@@ -1,0 +1,36 @@
+services:
+  imap-mcp:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - BIND_ADDR=0.0.0.0:8080
+    depends_on:
+      - redis
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.imap-mcp.rule=Host(`${TRAEFIK_HOST}`)"
+      - "traefik.http.routers.imap-mcp.entrypoints=websecure"
+      - "traefik.http.routers.imap-mcp.tls.certresolver=le"
+      - "traefik.http.services.imap-mcp.loadbalancer.server.port=8080"
+    networks:
+      - web
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - internal
+
+volumes:
+  redis-data:
+
+networks:
+  web:
+    external: true
+  internal:
