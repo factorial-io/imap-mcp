@@ -1329,6 +1329,7 @@ dependencies = [
  "futures",
  "html2text",
  "http 1.4.0",
+ "http-body-util",
  "imap-proto",
  "mailparse",
  "openidconnect",

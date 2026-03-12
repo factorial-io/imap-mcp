@@ -53,3 +53,6 @@ url = { version = "2.5.4" }
 html2text = { version = "0.12.6" }
 mailparse = { version = "0.15.0" }
 imap-proto = { version = "0.16.4" }
+
+[dev-dependencies]
+http-body-util = { version = "0.1.3" }

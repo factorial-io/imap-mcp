@@ -1,28 +1,5 @@
-mod auth;
-mod error;
-mod imap;
-mod mcp;
-mod session;
-
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::Router;
-use http::Request;
-use openidconnect::core::CoreClient;
-use session::SessionStore;
+use imap_mcp::{auth, build_router, session::SessionStore, AppState};
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
-
-/// Shared application state.
-pub struct AppState {
-    pub sessions: SessionStore,
-    pub oidc_client: CoreClient,
-    pub imap_host: String,
-    pub imap_port: u16,
-    pub base_url: String,
-}
 
 fn env_var(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} environment variable is required"))
@@ -68,26 +45,7 @@ async fn main() -> anyhow::Result<()> {
         base_url,
     });
 
-    let app = Router::new()
-        // OAuth well-known endpoints
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(auth::oauth_protected_resource),
-        )
-        .route(
-            "/.well-known/oauth-authorization-server",
-            get(auth::oauth_authorization_server),
-        )
-        // Auth flow
-        .route("/auth/login", get(auth::login))
-        .route("/auth/callback", get(auth::callback))
-        .route("/auth/setup", post(auth::setup))
-        // MCP endpoint — handles GET (SSE stream) and POST (messages) with bearer auth
-        .route("/mcp", axum::routing::any(mcp_handler))
-        .route("/mcp/{path}", axum::routing::any(mcp_handler))
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let app = build_router(state);
 
     let bind_addr = env_var_or("BIND_ADDR", "0.0.0.0:8080");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -100,137 +58,9 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// MCP endpoint handler with bearer token authentication.
-///
-/// Validates the Bearer token against Redis, decrypts IMAP credentials,
-/// then delegates to rmcp's StreamableHttpService for MCP protocol handling.
-async fn mcp_handler(
-    headers: HeaderMap,
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    req: Request<axum::body::Body>,
-) -> Response {
-    // Extract bearer token
-    let token = match extract_bearer_token(&headers) {
-        Some(t) => t,
-        None => {
-            let www_auth = format!(
-                r#"Bearer resource_metadata="{}/.well-known/oauth-protected-resource""#,
-                state.base_url
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                [("WWW-Authenticate", www_auth)],
-                "Bearer token required",
-            )
-                .into_response();
-        }
-    };
-
-    // Look up session in Redis
-    let session = match state.sessions.get_session(&token).await {
-        Ok(s) => s,
-        Err(_) => {
-            let www_auth = format!(
-                r#"Bearer resource_metadata="{}/.well-known/oauth-protected-resource""#,
-                state.base_url
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                [("WWW-Authenticate", www_auth)],
-                "Invalid or expired token",
-            )
-                .into_response();
-        }
-    };
-
-    // Decrypt IMAP password
-    let imap_password = match state.sessions.decrypt_imap_password(&session) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("Failed to decrypt IMAP password: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
-        }
-    };
-
-    // Build per-request MCP service and delegate
-    let email = session.email.clone();
-    let imap_host = state.imap_host.clone();
-    let imap_port = state.imap_port;
-
-    let config =
-        rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default();
-    let session_manager: Arc<
-        rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
-    > = Arc::new(Default::default());
-
-    let service = rmcp::transport::streamable_http_server::tower::StreamableHttpService::new(
-        move || {
-            Ok(mcp::ImapMcpServer::new(
-                email.clone(),
-                imap_password.clone(),
-                imap_host.clone(),
-                imap_port,
-            ))
-        },
-        session_manager,
-        config,
-    );
-
-    let resp = service.handle(req).await;
-    resp.map(axum::body::Body::new)
-}
-
-fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
-    let auth = headers.get("authorization")?.to_str().ok()?;
-    let token = auth.strip_prefix("Bearer ")?;
-    Some(token.to_string())
-}
-
 async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
         .expect("failed to listen for ctrl+c");
     tracing::info!("Shutdown signal received");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_bearer_token_valid() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer my-token-123".parse().unwrap());
-        assert_eq!(
-            extract_bearer_token(&headers),
-            Some("my-token-123".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_bearer_token_missing_header() {
-        let headers = HeaderMap::new();
-        assert_eq!(extract_bearer_token(&headers), None);
-    }
-
-    #[test]
-    fn extract_bearer_token_wrong_scheme() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
-        assert_eq!(extract_bearer_token(&headers), None);
-    }
-
-    #[test]
-    fn extract_bearer_token_empty_bearer() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer ".parse().unwrap());
-        assert_eq!(extract_bearer_token(&headers), Some(String::new()));
-    }
-
-    #[test]
-    fn extract_bearer_token_no_space_after_bearer() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "BearerNOSPACE".parse().unwrap());
-        assert_eq!(extract_bearer_token(&headers), None);
-    }
 }
