@@ -77,7 +77,11 @@ impl ImapConnection {
         for folder in &names {
             result.push(FolderInfo {
                 name: folder.name().to_string(),
-                attributes: folder.attributes().iter().map(|a| format!("{a:?}")).collect(),
+                attributes: folder
+                    .attributes()
+                    .iter()
+                    .map(|a| format!("{a:?}"))
+                    .collect(),
                 delimiter: folder.delimiter().map(|c| c.to_string()),
             });
         }
@@ -126,11 +130,7 @@ impl ImapConnection {
     }
 
     /// Fetch full email by UID.
-    pub async fn get_email(
-        &mut self,
-        folder: &str,
-        uid: u32,
-    ) -> Result<EmailDetail, AppError> {
+    pub async fn get_email(&mut self, folder: &str, uid: u32) -> Result<EmailDetail, AppError> {
         self.session
             .select(folder)
             .await
@@ -162,8 +162,7 @@ impl ImapConnection {
             }),
             from: envelope.and_then(|e| format_addresses(e.from.as_deref())),
             to: envelope.and_then(|e| format_addresses(e.to.as_deref())),
-            subject: envelope
-                .and_then(|e| e.subject.as_ref().map(|s| decode_header_value(s))),
+            subject: envelope.and_then(|e| e.subject.as_ref().map(|s| decode_header_value(s))),
             body,
         })
     }
@@ -269,13 +268,12 @@ fn parse_summary(fetch: &async_imap::types::Fetch) -> EmailSummary {
                 .map(|d| String::from_utf8_lossy(d).to_string())
         }),
         from: envelope.and_then(|e| format_addresses(e.from.as_deref())),
-        subject: envelope
-            .and_then(|e| e.subject.as_ref().map(|s| decode_header_value(s))),
+        subject: envelope.and_then(|e| e.subject.as_ref().map(|s| decode_header_value(s))),
         seen,
     }
 }
 
-fn format_addresses(addrs: Option<&[imap_proto::types::Address]>) -> Option<String> {
+pub(crate) fn format_addresses(addrs: Option<&[imap_proto::types::Address]>) -> Option<String> {
     let addrs = addrs?;
     let formatted: Vec<String> = addrs
         .iter()
@@ -309,7 +307,7 @@ fn format_addresses(addrs: Option<&[imap_proto::types::Address]>) -> Option<Stri
     }
 }
 
-fn decode_header_value(raw: &[u8]) -> String {
+pub(crate) fn decode_header_value(raw: &[u8]) -> String {
     let s = String::from_utf8_lossy(raw).to_string();
     // Attempt RFC2047 decoding via mailparse
     match mailparse::parse_header(format!("Subject: {s}").as_bytes()) {
@@ -320,7 +318,7 @@ fn decode_header_value(raw: &[u8]) -> String {
 
 /// Extract plain-text body from raw email bytes.
 /// Prefers text/plain; falls back to converting text/html.
-fn extract_body(raw: &[u8]) -> String {
+pub(crate) fn extract_body(raw: &[u8]) -> String {
     match mailparse::parse_mail(raw) {
         Ok(parsed) => extract_body_from_parsed(&parsed),
         Err(_) => String::from_utf8_lossy(raw).to_string(),
@@ -358,4 +356,122 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> String {
     }
 
     "(no text content)".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    #[test]
+    fn decode_header_value_plain_ascii() {
+        let result = decode_header_value(b"Hello World");
+        assert_eq!(result, "Hello World");
+    }
+
+    #[test]
+    fn decode_header_value_utf8() {
+        let result = decode_header_value("Héllo Wörld".as_bytes());
+        assert_eq!(result, "Héllo Wörld");
+    }
+
+    #[test]
+    fn format_addresses_none_returns_none() {
+        assert_eq!(format_addresses(None), None);
+    }
+
+    #[test]
+    fn format_addresses_empty_returns_none() {
+        assert_eq!(format_addresses(Some(&[])), None);
+    }
+
+    #[test]
+    fn format_addresses_single_no_name() {
+        let addr = imap_proto::types::Address {
+            name: None,
+            adl: None,
+            mailbox: Some(Cow::Borrowed(b"alice")),
+            host: Some(Cow::Borrowed(b"example.com")),
+        };
+        let result = format_addresses(Some(&[addr]));
+        assert_eq!(result, Some("alice@example.com".to_string()));
+    }
+
+    #[test]
+    fn format_addresses_single_with_name() {
+        let addr = imap_proto::types::Address {
+            name: Some(Cow::Borrowed(b"Alice Smith")),
+            adl: None,
+            mailbox: Some(Cow::Borrowed(b"alice")),
+            host: Some(Cow::Borrowed(b"example.com")),
+        };
+        let result = format_addresses(Some(&[addr]));
+        assert_eq!(result, Some("Alice Smith <alice@example.com>".to_string()));
+    }
+
+    #[test]
+    fn format_addresses_multiple() {
+        let addrs = vec![
+            imap_proto::types::Address {
+                name: None,
+                adl: None,
+                mailbox: Some(Cow::Borrowed(b"alice")),
+                host: Some(Cow::Borrowed(b"a.com")),
+            },
+            imap_proto::types::Address {
+                name: Some(Cow::Borrowed(b"Bob")),
+                adl: None,
+                mailbox: Some(Cow::Borrowed(b"bob")),
+                host: Some(Cow::Borrowed(b"b.com")),
+            },
+        ];
+        let result = format_addresses(Some(&addrs));
+        assert_eq!(result, Some("alice@a.com, Bob <bob@b.com>".to_string()));
+    }
+
+    #[test]
+    fn extract_body_plain_text() {
+        let raw = b"Content-Type: text/plain\r\n\r\nHello, world!";
+        let body = extract_body(raw);
+        assert_eq!(body, "Hello, world!");
+    }
+
+    #[test]
+    fn extract_body_html_fallback() {
+        let raw = b"Content-Type: text/html\r\n\r\n<p>Hello</p>";
+        let body = extract_body(raw);
+        assert!(body.contains("Hello"));
+    }
+
+    #[test]
+    fn extract_body_multipart_prefers_plain() {
+        let raw = b"Content-Type: multipart/alternative; boundary=bound\r\n\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\r\n\
+Plain text body\r\n\
+--bound\r\n\
+Content-Type: text/html\r\n\r\n\
+<p>HTML body</p>\r\n\
+--bound--";
+        let body = extract_body(raw);
+        assert!(body.contains("Plain text body"));
+        assert!(!body.contains("<p>"));
+    }
+
+    #[test]
+    fn extract_body_multipart_html_only() {
+        let raw = b"Content-Type: multipart/alternative; boundary=bound\r\n\r\n\
+--bound\r\n\
+Content-Type: text/html\r\n\r\n\
+<p>Only HTML</p>\r\n\
+--bound--";
+        let body = extract_body(raw);
+        assert!(body.contains("Only HTML"));
+    }
+
+    #[test]
+    fn extract_body_empty_does_not_panic() {
+        // Empty input should not panic; returning empty string is acceptable
+        let _body = extract_body(b"");
+    }
 }

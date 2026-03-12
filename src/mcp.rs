@@ -16,12 +16,7 @@ pub struct ImapMcpServer {
 }
 
 impl ImapMcpServer {
-    pub fn new(
-        email: String,
-        imap_password: String,
-        imap_host: String,
-        imap_port: u16,
-    ) -> Self {
+    pub fn new(email: String, imap_password: String, imap_host: String, imap_port: u16) -> Self {
         Self {
             email,
             imap_password,
@@ -33,9 +28,14 @@ impl ImapMcpServer {
 
     /// Open a fresh IMAP connection using this server's credentials.
     async fn connect(&self) -> Result<ImapConnection, rmcp::ErrorData> {
-        ImapConnection::connect(&self.imap_host, self.imap_port, &self.email, &self.imap_password)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("IMAP connection failed: {e}"), None))
+        ImapConnection::connect(
+            &self.imap_host,
+            self.imap_port,
+            &self.email,
+            &self.imap_password,
+        )
+        .await
+        .map_err(|e| rmcp::ErrorData::internal_error(format!("IMAP connection failed: {e}"), None))
     }
 }
 
@@ -108,7 +108,9 @@ impl ImapMcpServer {
         Ok(CallToolResult::success(vec![json]))
     }
 
-    #[tool(description = "List emails in a folder with pagination. Returns uid, date, from, subject, and seen status.")]
+    #[tool(
+        description = "List emails in a folder with pagination. Returns uid, date, from, subject, and seen status."
+    )]
     async fn list_emails(
         &self,
         Parameters(params): Parameters<ListEmailsParams>,
@@ -140,7 +142,9 @@ impl ImapMcpServer {
         Ok(CallToolResult::success(vec![json]))
     }
 
-    #[tool(description = "Search emails using IMAP SEARCH criteria. Examples: UNSEEN, FROM \"user@example.com\", SUBJECT \"hello\", SINCE 01-Jan-2024")]
+    #[tool(
+        description = "Search emails using IMAP SEARCH criteria. Examples: UNSEEN, FROM \"user@example.com\", SUBJECT \"hello\", SINCE 01-Jan-2024"
+    )]
     async fn search_emails(
         &self,
         Parameters(params): Parameters<SearchEmailsParams>,

@@ -222,9 +222,7 @@ pub async fn setup(
 
 /// GET /.well-known/oauth-protected-resource
 /// MCP spec: tells the client where the authorization server is.
-pub async fn oauth_protected_resource(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn oauth_protected_resource(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = serde_json::json!({
         "resource": state.base_url,
         "authorization_servers": [state.base_url],
@@ -239,9 +237,7 @@ pub async fn oauth_protected_resource(
 
 /// GET /.well-known/oauth-authorization-server
 /// MCP spec: OAuth metadata for the authorization server.
-pub async fn oauth_authorization_server(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn oauth_authorization_server(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = serde_json::json!({
         "issuer": state.base_url,
         "authorization_endpoint": format!("{}/auth/login", state.base_url),

@@ -68,7 +68,8 @@ impl SessionStore {
         let key = format!("oidc:state:{state_token}");
         let value = serde_json::to_string(oidc_state)?;
         let mut conn = self.conn().await?;
-        conn.set_ex::<_, _, ()>(&key, &value, OIDC_STATE_TTL).await?;
+        conn.set_ex::<_, _, ()>(&key, &value, OIDC_STATE_TTL)
+            .await?;
         Ok(())
     }
 
@@ -125,7 +126,7 @@ impl SessionStore {
 
     // --- Encryption helpers ---
 
-    fn encrypt(&self, plaintext: &str) -> Result<(String, String), AppError> {
+    pub(crate) fn encrypt(&self, plaintext: &str) -> Result<(String, String), AppError> {
         let key = Key::<Aes256Gcm>::from_slice(&self.encryption_key);
         let cipher = Aes256Gcm::new(key);
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -135,7 +136,7 @@ impl SessionStore {
         Ok((B64.encode(ciphertext), B64.encode(nonce)))
     }
 
-    fn decrypt(&self, ciphertext_b64: &str, iv_b64: &str) -> Result<String, AppError> {
+    pub(crate) fn decrypt(&self, ciphertext_b64: &str, iv_b64: &str) -> Result<String, AppError> {
         let key = Key::<Aes256Gcm>::from_slice(&self.encryption_key);
         let cipher = Aes256Gcm::new(key);
         let ciphertext = B64
@@ -150,5 +151,110 @@ impl SessionStore {
             .map_err(|e| AppError::Encryption(format!("decrypt failed: {e}")))?;
         String::from_utf8(plaintext)
             .map_err(|e| AppError::Encryption(format!("invalid utf8 after decrypt: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create a SessionStore with a valid 32-byte key (no Redis needed for encrypt/decrypt tests).
+    fn test_store() -> SessionStore {
+        // 32 bytes base64 encoded
+        let key_b64 = B64.encode([0xABu8; 32]);
+        // Redis URL won't be connected in these tests
+        SessionStore::new("redis://localhost:6379", &key_b64).unwrap()
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let store = test_store();
+        let password = "s3cret-IMAP-p@ssw0rd!";
+        let (enc, iv) = store.encrypt(password).unwrap();
+        let decrypted = store.decrypt(&enc, &iv).unwrap();
+        assert_eq!(decrypted, password);
+    }
+
+    #[test]
+    fn encrypt_produces_different_ciphertext_each_time() {
+        let store = test_store();
+        let password = "same-password";
+        let (enc1, _) = store.encrypt(password).unwrap();
+        let (enc2, _) = store.encrypt(password).unwrap();
+        // Different nonces should produce different ciphertext
+        assert_ne!(enc1, enc2);
+    }
+
+    #[test]
+    fn decrypt_with_wrong_key_fails() {
+        let store1 = test_store();
+        let (enc, iv) = store1.encrypt("secret").unwrap();
+
+        let other_key_b64 = B64.encode([0xCDu8; 32]);
+        let store2 = SessionStore::new("redis://localhost:6379", &other_key_b64).unwrap();
+        assert!(store2.decrypt(&enc, &iv).is_err());
+    }
+
+    #[test]
+    fn decrypt_with_invalid_base64_fails() {
+        let store = test_store();
+        assert!(store.decrypt("not-base64!!!", "also-bad!!!").is_err());
+    }
+
+    #[test]
+    fn new_rejects_short_key() {
+        let short_key = B64.encode([0u8; 16]); // 16 bytes, not 32
+        let result = SessionStore::new("redis://localhost:6379", &short_key);
+        assert!(result.is_err());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_rejects_invalid_base64_key() {
+        let result = SessionStore::new("redis://localhost:6379", "not-valid-base64!!!");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_serialization_roundtrip() {
+        let session = Session {
+            email: "user@example.com".to_string(),
+            gitlab_sub: "12345".to_string(),
+            imap_password_enc: "encrypted".to_string(),
+            imap_password_iv: "nonce".to_string(),
+            created_at: 1700000000,
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        let deserialized: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.email, "user@example.com");
+        assert_eq!(deserialized.gitlab_sub, "12345");
+        assert_eq!(deserialized.created_at, 1700000000);
+    }
+
+    #[test]
+    fn oidc_state_serialization_roundtrip() {
+        let state = OidcState {
+            pkce_verifier: "verifier123".to_string(),
+            nonce: "nonce456".to_string(),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: OidcState = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.pkce_verifier, "verifier123");
+        assert_eq!(deserialized.nonce, "nonce456");
+    }
+
+    #[test]
+    fn decrypt_imap_password_works() {
+        let store = test_store();
+        let (enc, iv) = store.encrypt("my-imap-password").unwrap();
+        let session = Session {
+            email: "test@example.com".to_string(),
+            gitlab_sub: "sub".to_string(),
+            imap_password_enc: enc,
+            imap_password_iv: iv,
+            created_at: 0,
+        };
+        let decrypted = store.decrypt_imap_password(&session).unwrap();
+        assert_eq!(decrypted, "my-imap-password");
     }
 }

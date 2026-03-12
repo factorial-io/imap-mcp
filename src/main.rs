@@ -36,8 +36,7 @@ fn env_var_or(name: &str, default: &str) -> String {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -164,19 +163,18 @@ async fn mcp_handler(
         rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
     > = Arc::new(Default::default());
 
-    let service =
-        rmcp::transport::streamable_http_server::tower::StreamableHttpService::new(
-            move || {
-                Ok(mcp::ImapMcpServer::new(
-                    email.clone(),
-                    imap_password.clone(),
-                    imap_host.clone(),
-                    imap_port,
-                ))
-            },
-            session_manager,
-            config,
-        );
+    let service = rmcp::transport::streamable_http_server::tower::StreamableHttpService::new(
+        move || {
+            Ok(mcp::ImapMcpServer::new(
+                email.clone(),
+                imap_password.clone(),
+                imap_host.clone(),
+                imap_port,
+            ))
+        },
+        session_manager,
+        config,
+    );
 
     let resp = service.handle(req).await;
     resp.map(axum::body::Body::new)
@@ -193,4 +191,46 @@ async fn shutdown_signal() {
         .await
         .expect("failed to listen for ctrl+c");
     tracing::info!("Shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_bearer_token_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer my-token-123".parse().unwrap());
+        assert_eq!(
+            extract_bearer_token(&headers),
+            Some("my-token-123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_bearer_token_missing_header() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn extract_bearer_token_wrong_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+        assert_eq!(extract_bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn extract_bearer_token_empty_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer ".parse().unwrap());
+        assert_eq!(extract_bearer_token(&headers), Some(String::new()));
+    }
+
+    #[test]
+    fn extract_bearer_token_no_space_after_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "BearerNOSPACE".parse().unwrap());
+        assert_eq!(extract_bearer_token(&headers), None);
+    }
 }
