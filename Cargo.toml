@@ -2,6 +2,7 @@
 name = "imap-mcp"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 # Web framework
@@ -46,6 +47,9 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 # Crypto
 sha2 = { version = "0.10.8" }
+
+# Secret management
+secrecy = { version = "0.10.3", features = ["serde"] }
 
 # Misc
 uuid = { version = "1.16.0", features = ["v4"] }

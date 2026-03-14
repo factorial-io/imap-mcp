@@ -2,6 +2,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 use crate::imap::ImapConnection;
@@ -9,7 +10,7 @@ use crate::imap::ImapConnection;
 /// MCP server instance — one per request, holds session context.
 pub struct ImapMcpServer {
     pub email: String,
-    pub imap_password: String,
+    imap_password: SecretString,
     pub imap_host: String,
     pub imap_port: u16,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
@@ -19,7 +20,7 @@ impl ImapMcpServer {
     pub fn new(email: String, imap_password: String, imap_host: String, imap_port: u16) -> Self {
         Self {
             email,
-            imap_password,
+            imap_password: SecretString::from(imap_password),
             imap_host,
             imap_port,
             tool_router: Self::tool_router(),
@@ -32,7 +33,7 @@ impl ImapMcpServer {
             &self.imap_host,
             self.imap_port,
             &self.email,
-            &self.imap_password,
+            self.imap_password.expose_secret(),
         )
         .await
         .map_err(|e| rmcp::ErrorData::internal_error(format!("IMAP connection failed: {e}"), None))

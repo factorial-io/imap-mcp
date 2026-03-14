@@ -21,12 +21,12 @@ use crate::AppState;
 
 /// Build the OIDC client using auto-discovery.
 pub async fn build_oidc_client(
-    gitlab_url: &str,
+    oidc_issuer_url: &str,
     client_id: &str,
     client_secret: &str,
     base_url: &str,
 ) -> Result<CoreClient, AppError> {
-    let issuer_url = IssuerUrl::new(gitlab_url.to_string())
+    let issuer_url = IssuerUrl::new(oidc_issuer_url.to_string())
         .map_err(|e| AppError::Oidc(format!("invalid issuer URL: {e}")))?;
     let metadata = CoreProviderMetadata::discover_async(issuer_url, async_http_client)
         .await
@@ -83,6 +83,13 @@ pub async fn register(
         return Err(AppError::Auth("redirect_uris is required".into()));
     }
 
+    // Validate all redirect URIs use HTTPS
+    for uri in &req.redirect_uris {
+        if !uri.starts_with("https://") {
+            return Err(AppError::Auth("redirect_uris must use https".into()));
+        }
+    }
+
     let client_id = uuid::Uuid::new_v4().to_string();
     let client = OAuthClient {
         client_id: client_id.clone(),
@@ -127,7 +134,7 @@ fn default_s256() -> String {
     "S256".to_string()
 }
 
-/// GET /auth/login — Accept OAuth params from claude.ai, start GitLab OIDC flow.
+/// GET /auth/login — Accept OAuth params from claude.ai, start OIDC flow.
 pub async fn login(
     State(state): State<Arc<AppState>>,
     Query(params): Query<AuthorizationParams>,
@@ -142,7 +149,7 @@ pub async fn login(
         return Err(AppError::Auth("invalid redirect_uri".into()));
     }
 
-    // Start GitLab OIDC flow with PKCE
+    // Start OIDC flow with PKCE
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let (auth_url, csrf_token, nonce) = state
         .oidc_client
@@ -157,7 +164,7 @@ pub async fn login(
         .set_pkce_challenge(pkce_challenge)
         .url();
 
-    // Store combined state: claude.ai's OAuth params + GitLab OIDC params
+    // Store combined state: claude.ai's OAuth params + OIDC params
     let flow = AuthFlowState {
         oauth_client_id: params.client_id,
         oauth_redirect_uri: params.redirect_uri,
@@ -172,11 +179,11 @@ pub async fn login(
         .store_auth_flow(csrf_token.secret(), &flow)
         .await?;
 
-    tracing::info!("OAuth login started, redirecting to GitLab");
+    tracing::info!("OAuth login started, redirecting to OIDC provider");
     Ok(Redirect::temporary(auth_url.as_str()).into_response())
 }
 
-// --- GitLab Callback ---
+// --- OIDC Callback ---
 
 #[derive(Deserialize)]
 pub struct CallbackParams {
@@ -184,7 +191,7 @@ pub struct CallbackParams {
     state: String,
 }
 
-/// GET /auth/callback — Handle GitLab redirect, show IMAP password form.
+/// GET /auth/callback — Handle OIDC provider redirect, show IMAP password form.
 pub async fn callback(
     State(state): State<Arc<AppState>>,
     Query(params): Query<CallbackParams>,
@@ -195,7 +202,7 @@ pub async fn callback(
     let pkce_verifier = PkceCodeVerifier::new(flow.pkce_verifier);
     let nonce = Nonce::new(flow.nonce);
 
-    // Exchange GitLab authorization code for tokens
+    // Exchange OIDC authorization code for tokens
     let token_response = state
         .oidc_client
         .exchange_code(AuthorizationCode::new(params.code))
@@ -225,13 +232,17 @@ pub async fn callback(
         .map(|n| n.to_string())
         .unwrap_or_else(|| email.clone());
 
-    tracing::info!(email = %email, "GitLab auth successful, showing IMAP setup form");
+    tracing::info!("OIDC auth successful, showing IMAP setup form");
+
+    // HTML-escape user-controlled values to prevent XSS
+    let name = html_escape(&name);
+    let email_display = html_escape(&email);
 
     // Store pending setup in Redis
     let setup_id = uuid::Uuid::new_v4().to_string();
     let pending = PendingSetup {
         email: email.clone(),
-        gitlab_sub: sub,
+        oidc_sub: sub,
         name: name.clone(),
         oauth_client_id: flow.oauth_client_id,
         oauth_redirect_uri: flow.oauth_redirect_uri,
@@ -267,7 +278,7 @@ pub async fn callback(
     <p>Enter your IMAP password to connect your email to the MCP server.</p>
     <form method="POST" action="/auth/setup">
         <input type="hidden" name="setup_id" value="{setup_id}">
-        <label>Email: <strong>{email}</strong></label>
+        <label>Email: <strong>{email_display}</strong></label>
         <label for="imap_password">IMAP Password</label>
         <input type="password" id="imap_password" name="imap_password" required autocomplete="off">
         <button type="submit">Connect</button>
@@ -317,7 +328,7 @@ pub async fn setup(
         code_challenge: pending.oauth_code_challenge,
         code_challenge_method: pending.oauth_code_challenge_method,
         email: pending.email.clone(),
-        gitlab_sub: pending.gitlab_sub,
+        oidc_sub: pending.oidc_sub,
         imap_password_enc: enc,
         imap_password_iv: iv,
     };
@@ -382,7 +393,7 @@ pub async fn token(
 
     let access_token = state
         .sessions
-        .create_session(&auth_code.email, &auth_code.gitlab_sub, &imap_password)
+        .create_session(&auth_code.email, &auth_code.oidc_sub, &imap_password)
         .await?;
 
     tracing::info!(email = %auth_code.email, "Token exchange successful, MCP session created");
@@ -434,6 +445,15 @@ pub async fn oauth_authorization_server(State(state): State<Arc<AppState>>) -> i
         [("Content-Type", "application/json")],
         serde_json::to_string(&body).unwrap_or_default(),
     )
+}
+
+/// Escape HTML special characters to prevent XSS.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 #[cfg(test)]

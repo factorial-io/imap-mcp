@@ -62,6 +62,14 @@ impl ImapConnection {
         Ok(Self { session })
     }
 
+    /// Validate that an IMAP string does not contain injection characters.
+    fn validate_imap_input(input: &str, field: &str) -> Result<(), AppError> {
+        if input.contains('\r') || input.contains('\n') || input.contains('\0') {
+            return Err(AppError::Imap(format!("invalid characters in {field}")));
+        }
+        Ok(())
+    }
+
     /// List all mailbox folders.
     pub async fn list_folders(&mut self) -> Result<Vec<FolderInfo>, AppError> {
         let names: Vec<async_imap::types::Name> = self
@@ -95,6 +103,7 @@ impl ImapConnection {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<EmailSummary>, AppError> {
+        Self::validate_imap_input(folder, "folder name")?;
         let mailbox = self
             .session
             .select(folder)
@@ -131,6 +140,7 @@ impl ImapConnection {
 
     /// Fetch full email by UID.
     pub async fn get_email(&mut self, folder: &str, uid: u32) -> Result<EmailDetail, AppError> {
+        Self::validate_imap_input(folder, "folder name")?;
         self.session
             .select(folder)
             .await
@@ -174,6 +184,9 @@ impl ImapConnection {
         query: &str,
         limit: u32,
     ) -> Result<Vec<EmailSummary>, AppError> {
+        Self::validate_imap_input(folder, "folder name")?;
+        Self::validate_imap_input(query, "search query")?;
+
         self.session
             .select(folder)
             .await
@@ -212,6 +225,7 @@ impl ImapConnection {
 
     /// Set \Seen flag on email by UID.
     pub async fn mark_read(&mut self, folder: &str, uid: u32) -> Result<(), AppError> {
+        Self::validate_imap_input(folder, "folder name")?;
         self.session
             .select(folder)
             .await
@@ -230,6 +244,7 @@ impl ImapConnection {
 
     /// Unset \Seen flag on email by UID.
     pub async fn mark_unread(&mut self, folder: &str, uid: u32) -> Result<(), AppError> {
+        Self::validate_imap_input(folder, "folder name")?;
         self.session
             .select(folder)
             .await
@@ -361,10 +376,8 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> String {
         } else if sub_ct.starts_with("multipart/") {
             // Recurse into nested multipart (e.g. multipart/signed → multipart/alternative)
             let nested = extract_body_from_parsed(sub);
-            if !nested.is_empty() {
-                if plain.is_empty() {
-                    plain = nested;
-                }
+            if !nested.is_empty() && plain.is_empty() {
+                plain = nested;
             }
         }
     }

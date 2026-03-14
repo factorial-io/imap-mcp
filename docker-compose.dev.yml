@@ -3,9 +3,9 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      - GITLAB_URL=${GITLAB_URL}
-      - GITLAB_CLIENT_ID=${GITLAB_CLIENT_ID}
-      - GITLAB_CLIENT_SECRET=${GITLAB_CLIENT_SECRET}
+      - OIDC_ISSUER_URL=${OIDC_ISSUER_URL}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET}
       - IMAP_HOST=${IMAP_HOST}
       - IMAP_PORT=${IMAP_PORT:-993}
       - BASE_URL=${BASE_URL}

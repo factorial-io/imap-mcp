@@ -16,7 +16,7 @@ pub struct OAuthClient {
 }
 
 /// State stored during the OAuth + OIDC auth flow.
-/// Combines claude.ai's OAuth params with GitLab OIDC params.
+/// Combines claude.ai's OAuth params with OIDC params.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuthFlowState {
     pub oauth_client_id: String,
@@ -28,11 +28,11 @@ pub struct AuthFlowState {
     pub nonce: String,
 }
 
-/// Intermediate state between GitLab callback and IMAP password form submission.
+/// Intermediate state between OIDC callback and IMAP password form submission.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PendingSetup {
     pub email: String,
-    pub gitlab_sub: String,
+    pub oidc_sub: String,
     pub name: String,
     pub oauth_client_id: String,
     pub oauth_redirect_uri: String,
@@ -49,7 +49,7 @@ pub struct AuthCode {
     pub code_challenge: String,
     pub code_challenge_method: String,
     pub email: String,
-    pub gitlab_sub: String,
+    pub oidc_sub: String,
     pub imap_password_enc: String,
     pub imap_password_iv: String,
 }
@@ -58,7 +58,7 @@ pub struct AuthCode {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Session {
     pub email: String,
-    pub gitlab_sub: String,
+    pub oidc_sub: String,
     pub imap_password_enc: String,
     pub imap_password_iv: String,
     pub created_at: i64,
@@ -149,7 +149,7 @@ impl SessionStore {
         Ok(serde_json::from_str(&value)?)
     }
 
-    // --- Pending setup (between GitLab callback and IMAP password form) ---
+    // --- Pending setup (between OIDC callback and IMAP password form) ---
 
     pub async fn store_pending_setup(
         &self,
@@ -199,14 +199,14 @@ impl SessionStore {
     pub async fn create_session(
         &self,
         email: &str,
-        gitlab_sub: &str,
+        oidc_sub: &str,
         imap_password: &str,
     ) -> Result<String, AppError> {
         let (enc, iv) = self.encrypt(imap_password)?;
         let mcp_token = uuid::Uuid::new_v4().to_string();
         let session = Session {
             email: email.to_string(),
-            gitlab_sub: gitlab_sub.to_string(),
+            oidc_sub: oidc_sub.to_string(),
             imap_password_enc: enc,
             imap_password_iv: iv,
             created_at: chrono::Utc::now().timestamp(),
@@ -321,7 +321,7 @@ mod tests {
     fn session_serialization_roundtrip() {
         let session = Session {
             email: "user@example.com".to_string(),
-            gitlab_sub: "12345".to_string(),
+            oidc_sub: "12345".to_string(),
             imap_password_enc: "encrypted".to_string(),
             imap_password_iv: "nonce".to_string(),
             created_at: 1700000000,
@@ -329,7 +329,7 @@ mod tests {
         let json = serde_json::to_string(&session).unwrap();
         let deserialized: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.email, "user@example.com");
-        assert_eq!(deserialized.gitlab_sub, "12345");
+        assert_eq!(deserialized.oidc_sub, "12345");
         assert_eq!(deserialized.created_at, 1700000000);
     }
 
@@ -356,7 +356,7 @@ mod tests {
         let (enc, iv) = store.encrypt("my-imap-password").unwrap();
         let session = Session {
             email: "test@example.com".to_string(),
-            gitlab_sub: "sub".to_string(),
+            oidc_sub: "sub".to_string(),
             imap_password_enc: enc,
             imap_password_iv: iv,
             created_at: 0,

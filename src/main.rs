@@ -17,9 +17,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let gitlab_url = env_var("GITLAB_URL");
-    let gitlab_client_id = env_var("GITLAB_CLIENT_ID");
-    let gitlab_client_secret = env_var("GITLAB_CLIENT_SECRET");
+    let oidc_issuer_url = env_var("OIDC_ISSUER_URL");
+    let oidc_client_id = env_var("OIDC_CLIENT_ID");
+    let oidc_client_secret = env_var("OIDC_CLIENT_SECRET");
     let imap_host = env_var("IMAP_HOST");
     let imap_port: u16 = env_var_or("IMAP_PORT", "993").parse()?;
     let base_url = env_var("BASE_URL");
@@ -28,11 +28,11 @@ async fn main() -> anyhow::Result<()> {
 
     let sessions = SessionStore::new(&redis_url, &encryption_key)?;
 
-    tracing::info!("Discovering OIDC configuration from {gitlab_url}");
+    tracing::info!("Discovering OIDC configuration from {oidc_issuer_url}");
     let oidc_client = auth::build_oidc_client(
-        &gitlab_url,
-        &gitlab_client_id,
-        &gitlab_client_secret,
+        &oidc_issuer_url,
+        &oidc_client_id,
+        &oidc_client_secret,
         &base_url,
     )
     .await?;

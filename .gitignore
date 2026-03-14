@@ -1,2 +1,6 @@
 /target
 .env
+docs/
+.agents/
+.claude/skills/
+skills-lock.json

@@ -1,25 +1,28 @@
 # IMAP MCP Server
 
-A self-hosted Rust service that acts as a multi-tenant IMAP MCP server for claude.ai, using GitLab OIDC for authentication.
+[![CI](https://github.com/factorial-io/imap-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/factorial-io/imap-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Users authenticate via GitLab, enter their IMAP password once, and then claude.ai accesses their email through the MCP protocol using a Bearer token.
+A self-hosted Rust service that acts as a multi-tenant IMAP MCP server for claude.ai, using any OpenID Connect provider for authentication.
+
+Users authenticate via their OIDC provider (e.g. GitLab, Keycloak, Auth0), enter their IMAP password once, and then claude.ai accesses their email through the MCP protocol using a Bearer token.
 
 ## Prerequisites
 
 - Docker and Docker Compose
-- A GitLab instance with OAuth application configured
+- An OpenID Connect provider (GitLab, Keycloak, Auth0, etc.) with an OAuth application configured
 - An IMAP mail server (TLS, port 993)
 - Traefik reverse proxy (for HTTPS) or equivalent
 
-## GitLab OAuth App Setup
+## OIDC Provider Setup
 
-1. Go to **GitLab > Settings > Applications** (admin or user-level)
-2. Create a new application:
-   - **Name**: IMAP MCP Server
-   - **Redirect URI**: `https://<YOUR_DOMAIN>/auth/callback`
-   - **Scopes**: `openid`, `profile`, `email`
-   - **Confidential**: Yes
-3. Note the **Application ID** and **Secret**
+Create an OAuth/OIDC application in your identity provider:
+
+- **Redirect URI**: `https://<YOUR_DOMAIN>/auth/callback`
+- **Scopes**: `openid`, `profile`, `email`
+- **Confidential**: Yes
+
+Note the **Client ID**, **Client Secret**, and **Issuer URL** (e.g. `https://gitlab.example.com`).
 
 ## Deployment
 
@@ -43,7 +46,7 @@ openssl rand -base64 32
 # Paste it as ENCRYPTION_KEY in .env
 ```
 
-Edit `.env` with your GitLab OAuth credentials, IMAP host, public domain, etc.
+Edit `.env` with your OIDC credentials, IMAP host, public domain, etc.
 
 4. Deploy with Docker Compose:
 
@@ -58,11 +61,12 @@ The service will be available at `https://<YOUR_DOMAIN>`.
 1. Open [claude.ai](https://claude.ai)
 2. Go to **Settings > Integrations > Add MCP Server**
 3. Enter the URL: `https://<YOUR_DOMAIN>/mcp`
-4. Claude.ai will open a popup for authentication:
-   - You'll be redirected to GitLab to log in
+4. Claude.ai handles the OAuth flow automatically:
+   - Registers itself as an OAuth client (RFC 7591 dynamic registration)
+   - Opens a popup where you log in via your OIDC provider
    - After login, enter your IMAP password in the setup form
    - The form validates your credentials against the IMAP server
-   - On success, you'll receive a Bearer token
+   - On success, claude.ai receives an access token via OAuth code exchange
 5. The MCP server is now connected — claude.ai can read your email
 
 ## Available MCP Tools
@@ -71,7 +75,7 @@ The service will be available at `https://<YOUR_DOMAIN>`.
 |------|-------------|
 | `list_folders` | List all IMAP mailbox folders |
 | `list_emails` | List emails in a folder (uid, date, from, subject, seen flag) |
-| `get_email` | Fetch full email by UID (headers + plain text body) |
+| `get_email` | Fetch full email by UID (headers + plain text body, S/MIME signed supported) |
 | `search_emails` | Search emails using IMAP SEARCH criteria |
 | `mark_read` | Set \Seen flag on an email by UID |
 | `mark_unread` | Unset \Seen flag on an email by UID |
@@ -79,26 +83,33 @@ The service will be available at `https://<YOUR_DOMAIN>`.
 ## Architecture
 
 ```
-User → claude.ai → Bearer token → /mcp endpoint
-                                       ↓
-                              Validate token (Redis)
-                                       ↓
-                              Decrypt IMAP password
-                                       ↓
-                              Connect to IMAP server
-                                       ↓
-                              Execute MCP tool
-                                       ↓
-                              Return results to claude.ai
+claude.ai → POST /register (dynamic client registration)
+         → GET  /auth/login (OAuth authorize → redirects to OIDC provider)
+                    → OIDC provider login
+                    → GET /auth/callback (show IMAP password form)
+                    → POST /auth/setup (validate IMAP, generate auth code)
+                    → redirect to claude.ai with authorization code
+         → POST /auth/token (exchange code for access token, PKCE verified)
+         → POST /mcp (Bearer token → MCP JSON-RPC)
+                    ↓
+           Validate token (Redis)
+                    ↓
+           Decrypt IMAP password (AES-256-GCM)
+                    ↓
+           Connect to IMAP server (TLS)
+                    ↓
+           Execute MCP tool
+                    ↓
+           Return results to claude.ai
 ```
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GITLAB_URL` | Yes | GitLab instance URL |
-| `GITLAB_CLIENT_ID` | Yes | OAuth application ID |
-| `GITLAB_CLIENT_SECRET` | Yes | OAuth application secret |
+| `OIDC_ISSUER_URL` | Yes | OIDC provider URL (e.g. `https://gitlab.example.com`) |
+| `OIDC_CLIENT_ID` | Yes | OIDC application client ID |
+| `OIDC_CLIENT_SECRET` | Yes | OIDC application client secret |
 | `IMAP_HOST` | Yes | IMAP server hostname |
 | `IMAP_PORT` | No | IMAP port (default: 993) |
 | `BASE_URL` | Yes | Public URL of this service, no trailing slash |
@@ -118,7 +129,7 @@ A `docker-compose.dev.yml` is provided for local testing with claude.ai using ng
 
 ### Setup
 
-1. Copy the example env file and fill in your GitLab OAuth credentials in 1Password (vault: **Employee**, item: **IMAP MCP Server**):
+1. Copy the example env file and fill in your OIDC credentials in 1Password (vault: **Employee**, item: **IMAP MCP Server**):
 
 ```bash
 cp .env.example .env
@@ -126,7 +137,7 @@ cp .env.example .env
 
 2. Set `BASE_URL` in `.env` to your ngrok URL (see step 4).
 
-3. Configure the GitLab OAuth app redirect URI to `https://<NGROK_URL>/auth/callback`.
+3. Configure the OIDC provider's redirect URI to `https://<NGROK_URL>/auth/callback`.
 
 4. Start all services:
 
@@ -154,14 +165,28 @@ If you have a reserved ngrok domain, set `NGROK_DOMAIN` in `.env` to skip steps 
 
 1. Go to **Settings > Integrations > Add MCP Server** on [claude.ai](https://claude.ai)
 2. Enter the URL: `https://<NGROK_URL>/mcp`
-3. Authenticate via GitLab and enter your IMAP password
+3. Authenticate via your OIDC provider and enter your IMAP password
 4. Try prompts like "List my email folders" or "Show my latest emails"
 
 ## Security
 
-- PKCE (S256) is mandatory for the OIDC flow
-- IMAP passwords are encrypted at rest with AES-256-GCM
+- OAuth 2.0 with PKCE (S256) for the full authorization flow
+- Dynamic client registration (RFC 7591) — redirect URIs must use HTTPS
+- IMAP passwords are encrypted at rest with AES-256-GCM and wrapped in `SecretString` in memory
 - IMAP passwords are never logged or returned in responses
 - Session tokens are opaque UUIDs (not JWTs)
 - Sessions expire after 30 days, refreshed on each use
+- Authorization codes are single-use with 5-minute TTL
+- IMAP input validation prevents command injection via folder names and search queries
+- HTML output is escaped to prevent XSS
+- CORS restricted to required methods and headers
+- Container runs as non-root user
 - IMAP connections are opened per-request (no persistent pool)
+
+## License
+
+MIT -- see [LICENSE](LICENSE).
+
+## Acknowledgements
+
+Development time and API tokens sponsored by [Factorial.io](https://www.factorial.io/).

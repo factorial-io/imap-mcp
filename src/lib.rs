@@ -16,7 +16,7 @@ use rmcp::transport::streamable_http_server::tower::{
 };
 use session::SessionStore;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 /// Shared application state.
@@ -64,7 +64,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/auth/token", post(auth::token))
         .route("/mcp", axum::routing::any(mcp_handler))
         .route("/mcp/{path}", axum::routing::any(mcp_handler))
-        .layer(CorsLayer::permissive())
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([
+                    http::Method::GET,
+                    http::Method::POST,
+                    http::Method::DELETE,
+                    http::Method::OPTIONS,
+                ])
+                .allow_headers([
+                    http::header::AUTHORIZATION,
+                    http::header::CONTENT_TYPE,
+                    http::header::ACCEPT,
+                ]),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
