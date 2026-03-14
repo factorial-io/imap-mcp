@@ -10,6 +10,10 @@ use axum::routing::{get, post};
 use axum::Router;
 use http::Request;
 use openidconnect::core::CoreClient;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::tower::{
+    StreamableHttpServerConfig, StreamableHttpService,
+};
 use session::SessionStore;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -24,6 +28,24 @@ pub struct AppState {
     pub base_url: String,
 }
 
+impl AppState {
+    pub fn new(
+        sessions: SessionStore,
+        oidc_client: CoreClient,
+        imap_host: String,
+        imap_port: u16,
+        base_url: String,
+    ) -> Self {
+        Self {
+            sessions,
+            oidc_client,
+            imap_host,
+            imap_port,
+            base_url,
+        }
+    }
+}
+
 /// Build the axum Router from shared state. Used by main and integration tests.
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -35,9 +57,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/.well-known/oauth-authorization-server",
             get(auth::oauth_authorization_server),
         )
+        .route("/register", post(auth::register))
         .route("/auth/login", get(auth::login))
         .route("/auth/callback", get(auth::callback))
         .route("/auth/setup", post(auth::setup))
+        .route("/auth/token", post(auth::token))
         .route("/mcp", axum::routing::any(mcp_handler))
         .route("/mcp/{path}", axum::routing::any(mcp_handler))
         .layer(CorsLayer::permissive())
@@ -91,17 +115,17 @@ async fn mcp_handler(
         }
     };
 
-    let email = session.email.clone();
+    let email = session.email;
     let imap_host = state.imap_host.clone();
     let imap_port = state.imap_port;
 
-    let config =
-        rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default();
-    let session_manager: Arc<
-        rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
-    > = Arc::new(Default::default());
+    let config = StreamableHttpServerConfig {
+        stateful_mode: false,
+        json_response: true,
+        ..Default::default()
+    };
 
-    let service = rmcp::transport::streamable_http_server::tower::StreamableHttpService::new(
+    let service = StreamableHttpService::new(
         move || {
             Ok(mcp::ImapMcpServer::new(
                 email.clone(),
@@ -110,11 +134,11 @@ async fn mcp_handler(
                 imap_port,
             ))
         },
-        session_manager,
+        LocalSessionManager::default().into(),
         config,
     );
 
-    let resp = service.handle(req).await;
+    let resp: http::Response<_> = service.handle(req).await;
     resp.map(axum::body::Body::new)
 }
 

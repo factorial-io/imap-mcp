@@ -1,6 +1,8 @@
 use axum::extract::{Query, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::Form;
+use axum::{Form, Json};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use http::StatusCode;
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
 use openidconnect::reqwest::async_http_client;
@@ -8,12 +10,13 @@ use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::error::AppError;
 use crate::imap::ImapConnection;
-use crate::session::OidcState;
+use crate::session::{AuthCode, AuthFlowState, OAuthClient, PendingSetup};
 use crate::AppState;
 
 /// Build the OIDC client using auto-discovery.
@@ -42,8 +45,104 @@ pub async fn build_oidc_client(
     Ok(client)
 }
 
-/// GET /auth/login — Start the OIDC flow with PKCE.
-pub async fn login(State(state): State<Arc<AppState>>) -> Result<Response, AppError> {
+// --- Dynamic Client Registration (RFC 7591) ---
+
+#[derive(Debug, Deserialize)]
+pub struct RegistrationRequest {
+    pub redirect_uris: Vec<String>,
+    #[serde(default)]
+    pub client_name: Option<String>,
+    // Accept and ignore additional fields from the MCP client
+    #[serde(default)]
+    pub grant_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub response_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegistrationResponse {
+    pub client_id: String,
+    pub redirect_uris: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    pub grant_types: Vec<String>,
+    pub response_types: Vec<String>,
+    pub token_endpoint_auth_method: String,
+}
+
+/// POST /register — Dynamic OAuth client registration.
+pub async fn register(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegistrationRequest>,
+) -> Result<Response, AppError> {
+    if req.redirect_uris.is_empty() {
+        return Err(AppError::Auth("redirect_uris is required".into()));
+    }
+
+    let client_id = uuid::Uuid::new_v4().to_string();
+    let client = OAuthClient {
+        client_id: client_id.clone(),
+        redirect_uris: req.redirect_uris.clone(),
+        client_name: req.client_name.clone(),
+    };
+    state
+        .sessions
+        .store_oauth_client(&client_id, &client)
+        .await?;
+
+    tracing::info!(client_id = %client_id, "OAuth client registered");
+
+    let resp = RegistrationResponse {
+        client_id,
+        redirect_uris: req.redirect_uris,
+        client_name: req.client_name,
+        grant_types: vec!["authorization_code".to_string()],
+        response_types: vec!["code".to_string()],
+        token_endpoint_auth_method: "none".to_string(),
+    };
+
+    Ok((StatusCode::CREATED, Json(resp)).into_response())
+}
+
+// --- Authorization Endpoint ---
+
+#[derive(Debug, Deserialize)]
+pub struct AuthorizationParams {
+    pub response_type: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub state: String,
+    pub code_challenge: String,
+    #[serde(default = "default_s256")]
+    pub code_challenge_method: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+fn default_s256() -> String {
+    "S256".to_string()
+}
+
+/// GET /auth/login — Accept OAuth params from claude.ai, start GitLab OIDC flow.
+pub async fn login(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AuthorizationParams>,
+) -> Result<Response, AppError> {
+    if params.response_type != "code" {
+        return Err(AppError::Auth("unsupported response_type".into()));
+    }
+
+    // Validate client_id and redirect_uri
+    let client = state.sessions.get_oauth_client(&params.client_id).await?;
+    if !client.redirect_uris.contains(&params.redirect_uri) {
+        return Err(AppError::Auth("invalid redirect_uri".into()));
+    }
+
+    // Start GitLab OIDC flow with PKCE
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let (auth_url, csrf_token, nonce) = state
         .oidc_client
@@ -58,19 +157,26 @@ pub async fn login(State(state): State<Arc<AppState>>) -> Result<Response, AppEr
         .set_pkce_challenge(pkce_challenge)
         .url();
 
-    // Store PKCE verifier and nonce in Redis keyed by CSRF state token
-    let oidc_state = OidcState {
+    // Store combined state: claude.ai's OAuth params + GitLab OIDC params
+    let flow = AuthFlowState {
+        oauth_client_id: params.client_id,
+        oauth_redirect_uri: params.redirect_uri,
+        oauth_state: params.state,
+        oauth_code_challenge: params.code_challenge,
+        oauth_code_challenge_method: params.code_challenge_method,
         pkce_verifier: pkce_verifier.secret().clone(),
         nonce: nonce.secret().clone(),
     };
     state
         .sessions
-        .store_oidc_state(csrf_token.secret(), &oidc_state)
+        .store_auth_flow(csrf_token.secret(), &flow)
         .await?;
 
-    tracing::info!("OIDC login started, redirecting to GitLab");
+    tracing::info!("OAuth login started, redirecting to GitLab");
     Ok(Redirect::temporary(auth_url.as_str()).into_response())
 }
+
+// --- GitLab Callback ---
 
 #[derive(Deserialize)]
 pub struct CallbackParams {
@@ -78,18 +184,18 @@ pub struct CallbackParams {
     state: String,
 }
 
-/// GET /auth/callback — Handle GitLab redirect, exchange code for ID token.
+/// GET /auth/callback — Handle GitLab redirect, show IMAP password form.
 pub async fn callback(
     State(state): State<Arc<AppState>>,
     Query(params): Query<CallbackParams>,
 ) -> Result<Response, AppError> {
-    // Retrieve and validate OIDC state from Redis
-    let oidc_state = state.sessions.get_oidc_state(&params.state).await?;
+    // Retrieve combined auth flow state
+    let flow = state.sessions.get_auth_flow(&params.state).await?;
 
-    let pkce_verifier = PkceCodeVerifier::new(oidc_state.pkce_verifier);
-    let nonce = Nonce::new(oidc_state.nonce);
+    let pkce_verifier = PkceCodeVerifier::new(flow.pkce_verifier);
+    let nonce = Nonce::new(flow.nonce);
 
-    // Exchange authorization code for tokens
+    // Exchange GitLab authorization code for tokens
     let token_response = state
         .oidc_client
         .exchange_code(AuthorizationCode::new(params.code))
@@ -98,7 +204,6 @@ pub async fn callback(
         .await
         .map_err(|e| AppError::Oidc(format!("token exchange failed: {e}")))?;
 
-    // Extract and verify ID token
     let id_token = token_response
         .id_token()
         .ok_or_else(|| AppError::Oidc("missing ID token".to_string()))?;
@@ -120,9 +225,26 @@ pub async fn callback(
         .map(|n| n.to_string())
         .unwrap_or_else(|| email.clone());
 
-    tracing::info!(email = %email, "OIDC callback successful, showing setup form");
+    tracing::info!(email = %email, "GitLab auth successful, showing IMAP setup form");
 
-    // Render the IMAP password form
+    // Store pending setup in Redis
+    let setup_id = uuid::Uuid::new_v4().to_string();
+    let pending = PendingSetup {
+        email: email.clone(),
+        gitlab_sub: sub,
+        name: name.clone(),
+        oauth_client_id: flow.oauth_client_id,
+        oauth_redirect_uri: flow.oauth_redirect_uri,
+        oauth_state: flow.oauth_state,
+        oauth_code_challenge: flow.oauth_code_challenge,
+        oauth_code_challenge_method: flow.oauth_code_challenge_method,
+    };
+    state
+        .sessions
+        .store_pending_setup(&setup_id, &pending)
+        .await?;
+
+    // Render IMAP password form
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -144,8 +266,7 @@ pub async fn callback(
     <h1>Hello {name}!</h1>
     <p>Enter your IMAP password to connect your email to the MCP server.</p>
     <form method="POST" action="/auth/setup">
-        <input type="hidden" name="email" value="{email}">
-        <input type="hidden" name="gitlab_sub" value="{sub}">
+        <input type="hidden" name="setup_id" value="{setup_id}">
         <label>Email: <strong>{email}</strong></label>
         <label for="imap_password">IMAP Password</label>
         <input type="password" id="imap_password" name="imap_password" required autocomplete="off">
@@ -158,70 +279,131 @@ pub async fn callback(
     Ok(Html(html).into_response())
 }
 
+// --- IMAP Setup + Authorization Code Generation ---
+
 #[derive(Deserialize)]
 pub struct SetupForm {
-    email: String,
-    gitlab_sub: String,
+    setup_id: String,
     imap_password: String,
 }
 
-/// POST /auth/setup — Validate IMAP credentials and create session.
+/// POST /auth/setup — Validate IMAP credentials, generate auth code, redirect to claude.ai.
 pub async fn setup(
     State(state): State<Arc<AppState>>,
     Form(form): Form<SetupForm>,
 ) -> Result<Response, AppError> {
-    // Validate IMAP credentials with a real connection attempt
-    tracing::info!(email = %form.email, "Validating IMAP credentials");
+    let pending = state.sessions.get_pending_setup(&form.setup_id).await?;
+
+    // Validate IMAP credentials
+    tracing::info!(email = %pending.email, "Validating IMAP credentials");
     let conn = ImapConnection::connect(
         &state.imap_host,
         state.imap_port,
-        &form.email,
+        &pending.email,
         &form.imap_password,
     )
     .await
     .map_err(|_| AppError::InvalidCredentials)?;
-
-    // Logout from the validation connection
     conn.logout().await.ok();
 
-    // Create session with encrypted password
-    let mcp_token = state
-        .sessions
-        .create_session(&form.email, &form.gitlab_sub, &form.imap_password)
-        .await?;
+    // Encrypt the IMAP password for storage in the auth code
+    let (enc, iv) = state.sessions.encrypt(&form.imap_password)?;
 
-    tracing::info!(email = %form.email, "Session created, redirecting with token");
+    // Generate authorization code
+    let code = uuid::Uuid::new_v4().to_string();
+    let auth_code = AuthCode {
+        client_id: pending.oauth_client_id,
+        redirect_uri: pending.oauth_redirect_uri.clone(),
+        code_challenge: pending.oauth_code_challenge,
+        code_challenge_method: pending.oauth_code_challenge_method,
+        email: pending.email.clone(),
+        gitlab_sub: pending.gitlab_sub,
+        imap_password_enc: enc,
+        imap_password_iv: iv,
+    };
+    state.sessions.store_auth_code(&code, &auth_code).await?;
 
-    // Redirect back to claude.ai with the token
-    // The MCP spec expects the token to be passed back; render a page that provides it
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Setup Complete</title>
-    <style>
-        body {{ font-family: system-ui, sans-serif; max-width: 480px; margin: 60px auto; padding: 0 20px; }}
-        .token {{ background: #f3f4f6; padding: 12px; border-radius: 4px; word-break: break-all; font-family: monospace; }}
-        .success {{ color: #16a34a; font-weight: 600; }}
-    </style>
-</head>
-<body>
-    <h1 class="success">Connected!</h1>
-    <p>Your IMAP account has been verified and connected.</p>
-    <p>Your MCP access token:</p>
-    <div class="token">{mcp_token}</div>
-    <p>Use this token as a Bearer token when configuring the MCP server in claude.ai.</p>
-    <p>You can close this window.</p>
-</body>
-</html>"#,
+    tracing::info!(email = %pending.email, "IMAP validated, redirecting with authorization code");
+
+    // Redirect back to claude.ai's redirect_uri with the authorization code
+    let redirect_url = format!(
+        "{}?code={}&state={}",
+        pending.oauth_redirect_uri, code, pending.oauth_state
     );
-
-    Ok(Html(html).into_response())
+    // 303 See Other to change POST to GET for claude.ai's callback
+    Ok((StatusCode::SEE_OTHER, [("location", redirect_url)]).into_response())
 }
 
+// --- Token Endpoint ---
+
+#[derive(Debug, Deserialize)]
+pub struct TokenRequest {
+    pub grant_type: String,
+    pub code: String,
+    pub code_verifier: String,
+    pub redirect_uri: String,
+    pub client_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TokenResponse2 {
+    pub access_token: String,
+    pub token_type: String,
+}
+
+/// POST /auth/token — Exchange authorization code for access token.
+pub async fn token(
+    State(state): State<Arc<AppState>>,
+    Form(req): Form<TokenRequest>,
+) -> Result<Response, AppError> {
+    if req.grant_type != "authorization_code" {
+        return Err(AppError::Auth("unsupported grant_type".into()));
+    }
+
+    let auth_code = state.sessions.get_auth_code(&req.code).await?;
+
+    // Validate client_id and redirect_uri match
+    if auth_code.client_id != req.client_id {
+        return Err(AppError::Auth("client_id mismatch".into()));
+    }
+    if auth_code.redirect_uri != req.redirect_uri {
+        return Err(AppError::Auth("redirect_uri mismatch".into()));
+    }
+
+    // Verify PKCE: SHA256(code_verifier) must match code_challenge
+    if !verify_pkce_s256(&req.code_verifier, &auth_code.code_challenge) {
+        return Err(AppError::Auth("PKCE verification failed".into()));
+    }
+
+    // Decrypt IMAP password from auth code and create MCP session
+    let imap_password = state
+        .sessions
+        .decrypt(&auth_code.imap_password_enc, &auth_code.imap_password_iv)?;
+
+    let access_token = state
+        .sessions
+        .create_session(&auth_code.email, &auth_code.gitlab_sub, &imap_password)
+        .await?;
+
+    tracing::info!(email = %auth_code.email, "Token exchange successful, MCP session created");
+
+    let resp = TokenResponse2 {
+        access_token,
+        token_type: "bearer".to_string(),
+    };
+    Ok(Json(resp).into_response())
+}
+
+/// Verify PKCE S256: BASE64URL(SHA256(code_verifier)) == code_challenge
+fn verify_pkce_s256(code_verifier: &str, code_challenge: &str) -> bool {
+    let hash = Sha256::digest(code_verifier.as_bytes());
+    let computed = URL_SAFE_NO_PAD.encode(hash);
+    computed == code_challenge
+}
+
+// --- Well-known endpoints ---
+
 /// GET /.well-known/oauth-protected-resource
-/// MCP spec: tells the client where the authorization server is.
 pub async fn oauth_protected_resource(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = serde_json::json!({
         "resource": state.base_url,
@@ -236,12 +418,12 @@ pub async fn oauth_protected_resource(State(state): State<Arc<AppState>>) -> imp
 }
 
 /// GET /.well-known/oauth-authorization-server
-/// MCP spec: OAuth metadata for the authorization server.
 pub async fn oauth_authorization_server(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = serde_json::json!({
         "issuer": state.base_url,
         "authorization_endpoint": format!("{}/auth/login", state.base_url),
-        "token_endpoint": format!("{}/auth/setup", state.base_url),
+        "token_endpoint": format!("{}/auth/token", state.base_url),
+        "registration_endpoint": format!("{}/register", state.base_url),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
@@ -252,4 +434,23 @@ pub async fn oauth_authorization_server(State(state): State<Arc<AppState>>) -> i
         [("Content-Type", "application/json")],
         serde_json::to_string(&body).unwrap_or_default(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_pkce_s256_valid() {
+        // Known test vector: code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let hash = Sha256::digest(verifier.as_bytes());
+        let challenge = URL_SAFE_NO_PAD.encode(hash);
+        assert!(verify_pkce_s256(verifier, &challenge));
+    }
+
+    #[test]
+    fn verify_pkce_s256_invalid() {
+        assert!(!verify_pkce_s256("wrong-verifier", "wrong-challenge"));
+    }
 }

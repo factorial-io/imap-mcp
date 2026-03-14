@@ -7,11 +7,51 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
-/// OIDC state stored temporarily during the auth flow.
+/// Dynamic OAuth client registration data.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct OidcState {
+pub struct OAuthClient {
+    pub client_id: String,
+    pub redirect_uris: Vec<String>,
+    pub client_name: Option<String>,
+}
+
+/// State stored during the OAuth + OIDC auth flow.
+/// Combines claude.ai's OAuth params with GitLab OIDC params.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthFlowState {
+    pub oauth_client_id: String,
+    pub oauth_redirect_uri: String,
+    pub oauth_state: String,
+    pub oauth_code_challenge: String,
+    pub oauth_code_challenge_method: String,
     pub pkce_verifier: String,
     pub nonce: String,
+}
+
+/// Intermediate state between GitLab callback and IMAP password form submission.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingSetup {
+    pub email: String,
+    pub gitlab_sub: String,
+    pub name: String,
+    pub oauth_client_id: String,
+    pub oauth_redirect_uri: String,
+    pub oauth_state: String,
+    pub oauth_code_challenge: String,
+    pub oauth_code_challenge_method: String,
+}
+
+/// Authorization code data, stored briefly between setup and token exchange.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthCode {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub code_challenge: String,
+    pub code_challenge_method: String,
+    pub email: String,
+    pub gitlab_sub: String,
+    pub imap_password_enc: String,
+    pub imap_password_iv: String,
 }
 
 /// Session data stored in Redis, keyed by mcp_token.
@@ -24,14 +64,17 @@ pub struct Session {
     pub created_at: i64,
 }
 
-/// Manages sessions and OIDC state in Redis with AES-256-GCM encryption.
+/// Manages sessions and auth state in Redis with AES-256-GCM encryption.
 #[derive(Clone)]
 pub struct SessionStore {
     redis: redis::Client,
     encryption_key: Vec<u8>,
 }
 
-const OIDC_STATE_TTL: u64 = 600; // 10 minutes
+const OAUTH_CLIENT_TTL: u64 = 365 * 24 * 3600; // 1 year
+const AUTH_FLOW_TTL: u64 = 600; // 10 minutes
+const PENDING_SETUP_TTL: u64 = 600; // 10 minutes
+const AUTH_CODE_TTL: u64 = 300; // 5 minutes
 const SESSION_TTL: u64 = 30 * 24 * 3600; // 30 days
 
 impl SessionStore {
@@ -58,34 +101,101 @@ impl SessionStore {
             .map_err(AppError::Redis)
     }
 
-    // --- OIDC state ---
+    // --- OAuth client registration ---
 
-    pub async fn store_oidc_state(
+    pub async fn store_oauth_client(
         &self,
-        state_token: &str,
-        oidc_state: &OidcState,
+        client_id: &str,
+        client: &OAuthClient,
     ) -> Result<(), AppError> {
-        let key = format!("oidc:state:{state_token}");
-        let value = serde_json::to_string(oidc_state)?;
+        let key = format!("oauth:client:{client_id}");
+        let value = serde_json::to_string(client)?;
         let mut conn = self.conn().await?;
-        conn.set_ex::<_, _, ()>(&key, &value, OIDC_STATE_TTL)
+        conn.set_ex::<_, _, ()>(&key, &value, OAUTH_CLIENT_TTL)
             .await?;
         Ok(())
     }
 
-    pub async fn get_oidc_state(&self, state_token: &str) -> Result<OidcState, AppError> {
-        let key = format!("oidc:state:{state_token}");
+    pub async fn get_oauth_client(&self, client_id: &str) -> Result<OAuthClient, AppError> {
+        let key = format!("oauth:client:{client_id}");
         let mut conn = self.conn().await?;
         let value: Option<String> = conn.get(&key).await?;
-        let value = value.ok_or(AppError::Auth("OIDC state not found or expired".into()))?;
-        // Delete after retrieval to prevent replay
+        let value = value.ok_or(AppError::Auth("unknown client_id".into()))?;
+        Ok(serde_json::from_str(&value)?)
+    }
+
+    // --- Auth flow state (OAuth + OIDC combined) ---
+
+    pub async fn store_auth_flow(
+        &self,
+        csrf_token: &str,
+        flow: &AuthFlowState,
+    ) -> Result<(), AppError> {
+        let key = format!("auth:flow:{csrf_token}");
+        let value = serde_json::to_string(flow)?;
+        let mut conn = self.conn().await?;
+        conn.set_ex::<_, _, ()>(&key, &value, AUTH_FLOW_TTL).await?;
+        Ok(())
+    }
+
+    pub async fn get_auth_flow(&self, csrf_token: &str) -> Result<AuthFlowState, AppError> {
+        let key = format!("auth:flow:{csrf_token}");
+        let mut conn = self.conn().await?;
+        let value: Option<String> = conn.get(&key).await?;
+        let value = value.ok_or(AppError::Auth(
+            "auth flow state not found or expired".into(),
+        ))?;
+        let _: () = conn.del(&key).await?;
+        Ok(serde_json::from_str(&value)?)
+    }
+
+    // --- Pending setup (between GitLab callback and IMAP password form) ---
+
+    pub async fn store_pending_setup(
+        &self,
+        setup_id: &str,
+        pending: &PendingSetup,
+    ) -> Result<(), AppError> {
+        let key = format!("auth:setup:{setup_id}");
+        let value = serde_json::to_string(pending)?;
+        let mut conn = self.conn().await?;
+        conn.set_ex::<_, _, ()>(&key, &value, PENDING_SETUP_TTL)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_pending_setup(&self, setup_id: &str) -> Result<PendingSetup, AppError> {
+        let key = format!("auth:setup:{setup_id}");
+        let mut conn = self.conn().await?;
+        let value: Option<String> = conn.get(&key).await?;
+        let value = value.ok_or(AppError::Auth("setup session not found or expired".into()))?;
+        let _: () = conn.del(&key).await?;
+        Ok(serde_json::from_str(&value)?)
+    }
+
+    // --- Authorization codes ---
+
+    pub async fn store_auth_code(&self, code: &str, auth_code: &AuthCode) -> Result<(), AppError> {
+        let key = format!("auth:code:{code}");
+        let value = serde_json::to_string(auth_code)?;
+        let mut conn = self.conn().await?;
+        conn.set_ex::<_, _, ()>(&key, &value, AUTH_CODE_TTL).await?;
+        Ok(())
+    }
+
+    pub async fn get_auth_code(&self, code: &str) -> Result<AuthCode, AppError> {
+        let key = format!("auth:code:{code}");
+        let mut conn = self.conn().await?;
+        let value: Option<String> = conn.get(&key).await?;
+        let value = value.ok_or(AppError::Auth(
+            "authorization code not found or expired".into(),
+        ))?;
         let _: () = conn.del(&key).await?;
         Ok(serde_json::from_str(&value)?)
     }
 
     // --- MCP sessions ---
 
-    /// Encrypt the IMAP password and store a new session. Returns the mcp_token.
     pub async fn create_session(
         &self,
         email: &str,
@@ -108,18 +218,15 @@ impl SessionStore {
         Ok(mcp_token)
     }
 
-    /// Look up a session by mcp_token, refresh TTL on access.
     pub async fn get_session(&self, mcp_token: &str) -> Result<Session, AppError> {
         let key = format!("mcp:session:{mcp_token}");
         let mut conn = self.conn().await?;
         let value: Option<String> = conn.get(&key).await?;
         let value = value.ok_or(AppError::SessionNotFound)?;
-        // Refresh TTL on each access
         conn.expire::<_, ()>(&key, SESSION_TTL as i64).await?;
         Ok(serde_json::from_str(&value)?)
     }
 
-    /// Decrypt the IMAP password from a session.
     pub fn decrypt_imap_password(&self, session: &Session) -> Result<String, AppError> {
         self.decrypt(&session.imap_password_enc, &session.imap_password_iv)
     }
@@ -158,11 +265,8 @@ impl SessionStore {
 mod tests {
     use super::*;
 
-    /// Helper: create a SessionStore with a valid 32-byte key (no Redis needed for encrypt/decrypt tests).
     fn test_store() -> SessionStore {
-        // 32 bytes base64 encoded
         let key_b64 = B64.encode([0xABu8; 32]);
-        // Redis URL won't be connected in these tests
         SessionStore::new("redis://localhost:6379", &key_b64).unwrap()
     }
 
@@ -181,7 +285,6 @@ mod tests {
         let password = "same-password";
         let (enc1, _) = store.encrypt(password).unwrap();
         let (enc2, _) = store.encrypt(password).unwrap();
-        // Different nonces should produce different ciphertext
         assert_ne!(enc1, enc2);
     }
 
@@ -203,9 +306,8 @@ mod tests {
 
     #[test]
     fn new_rejects_short_key() {
-        let short_key = B64.encode([0u8; 16]); // 16 bytes, not 32
+        let short_key = B64.encode([0u8; 16]);
         let result = SessionStore::new("redis://localhost:6379", &short_key);
-        assert!(result.is_err());
         assert!(result.is_err());
     }
 
@@ -232,15 +334,20 @@ mod tests {
     }
 
     #[test]
-    fn oidc_state_serialization_roundtrip() {
-        let state = OidcState {
+    fn auth_flow_state_serialization_roundtrip() {
+        let state = AuthFlowState {
+            oauth_client_id: "client123".to_string(),
+            oauth_redirect_uri: "https://example.com/callback".to_string(),
+            oauth_state: "state456".to_string(),
+            oauth_code_challenge: "challenge789".to_string(),
+            oauth_code_challenge_method: "S256".to_string(),
             pkce_verifier: "verifier123".to_string(),
             nonce: "nonce456".to_string(),
         };
         let json = serde_json::to_string(&state).unwrap();
-        let deserialized: OidcState = serde_json::from_str(&json).unwrap();
+        let deserialized: AuthFlowState = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.oauth_client_id, "client123");
         assert_eq!(deserialized.pkce_verifier, "verifier123");
-        assert_eq!(deserialized.nonce, "nonce456");
     }
 
     #[test]

@@ -326,33 +326,61 @@ pub(crate) fn extract_body(raw: &[u8]) -> String {
 }
 
 fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> String {
-    // Check subparts for text/plain first
-    for sub in &parsed.subparts {
-        let ct = sub.ctype.mimetype.to_lowercase();
+    let ct = parsed.ctype.mimetype.to_lowercase();
+
+    // Leaf node: return text content directly
+    if !ct.starts_with("multipart/") {
         if ct == "text/plain" {
-            if let Ok(body) = sub.get_body() {
+            if let Ok(body) = parsed.get_body() {
                 return body;
             }
         }
+        if ct == "text/html" {
+            if let Ok(body) = parsed.get_body() {
+                return html2text::from_read(body.as_bytes(), 80);
+            }
+        }
+        // Skip non-text parts (signatures, attachments, etc.)
+        return String::new();
     }
 
-    // Fallback: look for text/html and convert
+    // Multipart: recurse into subparts, prefer text/plain over text/html
+    let mut plain = String::new();
+    let mut html = String::new();
+
     for sub in &parsed.subparts {
-        let ct = sub.ctype.mimetype.to_lowercase();
-        if ct == "text/html" {
+        let sub_ct = sub.ctype.mimetype.to_lowercase();
+        if sub_ct == "text/plain" && plain.is_empty() {
             if let Ok(body) = sub.get_body() {
-                return html2text::from_read(body.as_bytes(), 80);
+                plain = body;
+            }
+        } else if sub_ct == "text/html" && html.is_empty() {
+            if let Ok(body) = sub.get_body() {
+                html = body;
+            }
+        } else if sub_ct.starts_with("multipart/") {
+            // Recurse into nested multipart (e.g. multipart/signed → multipart/alternative)
+            let nested = extract_body_from_parsed(sub);
+            if !nested.is_empty() {
+                if plain.is_empty() {
+                    plain = nested;
+                }
             }
         }
     }
 
-    // Last resort: top-level body
+    if !plain.is_empty() {
+        return plain;
+    }
+    if !html.is_empty() {
+        return html2text::from_read(html.as_bytes(), 80);
+    }
+
+    // Last resort: top-level body (preamble text)
     if let Ok(body) = parsed.get_body() {
-        let ct = parsed.ctype.mimetype.to_lowercase();
-        if ct.starts_with("text/html") {
-            return html2text::from_read(body.as_bytes(), 80);
+        if !body.trim().is_empty() && !body.contains("S/MIME") {
+            return body;
         }
-        return body;
     }
 
     "(no text content)".to_string()
@@ -473,5 +501,50 @@ Content-Type: text/html\r\n\r\n\
     fn extract_body_empty_does_not_panic() {
         // Empty input should not panic; returning empty string is acceptable
         let _body = extract_body(b"");
+    }
+
+    #[test]
+    fn extract_body_smime_signed_plain() {
+        // S/MIME signed: multipart/signed containing text/plain + signature
+        let raw = b"Content-Type: multipart/signed; boundary=sig; protocol=\"application/pkcs7-signature\"\r\n\r\n\
+This is an S/MIME signed message\r\n\r\n\
+--sig\r\n\
+Content-Type: text/plain\r\n\r\n\
+Actual email body here\r\n\
+--sig\r\n\
+Content-Type: application/pkcs7-signature\r\n\r\n\
+BINARYSIGNATUREDATA\r\n\
+--sig--";
+        let body = extract_body(raw);
+        assert!(
+            body.contains("Actual email body"),
+            "Should extract body from signed message, got: {body}"
+        );
+        assert!(!body.contains("S/MIME"));
+    }
+
+    #[test]
+    fn extract_body_smime_signed_with_nested_multipart() {
+        // S/MIME signed: multipart/signed → multipart/alternative → text/plain + text/html
+        let raw = b"Content-Type: multipart/signed; boundary=sig; protocol=\"application/pkcs7-signature\"\r\n\r\n\
+This is an S/MIME signed message\r\n\r\n\
+--sig\r\n\
+Content-Type: multipart/alternative; boundary=alt\r\n\r\n\
+--alt\r\n\
+Content-Type: text/plain\r\n\r\n\
+Plain text from signed email\r\n\
+--alt\r\n\
+Content-Type: text/html\r\n\r\n\
+<p>HTML from signed email</p>\r\n\
+--alt--\r\n\
+--sig\r\n\
+Content-Type: application/pkcs7-signature\r\n\r\n\
+BINARYSIGNATUREDATA\r\n\
+--sig--";
+        let body = extract_body(raw);
+        assert!(
+            body.contains("Plain text from signed email"),
+            "Should recurse into nested multipart, got: {body}"
+        );
     }
 }

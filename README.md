@@ -107,6 +107,56 @@ User → claude.ai → Bearer token → /mcp endpoint
 | `RUST_LOG` | No | Log level (default: info) |
 | `BIND_ADDR` | No | Listen address (default: 0.0.0.0:8080) |
 
+## Local Development
+
+A `docker-compose.dev.yml` is provided for local testing with claude.ai using ngrok as a tunnel.
+
+### Prerequisites
+
+- [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) — secrets are stored in 1Password
+- An [ngrok](https://ngrok.com/) account (free tier works, paid gives a stable domain)
+
+### Setup
+
+1. Copy the example env file and fill in your GitLab OAuth credentials in 1Password (vault: **Employee**, item: **IMAP MCP Server**):
+
+```bash
+cp .env.example .env
+```
+
+2. Set `BASE_URL` in `.env` to your ngrok URL (see step 4).
+
+3. Configure the GitLab OAuth app redirect URI to `https://<NGROK_URL>/auth/callback`.
+
+4. Start all services:
+
+```bash
+op run --env-file=.env -- docker compose -f docker-compose.dev.yml up --build
+```
+
+5. Get the ngrok public URL:
+
+```bash
+curl -s http://localhost:4040/api/tunnels | jq '.tunnels[0].public_url'
+```
+
+Or open http://localhost:4040 in your browser.
+
+6. Update `BASE_URL` in `.env` with the ngrok URL and restart the app:
+
+```bash
+op run --env-file=.env -- docker compose -f docker-compose.dev.yml restart imap-mcp
+```
+
+If you have a reserved ngrok domain, set `NGROK_DOMAIN` in `.env` to skip steps 5-6.
+
+### Connect claude.ai
+
+1. Go to **Settings > Integrations > Add MCP Server** on [claude.ai](https://claude.ai)
+2. Enter the URL: `https://<NGROK_URL>/mcp`
+3. Authenticate via GitLab and enter your IMAP password
+4. Try prompts like "List my email folders" or "Show my latest emails"
+
 ## Security
 
 - PKCE (S256) is mandatory for the OIDC flow

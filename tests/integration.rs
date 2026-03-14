@@ -45,13 +45,13 @@ fn fake_oidc_client() -> CoreClient {
 fn test_state() -> Arc<AppState> {
     let encryption_key = B64.encode([0xABu8; 32]);
     let sessions = SessionStore::new("redis://localhost:6379", &encryption_key).unwrap();
-    Arc::new(AppState {
+    Arc::new(AppState::new(
         sessions,
-        oidc_client: fake_oidc_client(),
-        imap_host: "imap.example.com".to_string(),
-        imap_port: 993,
-        base_url: "https://imap-mcp.example.com".to_string(),
-    })
+        fake_oidc_client(),
+        "imap.example.com".to_string(),
+        993,
+        "https://imap-mcp.example.com".to_string(),
+    ))
 }
 
 /// Helper: send a request to the test router and get response.
@@ -108,7 +108,11 @@ async fn well_known_oauth_authorization_server_returns_correct_json() {
     );
     assert_eq!(
         json["token_endpoint"],
-        "https://imap-mcp.example.com/auth/setup"
+        "https://imap-mcp.example.com/auth/token"
+    );
+    assert_eq!(
+        json["registration_endpoint"],
+        "https://imap-mcp.example.com/register"
     );
     assert!(json["response_types_supported"]
         .as_array()
@@ -118,6 +122,21 @@ async fn well_known_oauth_authorization_server_returns_correct_json() {
         .as_array()
         .unwrap()
         .contains(&serde_json::json!("S256")));
+}
+
+// --- Dynamic client registration tests ---
+
+#[tokio::test]
+async fn register_without_redirect_uris_returns_error() {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/register")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"redirect_uris": []}"#))
+        .unwrap();
+
+    let resp = send_request(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // --- MCP endpoint auth tests ---
@@ -150,7 +169,6 @@ async fn mcp_without_bearer_returns_401_with_www_authenticate() {
 
 #[tokio::test]
 async fn mcp_with_invalid_bearer_returns_401() {
-    // This will fail at Redis lookup (no Redis running), which should return 401
     let req = Request::builder()
         .uri("/mcp")
         .header("authorization", "Bearer invalid-token-xyz")
@@ -193,34 +211,38 @@ async fn mcp_subpath_without_bearer_returns_401() {
 // --- Auth endpoint tests ---
 
 #[tokio::test]
-async fn auth_login_redirects_to_gitlab() {
-    // /auth/login should redirect to the GitLab authorize URL.
-    // It will fail at Redis (storing OIDC state), but the redirect URL
-    // construction happens before that in the OIDC client.
-    // Since Redis is unavailable, this will return an error — but we can
-    // verify the endpoint exists and is routed correctly.
+async fn auth_login_without_params_returns_error() {
     let req = Request::builder()
         .uri("/auth/login")
         .body(Body::empty())
         .unwrap();
 
     let resp = send_request(req).await;
-    // Without Redis, storing OIDC state will fail → 500.
-    // If Redis were available, it'd be 307.
-    // Either way, the route exists and is handled.
+    // Missing required query params → 422
     let status = resp.status();
     assert!(
-        status == StatusCode::TEMPORARY_REDIRECT || status == StatusCode::INTERNAL_SERVER_ERROR,
-        "Expected redirect or internal error (no Redis), got {status}"
+        status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
+        "Expected 400 or 422, got {status}"
     );
 }
 
 #[tokio::test]
 async fn auth_setup_rejects_get_method() {
-    // POST /auth/setup is the only allowed method
     let req = Request::builder()
         .method("GET")
         .uri("/auth/setup")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = send_request(req).await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn auth_token_rejects_get_method() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/auth/token")
         .body(Body::empty())
         .unwrap();
 

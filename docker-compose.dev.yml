@@ -1,0 +1,51 @@
+services:
+  imap-mcp:
+    build: .
+    restart: unless-stopped
+    environment:
+      - GITLAB_URL=${GITLAB_URL}
+      - GITLAB_CLIENT_ID=${GITLAB_CLIENT_ID}
+      - GITLAB_CLIENT_SECRET=${GITLAB_CLIENT_SECRET}
+      - IMAP_HOST=${IMAP_HOST}
+      - IMAP_PORT=${IMAP_PORT:-993}
+      - BASE_URL=${BASE_URL}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - REDIS_URL=redis://redis:6379
+      - BIND_ADDR=0.0.0.0:8080
+      - RUST_LOG=debug
+    depends_on:
+      - redis
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - internal
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    restart: unless-stopped
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    # Free tier: random URL (check logs for the public URL)
+    # Reserved domain: uncomment and set NGROK_DOMAIN in .env
+    command: >
+      http imap-mcp:8080
+      ${NGROK_DOMAIN:+--url=${NGROK_DOMAIN}}
+    ports:
+      - "4040:4040"
+    networks:
+      - internal
+
+volumes:
+  redis-data:
+
+networks:
+  internal:

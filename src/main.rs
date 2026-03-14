@@ -37,13 +37,13 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let state = Arc::new(AppState {
+    let state = Arc::new(AppState::new(
         sessions,
         oidc_client,
         imap_host,
         imap_port,
         base_url,
-    });
+    ));
 
     let app = build_router(state);
 

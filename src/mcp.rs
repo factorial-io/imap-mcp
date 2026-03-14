@@ -196,12 +196,11 @@ impl ImapMcpServer {
 #[tool_handler]
 impl ServerHandler for ImapMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "IMAP email server. Use the tools to list folders, read emails, search, and manage read status.".to_string(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(
+            ServerCapabilities::builder().enable_tools().build(),
+        )
+        .with_instructions(
+            "IMAP email server. Use the tools to list folders, read emails, search, and manage read status.".to_string(),
+        )
     }
 }
