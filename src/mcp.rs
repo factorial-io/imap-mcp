@@ -5,7 +5,7 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
-use crate::imap::ImapConnection;
+use crate::imap::{self, ImapConnection};
 
 /// MCP server instance — one per request, holds session context.
 pub struct ImapMcpServer {
@@ -77,6 +77,17 @@ pub struct SearchEmailsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetAttachmentParams {
+    /// Email UID
+    pub uid: u32,
+    /// Zero-based attachment index (from the attachments list in get_email)
+    pub attachment_index: usize,
+    /// IMAP folder name (default: INBOX)
+    #[serde(default = "default_inbox")]
+    pub folder: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MarkParams {
     /// Email UID
     pub uid: u32,
@@ -127,7 +138,9 @@ impl ImapMcpServer {
         Ok(CallToolResult::success(vec![json]))
     }
 
-    #[tool(description = "Fetch a full email by UID. Returns headers and plain-text body.")]
+    #[tool(
+        description = "Fetch a full email by UID. Returns headers, plain-text body, and a list of attachments with metadata (filename, mime_type, size, index). Use get_attachment with the index to fetch attachment content."
+    )]
     async fn get_email(
         &self,
         Parameters(params): Parameters<GetEmailParams>,
@@ -141,6 +154,61 @@ impl ImapMcpServer {
         let json = Content::json(&email)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
+    }
+
+    #[tool(
+        description = "Fetch an email attachment by UID and attachment index. Use get_email first to see the list of attachments. Returns image content for images (visible to the LLM), text for text-based files, or base64-encoded data for binary files."
+    )]
+    async fn get_attachment(
+        &self,
+        Parameters(params): Parameters<GetAttachmentParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let mut conn = self.connect().await?;
+        let attachment = conn
+            .get_attachment(&params.folder, params.uid, params.attachment_index)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
+        conn.logout().await.ok();
+
+        let mime = &attachment.info.mime_type;
+        let filename = attachment
+            .info
+            .filename
+            .clone()
+            .unwrap_or_else(|| format!("attachment_{}", params.attachment_index));
+
+        // Images: return as image content so the LLM can see them
+        if mime.starts_with("image/") {
+            let b64 = imap::base64_encode(&attachment.data);
+            return Ok(CallToolResult::success(vec![
+                Content::text(format!(
+                    "Image attachment: {filename} ({mime}, {} bytes)",
+                    attachment.info.size
+                )),
+                Content::image(b64, mime.clone()),
+            ]));
+        }
+
+        // Text-based content types: return as text
+        if mime.starts_with("text/")
+            || mime == "application/json"
+            || mime == "application/xml"
+            || mime == "application/javascript"
+            || mime == "application/csv"
+        {
+            let text = String::from_utf8_lossy(&attachment.data).to_string();
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Text attachment: {filename} ({mime}, {} bytes)\n\n{text}",
+                attachment.info.size
+            ))]));
+        }
+
+        // Everything else: return as base64-encoded blob with metadata
+        let b64 = imap::base64_encode(&attachment.data);
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Binary attachment: {filename} ({mime}, {} bytes)\nBase64-encoded data:\n{b64}",
+            attachment.info.size
+        ))]))
     }
 
     #[tool(
@@ -201,7 +269,7 @@ impl ServerHandler for ImapMcpServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions(
-            "IMAP email server. Use the tools to list folders, read emails, search, and manage read status.".to_string(),
+            "IMAP email server. Use the tools to list folders, read emails, search, manage read status, and fetch attachments. When reading an email with get_email, attachment metadata is included. Use get_attachment with the attachment index to fetch the actual content — images are returned as visible image content, text files as text, and other formats as base64.".to_string(),
         )
     }
 }

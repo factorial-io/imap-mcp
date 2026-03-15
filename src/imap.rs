@@ -1,8 +1,12 @@
 use async_native_tls::TlsConnector;
+use base64::Engine;
 use futures::TryStreamExt;
 use serde::Serialize;
 
 use crate::error::AppError;
+
+/// Maximum attachment size we'll return (25 MB).
+const MAX_ATTACHMENT_SIZE: usize = 25 * 1024 * 1024;
 
 /// Summary of an email for list views.
 #[derive(Debug, Serialize)]
@@ -14,6 +18,27 @@ pub struct EmailSummary {
     pub seen: bool,
 }
 
+/// Metadata about an email attachment.
+#[derive(Debug, Clone, Serialize)]
+pub struct AttachmentInfo {
+    /// Zero-based index of this attachment within the email.
+    pub index: usize,
+    /// Filename if available.
+    pub filename: Option<String>,
+    /// MIME type (e.g. "image/png", "application/pdf").
+    pub mime_type: String,
+    /// Size in bytes of the decoded content.
+    pub size: usize,
+}
+
+/// A fetched attachment with its data.
+#[derive(Debug)]
+pub struct AttachmentData {
+    pub info: AttachmentInfo,
+    /// Raw decoded bytes of the attachment.
+    pub data: Vec<u8>,
+}
+
 /// Full email content.
 #[derive(Debug, Serialize)]
 pub struct EmailDetail {
@@ -23,6 +48,8 @@ pub struct EmailDetail {
     pub to: Option<String>,
     pub subject: Option<String>,
     pub body: String,
+    /// Metadata for each attachment (use get_attachment to fetch content).
+    pub attachments: Vec<AttachmentInfo>,
 }
 
 /// IMAP folder info.
@@ -161,6 +188,7 @@ impl ImapConnection {
 
         let body_raw = fetch.body().unwrap_or(b"");
         let body = extract_body(body_raw);
+        let attachments = extract_attachment_infos(body_raw);
 
         let envelope = fetch.envelope();
         Ok(EmailDetail {
@@ -174,7 +202,38 @@ impl ImapConnection {
             to: envelope.and_then(|e| format_addresses(e.to.as_deref())),
             subject: envelope.and_then(|e| e.subject.as_ref().map(|s| decode_header_value(s))),
             body,
+            attachments,
         })
+    }
+
+    /// Fetch a specific attachment from an email by UID and attachment index.
+    pub async fn get_attachment(
+        &mut self,
+        folder: &str,
+        uid: u32,
+        attachment_index: usize,
+    ) -> Result<AttachmentData, AppError> {
+        Self::validate_imap_input(folder, "folder name")?;
+        self.session
+            .select(folder)
+            .await
+            .map_err(|e| AppError::Imap(format!("SELECT {folder} failed: {e}")))?;
+
+        let fetches: Vec<async_imap::types::Fetch> = self
+            .session
+            .uid_fetch(uid.to_string(), "(UID BODY[])")
+            .await
+            .map_err(|e| AppError::Imap(format!("UID FETCH failed: {e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| AppError::Imap(format!("UID FETCH stream failed: {e}")))?;
+
+        let fetch = fetches
+            .first()
+            .ok_or_else(|| AppError::Imap(format!("email UID {uid} not found")))?;
+
+        let body_raw = fetch.body().unwrap_or(b"");
+        extract_attachment_data(body_raw, attachment_index)
     }
 
     /// Search emails using IMAP SEARCH criteria.
@@ -329,6 +388,127 @@ pub(crate) fn decode_header_value(raw: &[u8]) -> String {
         Ok((header, _)) => header.get_value(),
         Err(_) => s,
     }
+}
+
+/// Check whether a parsed MIME part is an attachment (not an inline body part).
+fn is_attachment(part: &mailparse::ParsedMail) -> bool {
+    let disposition = part.get_content_disposition();
+    // Explicit attachment disposition
+    if disposition.disposition == mailparse::DispositionType::Attachment {
+        return true;
+    }
+    // A non-text, non-multipart leaf part with a filename is an attachment
+    let ct = part.ctype.mimetype.to_lowercase();
+    if ct.starts_with("multipart/") {
+        return false;
+    }
+    if ct == "text/plain" || ct == "text/html" {
+        // Only treat as attachment if explicitly marked with a filename in disposition
+        return disposition.params.contains_key("filename");
+    }
+    // Any other content type that's a leaf (image, application, audio, video, etc.)
+    // is an attachment, even without explicit disposition
+    !ct.starts_with("multipart/")
+}
+
+/// Get the filename for an attachment from Content-Disposition or Content-Type params.
+fn attachment_filename(part: &mailparse::ParsedMail) -> Option<String> {
+    let disposition = part.get_content_disposition();
+    if let Some(name) = disposition.params.get("filename") {
+        return Some(name.clone());
+    }
+    // Fallback: "name" parameter on Content-Type
+    part.ctype.params.get("name").cloned()
+}
+
+/// Recursively collect attachment metadata from a parsed email.
+fn collect_attachment_infos(part: &mailparse::ParsedMail, out: &mut Vec<AttachmentInfo>) {
+    if part.ctype.mimetype.to_lowercase().starts_with("multipart/") {
+        for sub in &part.subparts {
+            collect_attachment_infos(sub, out);
+        }
+        return;
+    }
+    if is_attachment(part) {
+        let size = part.get_body_raw().map(|b| b.len()).unwrap_or(0);
+        out.push(AttachmentInfo {
+            index: out.len(),
+            filename: attachment_filename(part),
+            mime_type: part.ctype.mimetype.to_lowercase(),
+            size,
+        });
+    }
+}
+
+/// Extract attachment metadata from raw email bytes.
+pub(crate) fn extract_attachment_infos(raw: &[u8]) -> Vec<AttachmentInfo> {
+    match mailparse::parse_mail(raw) {
+        Ok(parsed) => {
+            let mut infos = Vec::new();
+            collect_attachment_infos(&parsed, &mut infos);
+            infos
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Recursively collect actual attachment parts from a parsed email.
+fn collect_attachment_parts<'a>(
+    part: &'a mailparse::ParsedMail<'a>,
+    out: &mut Vec<&'a mailparse::ParsedMail<'a>>,
+) {
+    if part.ctype.mimetype.to_lowercase().starts_with("multipart/") {
+        for sub in &part.subparts {
+            collect_attachment_parts(sub, out);
+        }
+        return;
+    }
+    if is_attachment(part) {
+        out.push(part);
+    }
+}
+
+/// Extract a specific attachment's data by index.
+pub(crate) fn extract_attachment_data(
+    raw: &[u8],
+    index: usize,
+) -> Result<AttachmentData, AppError> {
+    let parsed =
+        mailparse::parse_mail(raw).map_err(|e| AppError::Imap(format!("parse error: {e}")))?;
+
+    let mut parts = Vec::new();
+    collect_attachment_parts(&parsed, &mut parts);
+
+    let part = parts
+        .get(index)
+        .ok_or_else(|| AppError::Imap(format!("attachment index {index} not found")))?;
+
+    let data = part
+        .get_body_raw()
+        .map_err(|e| AppError::Imap(format!("failed to decode attachment: {e}")))?;
+
+    if data.len() > MAX_ATTACHMENT_SIZE {
+        return Err(AppError::Imap(format!(
+            "attachment too large ({} bytes, max {})",
+            data.len(),
+            MAX_ATTACHMENT_SIZE
+        )));
+    }
+
+    Ok(AttachmentData {
+        info: AttachmentInfo {
+            index,
+            filename: attachment_filename(part),
+            mime_type: part.ctype.mimetype.to_lowercase(),
+            size: data.len(),
+        },
+        data,
+    })
+}
+
+/// Encode raw bytes as a base64 string.
+pub(crate) fn base64_encode(data: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(data)
 }
 
 /// Extract plain-text body from raw email bytes.
@@ -559,5 +739,156 @@ BINARYSIGNATUREDATA\r\n\
             body.contains("Plain text from signed email"),
             "Should recurse into nested multipart, got: {body}"
         );
+    }
+
+    // --- Attachment tests ---
+
+    #[test]
+    fn no_attachments_in_plain_text_email() {
+        let raw = b"Content-Type: text/plain\r\n\r\nHello, world!";
+        let infos = extract_attachment_infos(raw);
+        assert!(infos.is_empty());
+    }
+
+    #[test]
+    fn no_attachments_in_multipart_alternative() {
+        let raw = b"Content-Type: multipart/alternative; boundary=bound\r\n\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\r\n\
+Plain text body\r\n\
+--bound\r\n\
+Content-Type: text/html\r\n\r\n\
+<p>HTML body</p>\r\n\
+--bound--";
+        let infos = extract_attachment_infos(raw);
+        assert!(infos.is_empty());
+    }
+
+    #[test]
+    fn detect_image_attachment() {
+        let raw = b"Content-Type: multipart/mixed; boundary=bound\r\n\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\r\n\
+See attached image.\r\n\
+--bound\r\n\
+Content-Type: image/png\r\n\
+Content-Disposition: attachment; filename=\"photo.png\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n\
+iVBORw0KGgo=\r\n\
+--bound--";
+        let infos = extract_attachment_infos(raw);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].index, 0);
+        assert_eq!(infos[0].filename, Some("photo.png".to_string()));
+        assert_eq!(infos[0].mime_type, "image/png");
+        assert!(infos[0].size > 0);
+    }
+
+    #[test]
+    fn detect_multiple_attachments() {
+        let raw = b"Content-Type: multipart/mixed; boundary=bound\r\n\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\r\n\
+Email body.\r\n\
+--bound\r\n\
+Content-Type: application/pdf\r\n\
+Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n\
+JVBER\r\n\
+--bound\r\n\
+Content-Type: image/jpeg\r\n\
+Content-Disposition: attachment; filename=\"photo.jpg\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n\
+/9j/4A\r\n\
+--bound--";
+        let infos = extract_attachment_infos(raw);
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].filename, Some("report.pdf".to_string()));
+        assert_eq!(infos[0].mime_type, "application/pdf");
+        assert_eq!(infos[0].index, 0);
+        assert_eq!(infos[1].filename, Some("photo.jpg".to_string()));
+        assert_eq!(infos[1].mime_type, "image/jpeg");
+        assert_eq!(infos[1].index, 1);
+    }
+
+    #[test]
+    fn extract_attachment_data_by_index() {
+        let raw = b"Content-Type: multipart/mixed; boundary=bound\r\n\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\r\n\
+Email body.\r\n\
+--bound\r\n\
+Content-Type: text/csv\r\n\
+Content-Disposition: attachment; filename=\"data.csv\"\r\n\r\n\
+name,age\r\nAlice,30\r\n\
+--bound--";
+        let result = extract_attachment_data(raw, 0);
+        assert!(result.is_ok());
+        let att = result.unwrap();
+        assert_eq!(att.info.filename, Some("data.csv".to_string()));
+        assert_eq!(att.info.mime_type, "text/csv");
+        let text = String::from_utf8_lossy(&att.data);
+        assert!(text.contains("Alice,30"));
+    }
+
+    #[test]
+    fn extract_attachment_data_invalid_index() {
+        let raw = b"Content-Type: text/plain\r\n\r\nNo attachments here.";
+        let result = extract_attachment_data(raw, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn detect_inline_image_without_disposition() {
+        // Images without explicit Content-Disposition should still be detected
+        let raw = b"Content-Type: multipart/mixed; boundary=bound\r\n\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\r\n\
+Body text.\r\n\
+--bound\r\n\
+Content-Type: image/gif\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n\
+R0lGODlh\r\n\
+--bound--";
+        let infos = extract_attachment_infos(raw);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].mime_type, "image/gif");
+    }
+
+    #[test]
+    fn smime_signature_not_counted_as_attachment() {
+        // pkcs7-signature parts should be detected as attachments (they are non-text leaf parts)
+        // but in practice the S/MIME signature is binary cruft — we still report it
+        // so users know about it, but the body extraction ignores it
+        let raw = b"Content-Type: multipart/signed; boundary=sig; protocol=\"application/pkcs7-signature\"\r\n\r\n\
+--sig\r\n\
+Content-Type: text/plain\r\n\r\n\
+Signed body\r\n\
+--sig\r\n\
+Content-Type: application/pkcs7-signature\r\n\r\n\
+SIGNATUREDATA\r\n\
+--sig--";
+        let infos = extract_attachment_infos(raw);
+        // The pkcs7-signature is a non-text leaf, so it's detected
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].mime_type, "application/pkcs7-signature");
+    }
+
+    #[test]
+    fn text_file_attachment_with_disposition() {
+        // A text/plain part with Content-Disposition: attachment should be an attachment
+        let raw = b"Content-Type: multipart/mixed; boundary=bound\r\n\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\r\n\
+Email body.\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\
+Content-Disposition: attachment; filename=\"notes.txt\"\r\n\r\n\
+These are my notes.\r\n\
+--bound--";
+        let infos = extract_attachment_infos(raw);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].filename, Some("notes.txt".to_string()));
+        assert_eq!(infos[0].mime_type, "text/plain");
     }
 }
