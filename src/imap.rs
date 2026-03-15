@@ -1,7 +1,9 @@
 use async_native_tls::TlsConnector;
 use base64::Engine;
+use chrono::Utc;
 use futures::TryStreamExt;
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::error::AppError;
 
@@ -317,6 +319,214 @@ impl ImapConnection {
             .await
             .map_err(|e| AppError::Imap(format!("STORE stream failed: {e}")))?;
         Ok(())
+    }
+
+    /// Build an RFC 2822 message from components.
+    fn build_rfc2822_message(
+        from: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+    ) -> String {
+        let date = Utc::now().format("%a, %d %b %Y %H:%M:%S +0000");
+        let message_id = format!(
+            "<{}.{}@imap-mcp>",
+            Uuid::new_v4(),
+            Utc::now().timestamp()
+        );
+        let mut msg = format!(
+            "From: {from}\r\n\
+             To: {to}\r\n\
+             Subject: {subject}\r\n\
+             Date: {date}\r\n\
+             Message-ID: {message_id}\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Transfer-Encoding: 8bit\r\n"
+        );
+        if let Some(cc) = cc {
+            msg.push_str(&format!("Cc: {cc}\r\n"));
+        }
+        if let Some(bcc) = bcc {
+            msg.push_str(&format!("Bcc: {bcc}\r\n"));
+        }
+        msg.push_str("\r\n");
+        msg.push_str(body);
+        msg
+    }
+
+    /// Create a new draft email by APPENDing to the given folder with \Draft flag.
+    /// Returns the UID of the newly created draft.
+    pub async fn create_draft(
+        &mut self,
+        folder: &str,
+        from: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+    ) -> Result<Option<u32>, AppError> {
+        Self::validate_imap_input(folder, "folder name")?;
+        Self::validate_imap_input(to, "to address")?;
+        Self::validate_imap_input(subject, "subject")?;
+        if let Some(cc) = cc {
+            Self::validate_imap_input(cc, "cc address")?;
+        }
+        if let Some(bcc) = bcc {
+            Self::validate_imap_input(bcc, "bcc address")?;
+        }
+
+        let message = Self::build_rfc2822_message(from, to, subject, body, cc, bcc);
+
+        // Get UIDNEXT before APPEND to identify the new message
+        let mailbox = self
+            .session
+            .select(folder)
+            .await
+            .map_err(|e| AppError::Imap(format!("SELECT {folder} failed: {e}")))?;
+        let uid_next_before = mailbox.uid_next;
+
+        self.session
+            .append(folder, Some("(\\Draft \\Seen)"), None, message.as_bytes())
+            .await
+            .map_err(|e| AppError::Imap(format!("APPEND failed: {e}")))?;
+
+        // Re-select to get updated state and find the new UID
+        let mailbox = self
+            .session
+            .select(folder)
+            .await
+            .map_err(|e| AppError::Imap(format!("SELECT {folder} failed: {e}")))?;
+
+        // If we know UIDNEXT, the new message should have that UID
+        if let Some(uid_next) = uid_next_before {
+            return Ok(Some(uid_next));
+        }
+
+        // Fallback: search for the most recent draft
+        if mailbox.exists > 0 {
+            let fetches: Vec<async_imap::types::Fetch> = self
+                .session
+                .fetch(mailbox.exists.to_string(), "(UID)")
+                .await
+                .map_err(|e| AppError::Imap(format!("FETCH failed: {e}")))?
+                .try_collect()
+                .await
+                .map_err(|e| AppError::Imap(format!("FETCH stream failed: {e}")))?;
+            if let Some(fetch) = fetches.first() {
+                return Ok(fetch.uid);
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Update an existing draft: delete the old one and append a new version.
+    /// Returns the UID of the new draft.
+    pub async fn update_draft(
+        &mut self,
+        folder: &str,
+        uid: u32,
+        from: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+    ) -> Result<Option<u32>, AppError> {
+        Self::validate_imap_input(folder, "folder name")?;
+        Self::validate_imap_input(to, "to address")?;
+        Self::validate_imap_input(subject, "subject")?;
+        if let Some(cc) = cc {
+            Self::validate_imap_input(cc, "cc address")?;
+        }
+        if let Some(bcc) = bcc {
+            Self::validate_imap_input(bcc, "bcc address")?;
+        }
+
+        // Verify the old draft exists
+        self.session
+            .select(folder)
+            .await
+            .map_err(|e| AppError::Imap(format!("SELECT {folder} failed: {e}")))?;
+
+        let fetches: Vec<async_imap::types::Fetch> = self
+            .session
+            .uid_fetch(uid.to_string(), "(UID FLAGS)")
+            .await
+            .map_err(|e| AppError::Imap(format!("UID FETCH failed: {e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| AppError::Imap(format!("UID FETCH stream failed: {e}")))?;
+
+        if fetches.is_empty() {
+            return Err(AppError::Imap(format!("draft UID {uid} not found")));
+        }
+
+        // Mark old draft as deleted
+        let _: Vec<async_imap::types::Fetch> = self
+            .session
+            .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
+            .await
+            .map_err(|e| AppError::Imap(format!("STORE +FLAGS failed: {e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| AppError::Imap(format!("STORE stream failed: {e}")))?;
+
+        // Expunge to permanently remove
+        let _: Vec<u32> = self
+            .session
+            .uid_expunge(uid.to_string())
+            .await
+            .map_err(|e| AppError::Imap(format!("UID EXPUNGE failed: {e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| AppError::Imap(format!("EXPUNGE stream failed: {e}")))?;
+
+        // Append the updated draft
+        let message = Self::build_rfc2822_message(from, to, subject, body, cc, bcc);
+
+        let mailbox = self
+            .session
+            .select(folder)
+            .await
+            .map_err(|e| AppError::Imap(format!("SELECT {folder} failed: {e}")))?;
+        let uid_next_before = mailbox.uid_next;
+
+        self.session
+            .append(folder, Some("(\\Draft \\Seen)"), None, message.as_bytes())
+            .await
+            .map_err(|e| AppError::Imap(format!("APPEND failed: {e}")))?;
+
+        // Re-select to find the new UID
+        let mailbox = self
+            .session
+            .select(folder)
+            .await
+            .map_err(|e| AppError::Imap(format!("SELECT {folder} failed: {e}")))?;
+
+        if let Some(uid_next) = uid_next_before {
+            return Ok(Some(uid_next));
+        }
+
+        if mailbox.exists > 0 {
+            let fetches: Vec<async_imap::types::Fetch> = self
+                .session
+                .fetch(mailbox.exists.to_string(), "(UID)")
+                .await
+                .map_err(|e| AppError::Imap(format!("FETCH failed: {e}")))?
+                .try_collect()
+                .await
+                .map_err(|e| AppError::Imap(format!("FETCH stream failed: {e}")))?;
+            if let Some(fetch) = fetches.first() {
+                return Ok(fetch.uid);
+            }
+        }
+
+        Ok(None)
     }
 
     /// Logout cleanly.
@@ -872,6 +1082,75 @@ SIGNATUREDATA\r\n\
         // The pkcs7-signature is a non-text leaf, so it's detected
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].mime_type, "application/pkcs7-signature");
+    }
+
+    // --- Draft / RFC 2822 message building tests ---
+
+    #[test]
+    fn build_rfc2822_basic_message() {
+        let msg = ImapConnection::build_rfc2822_message(
+            "alice@example.com",
+            "bob@example.com",
+            "Test Subject",
+            "Hello, Bob!",
+            None,
+            None,
+        );
+        assert!(msg.contains("From: alice@example.com\r\n"));
+        assert!(msg.contains("To: bob@example.com\r\n"));
+        assert!(msg.contains("Subject: Test Subject\r\n"));
+        assert!(msg.contains("MIME-Version: 1.0\r\n"));
+        assert!(msg.contains("Content-Type: text/plain; charset=utf-8\r\n"));
+        assert!(msg.contains("Message-ID: <"));
+        assert!(msg.contains("\r\n\r\nHello, Bob!"));
+        // Should NOT contain Cc or Bcc headers
+        assert!(!msg.contains("Cc:"));
+        assert!(!msg.contains("Bcc:"));
+    }
+
+    #[test]
+    fn build_rfc2822_with_cc_and_bcc() {
+        let msg = ImapConnection::build_rfc2822_message(
+            "alice@example.com",
+            "bob@example.com",
+            "With CC",
+            "Body text",
+            Some("carol@example.com"),
+            Some("dave@example.com"),
+        );
+        assert!(msg.contains("Cc: carol@example.com\r\n"));
+        assert!(msg.contains("Bcc: dave@example.com\r\n"));
+    }
+
+    #[test]
+    fn build_rfc2822_header_body_separator() {
+        let msg = ImapConnection::build_rfc2822_message(
+            "a@b.com",
+            "c@d.com",
+            "Sub",
+            "The body",
+            None,
+            None,
+        );
+        // Must have exactly one \r\n\r\n separating headers from body
+        let parts: Vec<&str> = msg.splitn(2, "\r\n\r\n").collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1], "The body");
+    }
+
+    #[test]
+    fn build_rfc2822_parseable_by_mailparse() {
+        let msg = ImapConnection::build_rfc2822_message(
+            "sender@test.com",
+            "recipient@test.com",
+            "Parse Test",
+            "Can mailparse handle this?",
+            Some("cc@test.com"),
+            None,
+        );
+        let parsed = mailparse::parse_mail(msg.as_bytes()).expect("should parse as valid email");
+        let body = parsed.get_body().expect("should extract body");
+        assert!(body.contains("Can mailparse handle this?"));
     }
 
     #[test]
