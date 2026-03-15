@@ -138,7 +138,9 @@ impl ImapMcpServer {
         Ok(CallToolResult::success(vec![json]))
     }
 
-    #[tool(description = "Fetch a full email by UID. Returns headers, plain-text body, and a list of attachments with metadata (filename, mime_type, size, index). Use get_attachment with the index to fetch attachment content.")]
+    #[tool(
+        description = "Fetch a full email by UID. Returns headers, plain-text body, and a list of attachments with metadata (filename, mime_type, size, index). Use get_attachment with the index to fetch attachment content."
+    )]
     async fn get_email(
         &self,
         Parameters(params): Parameters<GetEmailParams>,
@@ -195,12 +197,10 @@ impl ImapMcpServer {
             || mime == "application/csv"
         {
             let text = String::from_utf8_lossy(&attachment.data).to_string();
-            return Ok(CallToolResult::success(vec![
-                Content::text(format!(
-                    "Text attachment: {filename} ({mime}, {} bytes)\n\n{text}",
-                    attachment.info.size
-                )),
-            ]));
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Text attachment: {filename} ({mime}, {} bytes)\n\n{text}",
+                attachment.info.size
+            ))]));
         }
 
         // Everything else: return as base64-encoded blob with metadata
