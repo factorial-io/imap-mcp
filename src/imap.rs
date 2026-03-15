@@ -5,8 +5,8 @@ use serde::Serialize;
 
 use crate::error::AppError;
 
-/// Maximum attachment size we'll return (10 MB).
-const MAX_ATTACHMENT_SIZE: usize = 10 * 1024 * 1024;
+/// Maximum attachment size we'll return (25 MB).
+const MAX_ATTACHMENT_SIZE: usize = 25 * 1024 * 1024;
 
 /// Summary of an email for list views.
 #[derive(Debug, Serialize)]
