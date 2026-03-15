@@ -8,6 +8,9 @@ use crate::error::AppError;
 /// Maximum attachment size we'll return (25 MB).
 const MAX_ATTACHMENT_SIZE: usize = 25 * 1024 * 1024;
 
+/// Maximum text content size returned to the LLM (200 KB).
+pub const MAX_LLM_CONTENT_SIZE: usize = 200 * 1024;
+
 /// Summary of an email for list views.
 #[derive(Debug, Serialize)]
 pub struct EmailSummary {

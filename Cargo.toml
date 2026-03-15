@@ -51,6 +51,12 @@ sha2 = { version = "0.10.8" }
 # Secret management
 secrecy = { version = "0.10.3", features = ["serde"] }
 
+# Text extraction
+pdf-extract = { version = "0.10" }
+calamine = { version = "0.34" }
+zip = { version = "2" }
+quick-xml = { version = "0.37" }
+
 # Misc
 uuid = { version = "1.16.0", features = ["v4"] }
 chrono = { version = "0.4.40", features = ["serde"] }
