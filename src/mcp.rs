@@ -5,7 +5,7 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
-use crate::imap::{self, ImapConnection};
+use crate::imap::{self, DraftContent, ImapConnection};
 
 /// MCP server instance — one per request, holds session context.
 pub struct ImapMcpServer {
@@ -96,8 +96,51 @@ pub struct MarkParams {
     pub folder: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateDraftParams {
+    /// Recipient email address(es), comma-separated for multiple
+    pub to: String,
+    /// Email subject line
+    pub subject: String,
+    /// Plain text email body
+    pub body: String,
+    /// CC recipient(s), comma-separated (optional)
+    #[serde(default)]
+    pub cc: Option<String>,
+    /// BCC recipient(s), comma-separated (optional)
+    #[serde(default)]
+    pub bcc: Option<String>,
+    /// IMAP folder to save the draft in (default: Drafts)
+    #[serde(default = "default_drafts")]
+    pub folder: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpdateDraftParams {
+    /// UID of the existing draft to update
+    pub uid: u32,
+    /// Recipient email address(es), comma-separated for multiple
+    pub to: String,
+    /// Email subject line
+    pub subject: String,
+    /// Plain text email body
+    pub body: String,
+    /// CC recipient(s), comma-separated (optional)
+    #[serde(default)]
+    pub cc: Option<String>,
+    /// BCC recipient(s), comma-separated (optional)
+    #[serde(default)]
+    pub bcc: Option<String>,
+    /// IMAP folder containing the draft (default: Drafts)
+    #[serde(default = "default_drafts")]
+    pub folder: String,
+}
+
 fn default_inbox() -> String {
     "INBOX".to_string()
+}
+fn default_drafts() -> String {
+    "Drafts".to_string()
 }
 fn default_limit() -> u32 {
     20
@@ -260,6 +303,70 @@ impl ImapMcpServer {
             params.uid
         ))]))
     }
+
+    #[tool(
+        description = "Create a new draft email. The draft is saved to the specified folder (default: Drafts) and can be edited later with update_draft or sent from your email client."
+    )]
+    async fn create_draft(
+        &self,
+        Parameters(params): Parameters<CreateDraftParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let mut conn = self.connect().await?;
+        let draft = DraftContent {
+            from: &self.email,
+            to: &params.to,
+            subject: &params.subject,
+            body: &params.body,
+            cc: params.cc.as_deref(),
+            bcc: params.bcc.as_deref(),
+        };
+        let uid = conn
+            .create_draft(&params.folder, &draft)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
+        conn.logout().await.ok();
+
+        let uid_info = match uid {
+            Some(uid) => format!(" (UID: {uid})"),
+            None => String::new(),
+        };
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Draft created in folder '{}'{uid_info}",
+            params.folder
+        ))]))
+    }
+
+    #[tool(
+        description = "Update an existing draft email by UID. Replaces the old draft with the new content in the same folder."
+    )]
+    async fn update_draft(
+        &self,
+        Parameters(params): Parameters<UpdateDraftParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let mut conn = self.connect().await?;
+        let draft = DraftContent {
+            from: &self.email,
+            to: &params.to,
+            subject: &params.subject,
+            body: &params.body,
+            cc: params.cc.as_deref(),
+            bcc: params.bcc.as_deref(),
+        };
+        let new_uid = conn
+            .update_draft(&params.folder, params.uid, &draft)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
+        conn.logout().await.ok();
+
+        let new_uid_info = match new_uid {
+            Some(uid) => format!(" New UID: {uid}"),
+            None => String::new(),
+        };
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Draft UID {} updated in folder '{}'.{new_uid_info}",
+            params.uid, params.folder
+        ))]))
+    }
 }
 
 #[tool_handler]
@@ -269,7 +376,7 @@ impl ServerHandler for ImapMcpServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions(
-            "IMAP email server. Use the tools to list folders, read emails, search, manage read status, and fetch attachments. When reading an email with get_email, attachment metadata is included. Use get_attachment with the attachment index to fetch the actual content — images are returned as visible image content, text files as text, and other formats as base64.".to_string(),
+            "IMAP email server. Use the tools to list folders, read emails, search, manage read status, fetch attachments, and create or edit drafts. When reading an email with get_email, attachment metadata is included. Use get_attachment with the attachment index to fetch the actual content — images are returned as visible image content, text files as text, and other formats as base64. Use create_draft to compose a new draft and update_draft to modify an existing one.".to_string(),
         )
     }
 }
