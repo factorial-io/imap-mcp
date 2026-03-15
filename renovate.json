@@ -1,5 +1,130 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "labels": [
+    "dependencies",
+    "renovate"
+  ],
+  "cargo": {
+    "rangeStrategy": "update-lockfile"
+  },
+  "packageRules": [
+    {
+      "matchManagers": ["cargo"],
+      "rangeStrategy": "update-lockfile",
+      "enabled": true
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "addLabels": [
+        "rust"
+      ]
+    },
+    {
+      "groupName": "utoipa packages",
+      "matchPackageNames": [
+        "/^utoipa[-_]?/"
+      ]
+    },
+    {
+      "matchPackageNames": [
+        "capnp",
+        "capnpc"
+      ],
+      "groupName": "capnp packages"
+    },
+    {
+      "groupName": "futures packages",
+      "matchPackageNames": [
+        "/^futures[-_]?/"
+      ]
+    },
+    {
+      "groupName": "opentelemetry packages",
+      "matchPackageNames": [
+        "/^opentelemetry[-_]?/",
+        "/^tracing-opentelemetry$/",
+        "/^init-tracing-opentelemetry$/",
+        "/^axum-tracing-opentelemetry$/"
+      ]
+    },
+    {
+      "groupName": "gRPC-related packages",
+      "matchPackageNames": [
+        "/^prost[-_]?/",
+        "/^tonic[-_]?/"
+      ]
+    },
+    {
+      "groupName": "rusoto packages",
+      "matchPackageNames": [
+        "/^rusoto[-_]?/"
+      ]
+    },
+    {
+      "groupName": "serde packages",
+      "matchPackageNames": [
+        "/^serde[-_]?/"
+      ]
+    },
+    {
+      "groupName": "tokio packages",
+      "matchPackageNames": [
+        "/^tokio[-_]?/"
+      ]
+    },
+    {
+      "groupName": "tracing packages",
+      "matchPackageNames": [
+        "/^tracing[-_]?/",
+        "!tracing-opentelemetry"
+      ]
+    },
+    {
+      "matchPackageNames": [
+        "hyper-rustls",
+        "rustls",
+        "rustls-native-certs",
+        "tokio-rustls",
+        "webpki",
+        "webpki-roots"
+      ],
+      "groupName": "rustls packages"
+    },
+    {
+      "matchManagers": [
+        "bun"
+      ],
+      "automerge": true,
+      "platformAutomerge": true,
+      "gitLabIgnoreApprovals": true,
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "groupName": "Bun dependencies auto-merge (patch)"
+    },
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "automerge": true,
+      "platformAutomerge": true,
+      "gitLabIgnoreApprovals": true,
+      "matchUpdateTypes": [
+        "patch"
+      ],
+      "groupName": "Rust dependencies auto-merge (patch)"
+    },
+    {
+      "matchDatasources": [
+        "docker"
+      ],
+      "addLabels": [
+        "docker"
+      ]
+    }
+  ],
   "extends": [
     "config:recommended"
   ]
