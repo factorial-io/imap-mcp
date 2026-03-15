@@ -334,26 +334,40 @@ impl ImapConnection {
         Ok(())
     }
 
+    /// Encode a header value as an RFC 2047 encoded-word if it contains non-ASCII,
+    /// otherwise return it unchanged.
+    fn encode_rfc2047_if_needed(value: &str) -> String {
+        if value.is_ascii() {
+            return value.to_string();
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(value.as_bytes());
+        format!("=?UTF-8?B?{encoded}?=")
+    }
+
     /// Build an RFC 2822 message from draft content.
     fn build_rfc2822_message(draft: &DraftContent<'_>) -> String {
         let date = Utc::now().format("%a, %d %b %Y %H:%M:%S +0000");
         let message_id = format!("<{}.{}@imap-mcp>", Uuid::new_v4(), Utc::now().timestamp());
+        let encoded_from = Self::encode_rfc2047_if_needed(draft.from);
+        let encoded_to = Self::encode_rfc2047_if_needed(draft.to);
+        let encoded_subject = Self::encode_rfc2047_if_needed(draft.subject);
         let mut msg = format!(
-            "From: {}\r\n\
-             To: {}\r\n\
-             Subject: {}\r\n\
+            "From: {encoded_from}\r\n\
+             To: {encoded_to}\r\n\
+             Subject: {encoded_subject}\r\n\
              Date: {date}\r\n\
              Message-ID: {message_id}\r\n\
              MIME-Version: 1.0\r\n\
              Content-Type: text/plain; charset=utf-8\r\n\
              Content-Transfer-Encoding: 8bit\r\n",
-            draft.from, draft.to, draft.subject
         );
         if let Some(cc) = draft.cc {
-            msg.push_str(&format!("Cc: {cc}\r\n"));
+            let encoded_cc = Self::encode_rfc2047_if_needed(cc);
+            msg.push_str(&format!("Cc: {encoded_cc}\r\n"));
         }
         if let Some(bcc) = draft.bcc {
-            msg.push_str(&format!("Bcc: {bcc}\r\n"));
+            let encoded_bcc = Self::encode_rfc2047_if_needed(bcc);
+            msg.push_str(&format!("Bcc: {encoded_bcc}\r\n"));
         }
         msg.push_str("\r\n");
         msg.push_str(draft.body);
@@ -362,6 +376,7 @@ impl ImapConnection {
 
     /// Validate draft content fields for IMAP injection.
     fn validate_draft_content(draft: &DraftContent<'_>) -> Result<(), AppError> {
+        Self::validate_imap_input(draft.from, "from address")?;
         Self::validate_imap_input(draft.to, "to address")?;
         Self::validate_imap_input(draft.subject, "subject")?;
         if let Some(cc) = draft.cc {
@@ -784,6 +799,7 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mailparse::MailHeaderMap;
     use std::borrow::Cow;
 
     #[test]
@@ -1147,6 +1163,95 @@ SIGNATUREDATA\r\n\
         let parsed = mailparse::parse_mail(msg.as_bytes()).expect("should parse as valid email");
         let body = parsed.get_body().expect("should extract body");
         assert!(body.contains("Can mailparse handle this?"));
+    }
+
+    #[test]
+    fn validate_draft_rejects_crlf_in_from() {
+        let draft = DraftContent {
+            from: "evil@example.com\r\nBcc: victim@example.com",
+            to: "bob@example.com",
+            subject: "Test",
+            body: "Body",
+            cc: None,
+            bcc: None,
+        };
+        let result = ImapConnection::validate_draft_content(&draft);
+        assert!(result.is_err(), "from field with CRLF should be rejected");
+    }
+
+    #[test]
+    fn validate_draft_accepts_clean_from() {
+        let draft = DraftContent {
+            from: "alice@example.com",
+            to: "bob@example.com",
+            subject: "Test",
+            body: "Body",
+            cc: None,
+            bcc: None,
+        };
+        let result = ImapConnection::validate_draft_content(&draft);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn encode_rfc2047_ascii_passthrough() {
+        let result = ImapConnection::encode_rfc2047_if_needed("Hello World");
+        assert_eq!(result, "Hello World");
+    }
+
+    #[test]
+    fn encode_rfc2047_non_ascii_encoded() {
+        let result = ImapConnection::encode_rfc2047_if_needed("Héllo Wörld");
+        assert!(result.starts_with("=?UTF-8?B?"));
+        assert!(result.ends_with("?="));
+        // Decode and verify round-trip
+        let b64_part = result
+            .strip_prefix("=?UTF-8?B?")
+            .unwrap()
+            .strip_suffix("?=")
+            .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64_part)
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "Héllo Wörld");
+    }
+
+    #[test]
+    fn build_rfc2822_non_ascii_subject_is_encoded() {
+        let draft = DraftContent {
+            from: "sender@test.com",
+            to: "recipient@test.com",
+            subject: "Ünïcödé Subject",
+            body: "Body",
+            cc: None,
+            bcc: None,
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft);
+        // Subject must be RFC 2047 encoded, not raw UTF-8
+        assert!(
+            msg.contains("Subject: =?UTF-8?B?"),
+            "Non-ASCII subject should be RFC 2047 encoded, got: {}",
+            msg.lines().find(|l| l.starts_with("Subject:")).unwrap_or("(not found)")
+        );
+        // The encoded form should be parseable by mailparse
+        let parsed = mailparse::parse_mail(msg.as_bytes()).expect("should parse");
+        let headers = parsed.get_headers();
+        let subject = headers.get_first_value("Subject").unwrap();
+        assert_eq!(subject, "Ünïcödé Subject");
+    }
+
+    #[test]
+    fn build_rfc2822_ascii_subject_not_encoded() {
+        let draft = DraftContent {
+            from: "sender@test.com",
+            to: "recipient@test.com",
+            subject: "Plain ASCII",
+            body: "Body",
+            cc: None,
+            bcc: None,
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft);
+        assert!(msg.contains("Subject: Plain ASCII\r\n"));
     }
 
     #[test]
