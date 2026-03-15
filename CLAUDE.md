@@ -15,6 +15,10 @@ cargo clippy -- -D warnings
 
 We use `jj` (Jujutsu) when available, otherwise plain `git`.
 
+## Error Handling
+
+Never suppress errors with `.unwrap()`, `.expect()`, or silent `let _ =`. Propagate errors using `?` and return meaningful errors as late as possible. Use `thiserror` for typed domain errors and `anyhow` for ad-hoc context.
+
 ## Project Layout
 
 - `src/main.rs` — entrypoint, Axum server setup
