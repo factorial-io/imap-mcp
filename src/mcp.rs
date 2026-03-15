@@ -5,7 +5,7 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
-use crate::imap::{self, ImapConnection};
+use crate::imap::{self, DraftContent, ImapConnection};
 
 /// MCP server instance — one per request, holds session context.
 pub struct ImapMcpServer {
@@ -312,16 +312,16 @@ impl ImapMcpServer {
         Parameters(params): Parameters<CreateDraftParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mut conn = self.connect().await?;
+        let draft = DraftContent {
+            from: &self.email,
+            to: &params.to,
+            subject: &params.subject,
+            body: &params.body,
+            cc: params.cc.as_deref(),
+            bcc: params.bcc.as_deref(),
+        };
         let uid = conn
-            .create_draft(
-                &params.folder,
-                &self.email,
-                &params.to,
-                &params.subject,
-                &params.body,
-                params.cc.as_deref(),
-                params.bcc.as_deref(),
-            )
+            .create_draft(&params.folder, &draft)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout().await.ok();
@@ -344,17 +344,16 @@ impl ImapMcpServer {
         Parameters(params): Parameters<UpdateDraftParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mut conn = self.connect().await?;
+        let draft = DraftContent {
+            from: &self.email,
+            to: &params.to,
+            subject: &params.subject,
+            body: &params.body,
+            cc: params.cc.as_deref(),
+            bcc: params.bcc.as_deref(),
+        };
         let new_uid = conn
-            .update_draft(
-                &params.folder,
-                params.uid,
-                &self.email,
-                &params.to,
-                &params.subject,
-                &params.body,
-                params.cc.as_deref(),
-                params.bcc.as_deref(),
-            )
+            .update_draft(&params.folder, params.uid, &draft)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout().await.ok();

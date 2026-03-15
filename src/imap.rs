@@ -7,6 +7,16 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 
+/// Fields for composing a draft email.
+pub struct DraftContent<'a> {
+    pub from: &'a str,
+    pub to: &'a str,
+    pub subject: &'a str,
+    pub body: &'a str,
+    pub cc: Option<&'a str>,
+    pub bcc: Option<&'a str>,
+}
+
 /// Maximum attachment size we'll return (25 MB).
 const MAX_ATTACHMENT_SIZE: usize = 25 * 1024 * 1024;
 
@@ -321,40 +331,43 @@ impl ImapConnection {
         Ok(())
     }
 
-    /// Build an RFC 2822 message from components.
-    fn build_rfc2822_message(
-        from: &str,
-        to: &str,
-        subject: &str,
-        body: &str,
-        cc: Option<&str>,
-        bcc: Option<&str>,
-    ) -> String {
+    /// Build an RFC 2822 message from draft content.
+    fn build_rfc2822_message(draft: &DraftContent<'_>) -> String {
         let date = Utc::now().format("%a, %d %b %Y %H:%M:%S +0000");
-        let message_id = format!(
-            "<{}.{}@imap-mcp>",
-            Uuid::new_v4(),
-            Utc::now().timestamp()
-        );
+        let message_id = format!("<{}.{}@imap-mcp>", Uuid::new_v4(), Utc::now().timestamp());
         let mut msg = format!(
-            "From: {from}\r\n\
-             To: {to}\r\n\
-             Subject: {subject}\r\n\
+            "From: {}\r\n\
+             To: {}\r\n\
+             Subject: {}\r\n\
              Date: {date}\r\n\
              Message-ID: {message_id}\r\n\
              MIME-Version: 1.0\r\n\
              Content-Type: text/plain; charset=utf-8\r\n\
-             Content-Transfer-Encoding: 8bit\r\n"
+             Content-Transfer-Encoding: 8bit\r\n",
+            draft.from, draft.to, draft.subject
         );
-        if let Some(cc) = cc {
+        if let Some(cc) = draft.cc {
             msg.push_str(&format!("Cc: {cc}\r\n"));
         }
-        if let Some(bcc) = bcc {
+        if let Some(bcc) = draft.bcc {
             msg.push_str(&format!("Bcc: {bcc}\r\n"));
         }
         msg.push_str("\r\n");
-        msg.push_str(body);
+        msg.push_str(draft.body);
         msg
+    }
+
+    /// Validate draft content fields for IMAP injection.
+    fn validate_draft_content(draft: &DraftContent<'_>) -> Result<(), AppError> {
+        Self::validate_imap_input(draft.to, "to address")?;
+        Self::validate_imap_input(draft.subject, "subject")?;
+        if let Some(cc) = draft.cc {
+            Self::validate_imap_input(cc, "cc address")?;
+        }
+        if let Some(bcc) = draft.bcc {
+            Self::validate_imap_input(bcc, "bcc address")?;
+        }
+        Ok(())
     }
 
     /// Create a new draft email by APPENDing to the given folder with \Draft flag.
@@ -362,24 +375,12 @@ impl ImapConnection {
     pub async fn create_draft(
         &mut self,
         folder: &str,
-        from: &str,
-        to: &str,
-        subject: &str,
-        body: &str,
-        cc: Option<&str>,
-        bcc: Option<&str>,
+        draft: &DraftContent<'_>,
     ) -> Result<Option<u32>, AppError> {
         Self::validate_imap_input(folder, "folder name")?;
-        Self::validate_imap_input(to, "to address")?;
-        Self::validate_imap_input(subject, "subject")?;
-        if let Some(cc) = cc {
-            Self::validate_imap_input(cc, "cc address")?;
-        }
-        if let Some(bcc) = bcc {
-            Self::validate_imap_input(bcc, "bcc address")?;
-        }
+        Self::validate_draft_content(draft)?;
 
-        let message = Self::build_rfc2822_message(from, to, subject, body, cc, bcc);
+        let message = Self::build_rfc2822_message(draft);
 
         // Get UIDNEXT before APPEND to identify the new message
         let mailbox = self
@@ -430,22 +431,10 @@ impl ImapConnection {
         &mut self,
         folder: &str,
         uid: u32,
-        from: &str,
-        to: &str,
-        subject: &str,
-        body: &str,
-        cc: Option<&str>,
-        bcc: Option<&str>,
+        draft: &DraftContent<'_>,
     ) -> Result<Option<u32>, AppError> {
         Self::validate_imap_input(folder, "folder name")?;
-        Self::validate_imap_input(to, "to address")?;
-        Self::validate_imap_input(subject, "subject")?;
-        if let Some(cc) = cc {
-            Self::validate_imap_input(cc, "cc address")?;
-        }
-        if let Some(bcc) = bcc {
-            Self::validate_imap_input(bcc, "bcc address")?;
-        }
+        Self::validate_draft_content(draft)?;
 
         // Verify the old draft exists
         self.session
@@ -487,7 +476,7 @@ impl ImapConnection {
             .map_err(|e| AppError::Imap(format!("EXPUNGE stream failed: {e}")))?;
 
         // Append the updated draft
-        let message = Self::build_rfc2822_message(from, to, subject, body, cc, bcc);
+        let message = Self::build_rfc2822_message(draft);
 
         let mailbox = self
             .session
@@ -1088,14 +1077,15 @@ SIGNATUREDATA\r\n\
 
     #[test]
     fn build_rfc2822_basic_message() {
-        let msg = ImapConnection::build_rfc2822_message(
-            "alice@example.com",
-            "bob@example.com",
-            "Test Subject",
-            "Hello, Bob!",
-            None,
-            None,
-        );
+        let draft = DraftContent {
+            from: "alice@example.com",
+            to: "bob@example.com",
+            subject: "Test Subject",
+            body: "Hello, Bob!",
+            cc: None,
+            bcc: None,
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft);
         assert!(msg.contains("From: alice@example.com\r\n"));
         assert!(msg.contains("To: bob@example.com\r\n"));
         assert!(msg.contains("Subject: Test Subject\r\n"));
@@ -1110,28 +1100,30 @@ SIGNATUREDATA\r\n\
 
     #[test]
     fn build_rfc2822_with_cc_and_bcc() {
-        let msg = ImapConnection::build_rfc2822_message(
-            "alice@example.com",
-            "bob@example.com",
-            "With CC",
-            "Body text",
-            Some("carol@example.com"),
-            Some("dave@example.com"),
-        );
+        let draft = DraftContent {
+            from: "alice@example.com",
+            to: "bob@example.com",
+            subject: "With CC",
+            body: "Body text",
+            cc: Some("carol@example.com"),
+            bcc: Some("dave@example.com"),
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft);
         assert!(msg.contains("Cc: carol@example.com\r\n"));
         assert!(msg.contains("Bcc: dave@example.com\r\n"));
     }
 
     #[test]
     fn build_rfc2822_header_body_separator() {
-        let msg = ImapConnection::build_rfc2822_message(
-            "a@b.com",
-            "c@d.com",
-            "Sub",
-            "The body",
-            None,
-            None,
-        );
+        let draft = DraftContent {
+            from: "a@b.com",
+            to: "c@d.com",
+            subject: "Sub",
+            body: "The body",
+            cc: None,
+            bcc: None,
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft);
         // Must have exactly one \r\n\r\n separating headers from body
         let parts: Vec<&str> = msg.splitn(2, "\r\n\r\n").collect();
         assert_eq!(parts.len(), 2);
@@ -1140,14 +1132,15 @@ SIGNATUREDATA\r\n\
 
     #[test]
     fn build_rfc2822_parseable_by_mailparse() {
-        let msg = ImapConnection::build_rfc2822_message(
-            "sender@test.com",
-            "recipient@test.com",
-            "Parse Test",
-            "Can mailparse handle this?",
-            Some("cc@test.com"),
-            None,
-        );
+        let draft = DraftContent {
+            from: "sender@test.com",
+            to: "recipient@test.com",
+            subject: "Parse Test",
+            body: "Can mailparse handle this?",
+            cc: Some("cc@test.com"),
+            bcc: None,
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft);
         let parsed = mailparse::parse_mail(msg.as_bytes()).expect("should parse as valid email");
         let body = parsed.get_body().expect("should extract body");
         assert!(body.contains("Can mailparse handle this?"));
