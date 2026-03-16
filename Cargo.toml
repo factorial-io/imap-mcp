@@ -35,7 +35,7 @@ base64 = { version = "0.22.1" }
 # Serialization
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140" }
-schemars = { version = "0.8.22" }
+schemars = { version = "1.0.0" }
 
 # Error handling
 thiserror = { version = "2.0.12" }
