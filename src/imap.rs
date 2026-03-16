@@ -1,9 +1,7 @@
 use async_native_tls::TlsConnector;
 use base64::Engine;
-use chrono::Utc;
 use futures::TryStreamExt;
 use serde::Serialize;
-use uuid::Uuid;
 
 use crate::error::AppError;
 
@@ -334,80 +332,54 @@ impl ImapConnection {
         Ok(())
     }
 
-    /// Encode an unstructured header value (e.g. Subject) as an RFC 2047
-    /// encoded-word if it contains non-ASCII, otherwise return it unchanged.
-    fn encode_rfc2047_unstructured(value: &str) -> String {
-        if value.is_ascii() {
-            return value.to_string();
-        }
-        let encoded = base64::engine::general_purpose::STANDARD.encode(value.as_bytes());
-        format!("=?UTF-8?B?{encoded}?=")
-    }
-
-    /// Encode an address header value for RFC 2822. Only the display-name
-    /// portion is RFC 2047 encoded; the addr-spec stays as plain ASCII.
-    /// Handles formats: `Name <addr>`, bare `addr`, and comma-separated lists.
-    fn encode_rfc2047_address(value: &str) -> String {
-        value
-            .split(',')
-            .map(|addr| {
-                let addr = addr.trim();
-                if let Some(angle_start) = addr.rfind('<') {
-                    let display_name = addr[..angle_start].trim();
-                    let addr_spec = &addr[angle_start..]; // includes <...>
-                    if display_name.is_empty() {
-                        addr.to_string()
-                    } else if display_name.is_ascii() {
-                        format!("{display_name} {addr_spec}")
-                    } else {
-                        let encoded = Self::encode_rfc2047_unstructured(display_name);
-                        format!("{encoded} {addr_spec}")
-                    }
-                } else {
-                    // Bare addr-spec (user@host) — no display name to encode
-                    addr.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    /// Normalize line endings: replace bare LF with CRLF for RFC 2822 compliance.
-    fn normalize_body_crlf(body: &str) -> String {
-        // First normalize any existing CRLF to LF, then convert all LF to CRLF.
-        // This avoids doubling existing CRLF sequences.
-        let normalized = body.replace("\r\n", "\n");
-        normalized.replace('\n', "\r\n")
-    }
-
-    /// Build an RFC 2822 message from draft content.
-    fn build_rfc2822_message(draft: &DraftContent<'_>) -> String {
-        let date = Utc::now().format("%a, %d %b %Y %H:%M:%S +0000");
-        let message_id = format!("<{}.{}@imap-mcp>", Uuid::new_v4(), Utc::now().timestamp());
-        let encoded_from = Self::encode_rfc2047_address(draft.from);
-        let encoded_to = Self::encode_rfc2047_address(draft.to);
-        let encoded_subject = Self::encode_rfc2047_unstructured(draft.subject);
-        let mut msg = format!(
-            "From: {encoded_from}\r\n\
-             To: {encoded_to}\r\n\
-             Subject: {encoded_subject}\r\n\
-             Date: {date}\r\n\
-             Message-ID: {message_id}\r\n\
-             MIME-Version: 1.0\r\n\
-             Content-Type: text/plain; charset=utf-8\r\n\
-             Content-Transfer-Encoding: 8bit\r\n",
-        );
+    /// Build an RFC 5322 message from draft content using `mail-builder`.
+    /// Handles RFC 2047 encoding, CRLF normalization, and MIME structure automatically.
+    fn build_rfc2822_message(draft: &DraftContent<'_>) -> Result<String, AppError> {
+        let mut builder = mail_builder::MessageBuilder::new();
+        builder = builder
+            .from(Self::parse_address(draft.from))
+            .to(Self::parse_address(draft.to))
+            .subject(draft.subject)
+            .text_body(draft.body);
         if let Some(cc) = draft.cc {
-            let encoded_cc = Self::encode_rfc2047_address(cc);
-            msg.push_str(&format!("Cc: {encoded_cc}\r\n"));
+            builder = builder.cc(Self::parse_address(cc));
         }
         if let Some(bcc) = draft.bcc {
-            let encoded_bcc = Self::encode_rfc2047_address(bcc);
-            msg.push_str(&format!("Bcc: {encoded_bcc}\r\n"));
+            builder = builder.bcc(Self::parse_address(bcc));
         }
-        msg.push_str("\r\n");
-        msg.push_str(&Self::normalize_body_crlf(draft.body));
-        msg
+        builder
+            .write_to_string()
+            .map_err(|e| AppError::Imap(format!("failed to build RFC 5322 message: {e}")))
+    }
+
+    /// Parse an address string into a `mail_builder::headers::address::Address`.
+    /// Supports "Display Name <email>" and bare "email" formats, including
+    /// comma-separated lists.
+    fn parse_address(value: &str) -> mail_builder::headers::address::Address<'_> {
+        let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+        if parts.len() == 1 {
+            Self::parse_single_address(parts[0])
+        } else {
+            let addrs: Vec<mail_builder::headers::address::Address<'_>> =
+                parts.into_iter().map(Self::parse_single_address).collect();
+            mail_builder::headers::address::Address::new_list(addrs)
+        }
+    }
+
+    fn parse_single_address(addr: &str) -> mail_builder::headers::address::Address<'_> {
+        if let Some(angle_start) = addr.rfind('<') {
+            let display_name = addr[..angle_start].trim();
+            let email = addr[angle_start..]
+                .trim_start_matches('<')
+                .trim_end_matches('>');
+            if display_name.is_empty() {
+                mail_builder::headers::address::Address::new_address(None::<&str>, email)
+            } else {
+                mail_builder::headers::address::Address::new_address(Some(display_name), email)
+            }
+        } else {
+            mail_builder::headers::address::Address::new_address(None::<&str>, addr)
+        }
     }
 
     /// Validate draft content fields for IMAP injection.
@@ -434,7 +406,7 @@ impl ImapConnection {
         Self::validate_imap_input(folder, "folder name")?;
         Self::validate_draft_content(draft)?;
 
-        let message = Self::build_rfc2822_message(draft);
+        let message = Self::build_rfc2822_message(draft)?;
 
         // Get UIDNEXT before APPEND to identify the new message
         let mailbox = self
@@ -530,7 +502,7 @@ impl ImapConnection {
             .map_err(|e| AppError::Imap(format!("EXPUNGE stream failed: {e}")))?;
 
         // Append the updated draft
-        let message = Self::build_rfc2822_message(draft);
+        let message = Self::build_rfc2822_message(draft)?;
 
         let mailbox = self
             .session
@@ -1140,14 +1112,13 @@ SIGNATUREDATA\r\n\
             cc: None,
             bcc: None,
         };
-        let msg = ImapConnection::build_rfc2822_message(&draft);
-        assert!(msg.contains("From: alice@example.com\r\n"));
-        assert!(msg.contains("To: bob@example.com\r\n"));
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        assert!(msg.contains("alice@example.com"));
+        assert!(msg.contains("bob@example.com"));
         assert!(msg.contains("Subject: Test Subject\r\n"));
         assert!(msg.contains("MIME-Version: 1.0\r\n"));
-        assert!(msg.contains("Content-Type: text/plain; charset=utf-8\r\n"));
-        assert!(msg.contains("Message-ID: <"));
-        assert!(msg.contains("\r\n\r\nHello, Bob!"));
+        assert!(msg.contains("\r\n\r\n"));
+        assert!(msg.contains("Hello, Bob!"));
         // Should NOT contain Cc or Bcc headers
         assert!(!msg.contains("Cc:"));
         assert!(!msg.contains("Bcc:"));
@@ -1163,9 +1134,9 @@ SIGNATUREDATA\r\n\
             cc: Some("carol@example.com"),
             bcc: Some("dave@example.com"),
         };
-        let msg = ImapConnection::build_rfc2822_message(&draft);
-        assert!(msg.contains("Cc: carol@example.com\r\n"));
-        assert!(msg.contains("Bcc: dave@example.com\r\n"));
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        assert!(msg.contains("carol@example.com"));
+        assert!(msg.contains("dave@example.com"));
     }
 
     #[test]
@@ -1178,11 +1149,12 @@ SIGNATUREDATA\r\n\
             cc: None,
             bcc: None,
         };
-        let msg = ImapConnection::build_rfc2822_message(&draft);
-        // Must have exactly one \r\n\r\n separating headers from body
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        // Must have \r\n\r\n separating headers from body
+        assert!(msg.contains("\r\n\r\n"));
         let parts: Vec<&str> = msg.splitn(2, "\r\n\r\n").collect();
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[1], "The body");
+        assert!(parts[1].contains("The body"));
     }
 
     #[test]
@@ -1195,7 +1167,7 @@ SIGNATUREDATA\r\n\
             cc: Some("cc@test.com"),
             bcc: None,
         };
-        let msg = ImapConnection::build_rfc2822_message(&draft);
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
         let parsed = mailparse::parse_mail(msg.as_bytes()).expect("should parse as valid email");
         let body = parsed.get_body().expect("should extract body");
         assert!(body.contains("Can mailparse handle this?"));
@@ -1230,90 +1202,6 @@ SIGNATUREDATA\r\n\
     }
 
     #[test]
-    fn encode_rfc2047_unstructured_ascii_passthrough() {
-        let result = ImapConnection::encode_rfc2047_unstructured("Hello World");
-        assert_eq!(result, "Hello World");
-    }
-
-    #[test]
-    fn encode_rfc2047_unstructured_non_ascii_encoded() {
-        let result = ImapConnection::encode_rfc2047_unstructured("Héllo Wörld");
-        assert!(result.starts_with("=?UTF-8?B?"));
-        assert!(result.ends_with("?="));
-        // Decode and verify round-trip
-        let b64_part = result
-            .strip_prefix("=?UTF-8?B?")
-            .unwrap()
-            .strip_suffix("?=")
-            .unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(b64_part)
-            .unwrap();
-        assert_eq!(String::from_utf8(decoded).unwrap(), "Héllo Wörld");
-    }
-
-    #[test]
-    fn encode_rfc2047_address_bare_ascii() {
-        let result = ImapConnection::encode_rfc2047_address("user@example.com");
-        assert_eq!(result, "user@example.com");
-    }
-
-    #[test]
-    fn encode_rfc2047_address_ascii_display_name() {
-        let result = ImapConnection::encode_rfc2047_address("Alice <alice@example.com>");
-        assert_eq!(result, "Alice <alice@example.com>");
-    }
-
-    #[test]
-    fn encode_rfc2047_address_non_ascii_display_name() {
-        let result = ImapConnection::encode_rfc2047_address("Müller <muller@example.com>");
-        // Display name should be encoded, addr-spec should NOT be
-        assert!(
-            result.contains("=?UTF-8?B?"),
-            "Display name should be RFC 2047 encoded"
-        );
-        assert!(
-            result.contains("<muller@example.com>"),
-            "Addr-spec must remain as plain ASCII, got: {result}"
-        );
-        assert!(
-            !result.ends_with("?="),
-            "Addr-spec should follow the encoded-word"
-        );
-    }
-
-    #[test]
-    fn encode_rfc2047_address_comma_separated_list() {
-        let result =
-            ImapConnection::encode_rfc2047_address("Müller <a@b.com>, Bob <bob@b.com>, c@d.com");
-        // Check that addr-specs are preserved
-        assert!(result.contains("<a@b.com>"));
-        assert!(result.contains("<bob@b.com>"));
-        assert!(result.contains("c@d.com"));
-        // Müller should be encoded, Bob should not
-        assert!(result.contains("=?UTF-8?B?"));
-        assert!(result.contains("Bob"));
-    }
-
-    #[test]
-    fn normalize_body_crlf_bare_lf() {
-        let result = ImapConnection::normalize_body_crlf("line1\nline2\nline3");
-        assert_eq!(result, "line1\r\nline2\r\nline3");
-    }
-
-    #[test]
-    fn normalize_body_crlf_already_correct() {
-        let result = ImapConnection::normalize_body_crlf("line1\r\nline2\r\n");
-        assert_eq!(result, "line1\r\nline2\r\n");
-    }
-
-    #[test]
-    fn normalize_body_crlf_mixed() {
-        let result = ImapConnection::normalize_body_crlf("line1\r\nline2\nline3\r\n");
-        assert_eq!(result, "line1\r\nline2\r\nline3\r\n");
-    }
-
-    #[test]
     fn build_rfc2822_non_ascii_subject_is_encoded() {
         let draft = DraftContent {
             from: "sender@test.com",
@@ -1323,16 +1211,17 @@ SIGNATUREDATA\r\n\
             cc: None,
             bcc: None,
         };
-        let msg = ImapConnection::build_rfc2822_message(&draft);
-        // Subject must be RFC 2047 encoded, not raw UTF-8
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        // Subject must not contain raw non-ASCII bytes
+        let subject_line = msg
+            .lines()
+            .find(|l| l.starts_with("Subject:"))
+            .expect("Subject header missing");
         assert!(
-            msg.contains("Subject: =?UTF-8?B?"),
-            "Non-ASCII subject should be RFC 2047 encoded, got: {}",
-            msg.lines()
-                .find(|l| l.starts_with("Subject:"))
-                .unwrap_or("(not found)")
+            subject_line.is_ascii(),
+            "Subject header must be 7-bit ASCII after encoding, got: {subject_line}"
         );
-        // The encoded form should be parseable by mailparse
+        // The encoded form should be parseable by mailparse and round-trip correctly
         let parsed = mailparse::parse_mail(msg.as_bytes()).expect("should parse");
         let headers = parsed.get_headers();
         let subject = headers.get_first_value("Subject").unwrap();
@@ -1349,7 +1238,7 @@ SIGNATUREDATA\r\n\
             cc: None,
             bcc: None,
         };
-        let msg = ImapConnection::build_rfc2822_message(&draft);
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
         assert!(msg.contains("Subject: Plain ASCII\r\n"));
     }
 
@@ -1363,18 +1252,19 @@ SIGNATUREDATA\r\n\
             cc: None,
             bcc: None,
         };
-        let msg = ImapConnection::build_rfc2822_message(&draft);
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
         let from_line = msg
             .lines()
             .find(|l| l.starts_with("From:"))
             .expect("From header missing");
         assert!(
-            from_line.contains("<muller@example.com>"),
+            from_line.contains("muller@example.com"),
             "Addr-spec must be plain ASCII in From header, got: {from_line}"
         );
+        // From header should be 7-bit ASCII (display name encoded)
         assert!(
-            from_line.contains("=?UTF-8?B?"),
-            "Display name should be encoded, got: {from_line}"
+            from_line.is_ascii(),
+            "From header must be 7-bit ASCII after encoding, got: {from_line}"
         );
     }
 
@@ -1388,10 +1278,18 @@ SIGNATUREDATA\r\n\
             cc: None,
             bcc: None,
         };
-        let msg = ImapConnection::build_rfc2822_message(&draft);
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        // Body should not contain bare LF (LF not preceded by CR)
         let body_start = msg.find("\r\n\r\n").unwrap() + 4;
         let body = &msg[body_start..];
-        assert_eq!(body, "line1\r\nline2\r\nline3");
+        let has_bare_lf = body
+            .as_bytes()
+            .windows(2)
+            .any(|w| w[1] == b'\n' && w[0] != b'\r');
+        assert!(!has_bare_lf, "Body must not contain bare LF, got: {body:?}");
+        assert!(body.contains("line1"), "Body should contain original text");
+        assert!(body.contains("line2"), "Body should contain original text");
+        assert!(body.contains("line3"), "Body should contain original text");
     }
 
     #[test]
