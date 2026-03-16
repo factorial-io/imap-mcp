@@ -354,31 +354,35 @@ impl ImapConnection {
 
     /// Parse an address string into a `mail_builder::headers::address::Address`.
     /// Supports "Display Name <email>" and bare "email" formats, including
-    /// comma-separated lists.
-    fn parse_address(value: &str) -> mail_builder::headers::address::Address<'_> {
-        let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+    /// comma-separated lists. Uses angle-bracket and quote-aware splitting
+    /// to handle display names containing commas (e.g. `"Smith, John" <j@x.com>`).
+    fn parse_address(value: &str) -> mail_builder::headers::address::Address<'static> {
+        let parts = split_address_list(value);
         if parts.len() == 1 {
-            Self::parse_single_address(parts[0])
+            Self::parse_single_address_owned(&parts[0])
         } else {
-            let addrs: Vec<mail_builder::headers::address::Address<'_>> =
-                parts.into_iter().map(Self::parse_single_address).collect();
+            let addrs: Vec<mail_builder::headers::address::Address<'static>> = parts
+                .iter()
+                .map(|p| Self::parse_single_address_owned(p))
+                .collect();
             mail_builder::headers::address::Address::new_list(addrs)
         }
     }
 
-    fn parse_single_address(addr: &str) -> mail_builder::headers::address::Address<'_> {
+    fn parse_single_address_owned(addr: &str) -> mail_builder::headers::address::Address<'static> {
         if let Some(angle_start) = addr.rfind('<') {
-            let display_name = addr[..angle_start].trim();
+            let display_name = addr[..angle_start].trim().to_string();
             let email = addr[angle_start..]
                 .trim_start_matches('<')
-                .trim_end_matches('>');
+                .trim_end_matches('>')
+                .to_string();
             if display_name.is_empty() {
-                mail_builder::headers::address::Address::new_address(None::<&str>, email)
+                mail_builder::headers::address::Address::new_address(None::<String>, email)
             } else {
                 mail_builder::headers::address::Address::new_address(Some(display_name), email)
             }
         } else {
-            mail_builder::headers::address::Address::new_address(None::<&str>, addr)
+            mail_builder::headers::address::Address::new_address(None::<String>, addr.to_string())
         }
     }
 
@@ -397,7 +401,8 @@ impl ImapConnection {
     }
 
     /// Create a new draft email by APPENDing to the given folder with \Draft flag.
-    /// Returns the UID of the newly created draft.
+    /// Returns the UID of the newly created draft (best-effort; may be approximate
+    /// without UIDPLUS/APPENDUID support from the server).
     pub async fn create_draft(
         &mut self,
         folder: &str,
@@ -451,8 +456,9 @@ impl ImapConnection {
         Ok(None)
     }
 
-    /// Update an existing draft: delete the old one and append a new version.
-    /// Returns the UID of the new draft.
+    /// Update an existing draft: append the new version first, then delete the old one.
+    /// This ordering ensures no data loss if the APPEND fails.
+    /// Returns the UID of the new draft (best-effort; may be approximate without UIDPLUS).
     pub async fn update_draft(
         &mut self,
         folder: &str,
@@ -481,27 +487,7 @@ impl ImapConnection {
             return Err(AppError::Imap(format!("draft UID {uid} not found")));
         }
 
-        // Mark old draft as deleted
-        let _: Vec<async_imap::types::Fetch> = self
-            .session
-            .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
-            .await
-            .map_err(|e| AppError::Imap(format!("STORE +FLAGS failed: {e}")))?
-            .try_collect()
-            .await
-            .map_err(|e| AppError::Imap(format!("STORE stream failed: {e}")))?;
-
-        // Expunge to permanently remove
-        let _: Vec<u32> = self
-            .session
-            .uid_expunge(uid.to_string())
-            .await
-            .map_err(|e| AppError::Imap(format!("UID EXPUNGE failed: {e}")))?
-            .try_collect()
-            .await
-            .map_err(|e| AppError::Imap(format!("EXPUNGE stream failed: {e}")))?;
-
-        // Append the updated draft
+        // Append the new draft FIRST to avoid data loss if APPEND fails
         let message = Self::build_rfc2822_message(draft)?;
 
         let mailbox = self
@@ -516,6 +502,31 @@ impl ImapConnection {
             .await
             .map_err(|e| AppError::Imap(format!("APPEND failed: {e}")))?;
 
+        // Now delete the old draft (safe — new draft already exists)
+        self.session
+            .select(folder)
+            .await
+            .map_err(|e| AppError::Imap(format!("SELECT {folder} failed: {e}")))?;
+
+        let _: Vec<async_imap::types::Fetch> = self
+            .session
+            .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
+            .await
+            .map_err(|e| AppError::Imap(format!("STORE +FLAGS failed: {e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| AppError::Imap(format!("STORE stream failed: {e}")))?;
+
+        // Use standard EXPUNGE for compatibility with servers that don't
+        // support the UIDPLUS extension (RFC 4315).
+        self.session
+            .expunge()
+            .await
+            .map_err(|e| AppError::Imap(format!("EXPUNGE failed: {e}")))?
+            .try_collect::<Vec<u32>>()
+            .await
+            .map_err(|e| AppError::Imap(format!("EXPUNGE stream failed: {e}")))?;
+
         // Re-select to find the new UID
         let mailbox = self
             .session
@@ -523,6 +534,8 @@ impl ImapConnection {
             .await
             .map_err(|e| AppError::Imap(format!("SELECT {folder} failed: {e}")))?;
 
+        // Best-effort UID: UIDNEXT captured before APPEND.
+        // For exact UID, UIDPLUS (RFC 4315) APPENDUID would be needed.
         if let Some(uid_next) = uid_next_before {
             return Ok(Some(uid_next));
         }
@@ -552,6 +565,44 @@ impl ImapConnection {
             .map_err(|e| AppError::Imap(format!("logout failed: {e}")))?;
         Ok(())
     }
+}
+
+/// Split an address list on commas that are outside angle-bracket and quoted-string groups.
+/// Handles display names containing commas, e.g. `"Smith, John" <john@example.com>`.
+fn split_address_list(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut angle_depth: usize = 0;
+    let mut in_quotes = false;
+    let mut current = String::new();
+    let mut prev = '\0';
+    for ch in value.chars() {
+        match ch {
+            '"' if prev != '\\' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            '<' if !in_quotes => {
+                angle_depth += 1;
+                current.push(ch);
+            }
+            '>' if !in_quotes => {
+                angle_depth = angle_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if angle_depth == 0 && !in_quotes => {
+                parts.push(current.trim().to_string());
+                current = String::new();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+        prev = ch;
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
 }
 
 fn parse_summary(fetch: &async_imap::types::Fetch) -> EmailSummary {
@@ -1308,5 +1359,31 @@ These are my notes.\r\n\
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].filename, Some("notes.txt".to_string()));
         assert_eq!(infos[0].mime_type, "text/plain");
+    }
+
+    // --- Address list splitting tests ---
+
+    #[test]
+    fn split_address_list_simple() {
+        let parts = split_address_list("alice@example.com, bob@example.com");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "alice@example.com");
+        assert_eq!(parts[1], "bob@example.com");
+    }
+
+    #[test]
+    fn split_address_list_quoted_comma_in_display_name() {
+        let input = r#""Smith, John" <john@example.com>, alice@example.com"#;
+        let parts = split_address_list(input);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], r#""Smith, John" <john@example.com>"#);
+        assert_eq!(parts[1], "alice@example.com");
+    }
+
+    #[test]
+    fn split_address_list_single_address() {
+        let parts = split_address_list("Alice <alice@example.com>");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0], "Alice <alice@example.com>");
     }
 }
