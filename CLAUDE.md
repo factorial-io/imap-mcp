@@ -1,29 +1,36 @@
-# Imap-mcp Development Guidelines
+# CLAUDE.md
 
-Auto-generated from all feature plans. Last updated: 2026-03-15
+Rust MCP server bridging claude.ai to IMAP email via OIDC auth.
 
-## Active Technologies
+## Build & Test
 
-- (001-limit-attachment-size)
-
-## Project Structure
-
-```text
-src/
-tests/
+```bash
+cargo build
+cargo test
+cargo fmt -- --check
+cargo clippy -- -D warnings
 ```
 
-## Commands
+## Version Control
 
-# Add commands for 
+We use `jj` (Jujutsu) when available, otherwise plain `git`.
 
-## Code Style
+## Error Handling
 
-: Follow standard conventions
+Never suppress errors with `.unwrap()`, `.expect()`, or silent `let _ =`. Propagate errors using `?` and return meaningful errors as late as possible. Use `thiserror` for typed domain errors and `anyhow` for ad-hoc context.
+
+## Project Layout
+
+- `src/main.rs` — entrypoint, Axum server setup
+- `src/lib.rs` — app config, shared state
+- `src/auth.rs` — OAuth/OIDC flow, dynamic client registration, token exchange
+- `src/mcp.rs` — MCP tool definitions (list_folders, list_emails, get_email, search_emails, mark_read, mark_unread)
+- `src/imap.rs` — IMAP client operations
+- `src/session.rs` — Redis session storage, encryption
+- `src/error.rs` — error types
+- `src/extract.rs` — text extraction for attachments (PDF, DOCX, XLSX, PPTX)
+- `tests/integration.rs` — integration tests
 
 ## Recent Changes
 
-- 001-limit-attachment-size: Added
-
-<!-- MANUAL ADDITIONS START -->
-<!-- MANUAL ADDITIONS END -->
+- 001-limit-attachment-size: Added attachment size limiting and text extraction
