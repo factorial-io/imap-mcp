@@ -28,4 +28,9 @@ Never suppress errors with `.unwrap()`, `.expect()`, or silent `let _ =`. Propag
 - `src/imap.rs` — IMAP client operations
 - `src/session.rs` — Redis session storage, encryption
 - `src/error.rs` — error types
+- `src/extract.rs` — text extraction for attachments (PDF, DOCX, XLSX, PPTX)
 - `tests/integration.rs` — integration tests
+
+## Recent Changes
+
+- 001-limit-attachment-size: Added attachment size limiting and text extraction

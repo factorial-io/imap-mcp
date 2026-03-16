@@ -1,6 +1,12 @@
 /target
 .env
+.env*
 docs/
 .agents/
 .claude/skills/
 skills-lock.json
+*.rs.bk
+*.log
+.DS_Store
+.idea/
+.vscode/

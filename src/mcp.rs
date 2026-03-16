@@ -5,7 +5,8 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
-use crate::imap::{self, DraftContent, ImapConnection};
+use crate::extract;
+use crate::imap::{self, DraftContent, ImapConnection, MAX_LLM_CONTENT_SIZE};
 
 /// MCP server instance — one per request, holds session context.
 pub struct ImapMcpServer {
@@ -200,7 +201,7 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Fetch an email attachment by UID and attachment index. Use get_email first to see the list of attachments. Returns image content for images (visible to the LLM), text for text-based files, or base64-encoded data for binary files."
+        description = "Fetch an email attachment by UID and attachment index. Use get_email first to see the list of attachments. For PDFs and Office documents (DOCX, XLSX, PPTX), returns extracted text content. For text files, returns content directly. Large content is truncated to 200 KB. Images under 200 KB are returned visually; larger images and unsupported binary formats return metadata only."
     )]
     async fn get_attachment(
         &self,
@@ -214,43 +215,82 @@ impl ImapMcpServer {
         conn.logout().await.ok();
 
         let mime = &attachment.info.mime_type;
+        let size = attachment.info.size;
         let filename = attachment
             .info
             .filename
             .clone()
             .unwrap_or_else(|| format!("attachment_{}", params.attachment_index));
 
-        // Images: return as image content so the LLM can see them
+        // 1. Try text extraction for supported document formats (PDF, DOCX, XLSX, PPTX)
+        match extract::extract_text(&attachment.data, mime) {
+            Ok(Some(raw_text)) => {
+                let format_label = extract::mime_to_format_label(mime);
+                let extracted = extract::build_extracted(raw_text, format_label);
+                let mut header = format!(
+                    "Text content extracted from: {filename} ({format_label}, {size} bytes)"
+                );
+                if extracted.truncated {
+                    header.push_str(&format!(
+                        "\nNOTE: Extracted text truncated to {} KB (full text: {} KB). Showing first portion only.",
+                        extracted.included_bytes / 1024,
+                        extracted.total_bytes / 1024,
+                    ));
+                }
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "{header}\n\n{}",
+                    extracted.text
+                ))]));
+            }
+            Err(err_msg) => {
+                // Extraction failed — return metadata with error explanation
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Attachment: {filename} ({mime}, {size} bytes)\nText extraction failed: {err_msg}. Content cannot be displayed."
+                ))]));
+            }
+            Ok(None) => {
+                // Not an extractable format — fall through to other handlers
+            }
+        }
+
+        // 2. Images: return as image content if within size limit
         if mime.starts_with("image/") {
+            // Account for ~33% base64 expansion: raw_limit * 4/3 ≈ MAX_LLM_CONTENT_SIZE
+            if size > MAX_LLM_CONTENT_SIZE * 3 / 4 {
+                let human_size = format_size(size);
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Image attachment: {filename} ({mime}, {size} bytes)\nNOTE: Image too large to include ({human_size}). Only metadata is shown."
+                ))]));
+            }
             let b64 = imap::base64_encode(&attachment.data);
             return Ok(CallToolResult::success(vec![
                 Content::text(format!(
-                    "Image attachment: {filename} ({mime}, {} bytes)",
-                    attachment.info.size
+                    "Image attachment: {filename} ({mime}, {size} bytes)"
                 )),
                 Content::image(b64, mime.clone()),
             ]));
         }
 
-        // Text-based content types: return as text
-        if mime.starts_with("text/")
-            || mime == "application/json"
-            || mime == "application/xml"
-            || mime == "application/javascript"
-            || mime == "application/csv"
-        {
-            let text = String::from_utf8_lossy(&attachment.data).to_string();
+        // 3. Text-based content types: return with truncation if needed
+        if is_text_mime(mime) {
+            let text = String::from_utf8_lossy(&attachment.data);
+            let (content, truncated) = extract::truncate_to_limit(&text, MAX_LLM_CONTENT_SIZE);
+            let mut header = format!("Text attachment: {filename} ({mime}, {size} bytes)");
+            if truncated {
+                header.push_str(&format!(
+                    "\nNOTE: Content truncated to {} KB (full size: {} KB). Showing first portion only.",
+                    content.len() / 1024,
+                    text.len() / 1024,
+                ));
+            }
             return Ok(CallToolResult::success(vec![Content::text(format!(
-                "Text attachment: {filename} ({mime}, {} bytes)\n\n{text}",
-                attachment.info.size
+                "{header}\n\n{content}"
             ))]));
         }
 
-        // Everything else: return as base64-encoded blob with metadata
-        let b64 = imap::base64_encode(&attachment.data);
+        // 4. Unsupported binary: metadata only
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Binary attachment: {filename} ({mime}, {} bytes)\nBase64-encoded data:\n{b64}",
-            attachment.info.size
+            "Binary attachment: {filename} ({mime}, {size} bytes)\nText extraction is not supported for this format. Only metadata is shown."
         ))]))
     }
 
@@ -369,6 +409,26 @@ impl ImapMcpServer {
     }
 }
 
+/// Check if a MIME type is text-based (returned as-is, not extracted).
+fn is_text_mime(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || mime == "application/json"
+        || mime == "application/xml"
+        || mime == "application/javascript"
+        || mime == "application/csv"
+}
+
+/// Format a byte size as a human-readable string.
+fn format_size(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for ImapMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -376,7 +436,7 @@ impl ServerHandler for ImapMcpServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions(
-            "IMAP email server. Use the tools to list folders, read emails, search, manage read status, fetch attachments, and create or edit drafts. When reading an email with get_email, attachment metadata is included. Use get_attachment with the attachment index to fetch the actual content — images are returned as visible image content, text files as text, and other formats as base64. Use create_draft to compose a new draft and update_draft to modify an existing one.".to_string(),
+            "IMAP email server. Use the tools to list folders, read emails, search, manage read status, fetch attachments, and create or edit drafts. When reading an email with get_email, attachment metadata is included. Use get_attachment with the attachment index to fetch the actual content — for PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. Use create_draft to compose a new draft and update_draft to modify an existing one.".to_string(),
         )
     }
 }

@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod error;
+pub mod extract;
 pub mod imap;
 pub mod mcp;
 pub mod session;

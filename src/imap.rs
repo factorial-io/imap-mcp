@@ -1,9 +1,7 @@
 use async_native_tls::TlsConnector;
 use base64::Engine;
-use chrono::Utc;
 use futures::TryStreamExt;
 use serde::Serialize;
-use uuid::Uuid;
 
 use crate::error::AppError;
 
@@ -19,6 +17,9 @@ pub struct DraftContent<'a> {
 
 /// Maximum attachment size we'll return (25 MB).
 const MAX_ATTACHMENT_SIZE: usize = 25 * 1024 * 1024;
+
+/// Maximum text content size returned to the LLM (200 KB).
+pub const MAX_LLM_CONTENT_SIZE: usize = 200 * 1024;
 
 /// Summary of an email for list views.
 #[derive(Debug, Serialize)]
@@ -331,34 +332,79 @@ impl ImapConnection {
         Ok(())
     }
 
-    /// Build an RFC 2822 message from draft content.
-    fn build_rfc2822_message(draft: &DraftContent<'_>) -> String {
-        let date = Utc::now().format("%a, %d %b %Y %H:%M:%S +0000");
-        let message_id = format!("<{}.{}@imap-mcp>", Uuid::new_v4(), Utc::now().timestamp());
-        let mut msg = format!(
-            "From: {}\r\n\
-             To: {}\r\n\
-             Subject: {}\r\n\
-             Date: {date}\r\n\
-             Message-ID: {message_id}\r\n\
-             MIME-Version: 1.0\r\n\
-             Content-Type: text/plain; charset=utf-8\r\n\
-             Content-Transfer-Encoding: 8bit\r\n",
-            draft.from, draft.to, draft.subject
+    /// Build an RFC 5322 message from draft content using `mail-builder`.
+    /// Handles RFC 2047 encoding, CRLF normalization, and MIME structure automatically.
+    fn build_rfc2822_message(draft: &DraftContent<'_>) -> Result<String, AppError> {
+        let message_id = format!(
+            "<{}.{}@imap-mcp>",
+            uuid::Uuid::new_v4(),
+            chrono::Utc::now().timestamp()
         );
+        let mut builder = mail_builder::MessageBuilder::new();
+        builder = builder
+            .message_id(message_id)
+            .from(Self::parse_address(draft.from))
+            .to(Self::parse_address(draft.to))
+            .subject(draft.subject)
+            .text_body(draft.body);
         if let Some(cc) = draft.cc {
-            msg.push_str(&format!("Cc: {cc}\r\n"));
+            builder = builder.cc(Self::parse_address(cc));
         }
         if let Some(bcc) = draft.bcc {
-            msg.push_str(&format!("Bcc: {bcc}\r\n"));
+            builder = builder.bcc(Self::parse_address(bcc));
         }
-        msg.push_str("\r\n");
-        msg.push_str(draft.body);
-        msg
+        builder
+            .write_to_string()
+            .map_err(|e| AppError::Imap(format!("failed to build RFC 5322 message: {e}")))
+    }
+
+    /// Parse an address string into a `mail_builder::headers::address::Address`.
+    /// Supports "Display Name <email>" and bare "email" formats, including
+    /// comma-separated lists. Uses angle-bracket and quote-aware splitting
+    /// to handle display names containing commas (e.g. `"Smith, John" <j@x.com>`).
+    fn parse_address(value: &str) -> mail_builder::headers::address::Address<'static> {
+        let parts = split_address_list(value);
+        if parts.len() == 1 {
+            Self::parse_single_address_owned(&parts[0])
+        } else {
+            let addrs: Vec<mail_builder::headers::address::Address<'static>> = parts
+                .iter()
+                .map(|p| Self::parse_single_address_owned(p))
+                .collect();
+            mail_builder::headers::address::Address::new_list(addrs)
+        }
+    }
+
+    fn parse_single_address_owned(addr: &str) -> mail_builder::headers::address::Address<'static> {
+        if let Some(angle_start) = addr.rfind('<') {
+            let raw_name = addr[..angle_start].trim();
+            // Strip surrounding RFC 5322 quote delimiters if present,
+            // and unescape internal sequences, so mail-builder doesn't double-quote.
+            let display_name =
+                if raw_name.starts_with('"') && raw_name.ends_with('"') && raw_name.len() >= 2 {
+                    raw_name[1..raw_name.len() - 1]
+                        .replace("\\\"", "\"")
+                        .replace("\\\\", "\\")
+                } else {
+                    raw_name.to_string()
+                };
+            let email = addr[angle_start..]
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string();
+            if display_name.is_empty() {
+                mail_builder::headers::address::Address::new_address(None::<String>, email)
+            } else {
+                mail_builder::headers::address::Address::new_address(Some(display_name), email)
+            }
+        } else {
+            mail_builder::headers::address::Address::new_address(None::<String>, addr.to_string())
+        }
     }
 
     /// Validate draft content fields for IMAP injection.
     fn validate_draft_content(draft: &DraftContent<'_>) -> Result<(), AppError> {
+        Self::validate_imap_input(draft.from, "from address")?;
         Self::validate_imap_input(draft.to, "to address")?;
         Self::validate_imap_input(draft.subject, "subject")?;
         if let Some(cc) = draft.cc {
@@ -371,7 +417,8 @@ impl ImapConnection {
     }
 
     /// Create a new draft email by APPENDing to the given folder with \Draft flag.
-    /// Returns the UID of the newly created draft.
+    /// Returns the UID of the newly created draft (best-effort; may be approximate
+    /// without UIDPLUS/APPENDUID support from the server).
     pub async fn create_draft(
         &mut self,
         folder: &str,
@@ -380,7 +427,7 @@ impl ImapConnection {
         Self::validate_imap_input(folder, "folder name")?;
         Self::validate_draft_content(draft)?;
 
-        let message = Self::build_rfc2822_message(draft);
+        let message = Self::build_rfc2822_message(draft)?;
 
         // Get UIDNEXT before APPEND to identify the new message
         let mailbox = self
@@ -425,8 +472,9 @@ impl ImapConnection {
         Ok(None)
     }
 
-    /// Update an existing draft: delete the old one and append a new version.
-    /// Returns the UID of the new draft.
+    /// Update an existing draft: append the new version first, then delete the old one.
+    /// This ordering ensures no data loss if the APPEND fails.
+    /// Returns the UID of the new draft (best-effort; may be approximate without UIDPLUS).
     pub async fn update_draft(
         &mut self,
         folder: &str,
@@ -455,28 +503,8 @@ impl ImapConnection {
             return Err(AppError::Imap(format!("draft UID {uid} not found")));
         }
 
-        // Mark old draft as deleted
-        let _: Vec<async_imap::types::Fetch> = self
-            .session
-            .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
-            .await
-            .map_err(|e| AppError::Imap(format!("STORE +FLAGS failed: {e}")))?
-            .try_collect()
-            .await
-            .map_err(|e| AppError::Imap(format!("STORE stream failed: {e}")))?;
-
-        // Expunge to permanently remove
-        let _: Vec<u32> = self
-            .session
-            .uid_expunge(uid.to_string())
-            .await
-            .map_err(|e| AppError::Imap(format!("UID EXPUNGE failed: {e}")))?
-            .try_collect()
-            .await
-            .map_err(|e| AppError::Imap(format!("EXPUNGE stream failed: {e}")))?;
-
-        // Append the updated draft
-        let message = Self::build_rfc2822_message(draft);
+        // Append the new draft FIRST to avoid data loss if APPEND fails
+        let message = Self::build_rfc2822_message(draft)?;
 
         let mailbox = self
             .session
@@ -490,6 +518,50 @@ impl ImapConnection {
             .await
             .map_err(|e| AppError::Imap(format!("APPEND failed: {e}")))?;
 
+        // Now delete the old draft (safe — new draft already exists)
+        self.session
+            .select(folder)
+            .await
+            .map_err(|e| AppError::Imap(format!("SELECT {folder} failed: {e}")))?;
+
+        let _: Vec<async_imap::types::Fetch> = self
+            .session
+            .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
+            .await
+            .map_err(|e| AppError::Imap(format!("STORE +FLAGS failed: {e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| AppError::Imap(format!("STORE stream failed: {e}")))?;
+
+        // Prefer UID EXPUNGE (RFC 4315 / UIDPLUS) to only remove the target UID.
+        // Plain expunge() removes ALL \Deleted messages, which could destroy
+        // messages deleted by other clients. Fall back to expunge() only when
+        // the server doesn't support UIDPLUS.
+        let has_uidplus = self
+            .session
+            .capabilities()
+            .await
+            .map_err(|e| AppError::Imap(format!("CAPABILITY failed: {e}")))?
+            .has_str("UIDPLUS");
+
+        if has_uidplus {
+            self.session
+                .uid_expunge(uid.to_string())
+                .await
+                .map_err(|e| AppError::Imap(format!("UID EXPUNGE failed: {e}")))?
+                .try_collect::<Vec<u32>>()
+                .await
+                .map_err(|e| AppError::Imap(format!("EXPUNGE stream failed: {e}")))?;
+        } else {
+            self.session
+                .expunge()
+                .await
+                .map_err(|e| AppError::Imap(format!("EXPUNGE failed: {e}")))?
+                .try_collect::<Vec<u32>>()
+                .await
+                .map_err(|e| AppError::Imap(format!("EXPUNGE stream failed: {e}")))?;
+        }
+
         // Re-select to find the new UID
         let mailbox = self
             .session
@@ -497,6 +569,8 @@ impl ImapConnection {
             .await
             .map_err(|e| AppError::Imap(format!("SELECT {folder} failed: {e}")))?;
 
+        // Best-effort UID: UIDNEXT captured before APPEND.
+        // For exact UID, UIDPLUS (RFC 4315) APPENDUID would be needed.
         if let Some(uid_next) = uid_next_before {
             return Ok(Some(uid_next));
         }
@@ -526,6 +600,49 @@ impl ImapConnection {
             .map_err(|e| AppError::Imap(format!("logout failed: {e}")))?;
         Ok(())
     }
+}
+
+/// Split an address list on commas that are outside angle-bracket and quoted-string groups.
+/// Handles display names containing commas, e.g. `"Smith, John" <john@example.com>`.
+fn split_address_list(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut angle_depth: usize = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut current = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\\' => {
+                escaped = !escaped;
+                current.push(ch);
+                continue;
+            }
+            '"' if !escaped => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            '<' if !in_quotes && !escaped => {
+                angle_depth += 1;
+                current.push(ch);
+            }
+            '>' if !in_quotes && !escaped => {
+                angle_depth = angle_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if angle_depth == 0 && !in_quotes && !escaped => {
+                parts.push(current.trim().to_string());
+                current = String::new();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+        escaped = false;
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
 }
 
 fn parse_summary(fetch: &async_imap::types::Fetch) -> EmailSummary {
@@ -781,6 +898,7 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mailparse::MailHeaderMap;
     use std::borrow::Cow;
 
     #[test]
@@ -1085,14 +1203,13 @@ SIGNATUREDATA\r\n\
             cc: None,
             bcc: None,
         };
-        let msg = ImapConnection::build_rfc2822_message(&draft);
-        assert!(msg.contains("From: alice@example.com\r\n"));
-        assert!(msg.contains("To: bob@example.com\r\n"));
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        assert!(msg.contains("alice@example.com"));
+        assert!(msg.contains("bob@example.com"));
         assert!(msg.contains("Subject: Test Subject\r\n"));
         assert!(msg.contains("MIME-Version: 1.0\r\n"));
-        assert!(msg.contains("Content-Type: text/plain; charset=utf-8\r\n"));
-        assert!(msg.contains("Message-ID: <"));
-        assert!(msg.contains("\r\n\r\nHello, Bob!"));
+        assert!(msg.contains("\r\n\r\n"));
+        assert!(msg.contains("Hello, Bob!"));
         // Should NOT contain Cc or Bcc headers
         assert!(!msg.contains("Cc:"));
         assert!(!msg.contains("Bcc:"));
@@ -1108,9 +1225,9 @@ SIGNATUREDATA\r\n\
             cc: Some("carol@example.com"),
             bcc: Some("dave@example.com"),
         };
-        let msg = ImapConnection::build_rfc2822_message(&draft);
-        assert!(msg.contains("Cc: carol@example.com\r\n"));
-        assert!(msg.contains("Bcc: dave@example.com\r\n"));
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        assert!(msg.contains("carol@example.com"));
+        assert!(msg.contains("dave@example.com"));
     }
 
     #[test]
@@ -1123,11 +1240,12 @@ SIGNATUREDATA\r\n\
             cc: None,
             bcc: None,
         };
-        let msg = ImapConnection::build_rfc2822_message(&draft);
-        // Must have exactly one \r\n\r\n separating headers from body
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        // Must have \r\n\r\n separating headers from body
+        assert!(msg.contains("\r\n\r\n"));
         let parts: Vec<&str> = msg.splitn(2, "\r\n\r\n").collect();
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[1], "The body");
+        assert!(parts[1].contains("The body"));
     }
 
     #[test]
@@ -1140,10 +1258,129 @@ SIGNATUREDATA\r\n\
             cc: Some("cc@test.com"),
             bcc: None,
         };
-        let msg = ImapConnection::build_rfc2822_message(&draft);
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
         let parsed = mailparse::parse_mail(msg.as_bytes()).expect("should parse as valid email");
         let body = parsed.get_body().expect("should extract body");
         assert!(body.contains("Can mailparse handle this?"));
+    }
+
+    #[test]
+    fn validate_draft_rejects_crlf_in_from() {
+        let draft = DraftContent {
+            from: "evil@example.com\r\nBcc: victim@example.com",
+            to: "bob@example.com",
+            subject: "Test",
+            body: "Body",
+            cc: None,
+            bcc: None,
+        };
+        let result = ImapConnection::validate_draft_content(&draft);
+        assert!(result.is_err(), "from field with CRLF should be rejected");
+    }
+
+    #[test]
+    fn validate_draft_accepts_clean_from() {
+        let draft = DraftContent {
+            from: "alice@example.com",
+            to: "bob@example.com",
+            subject: "Test",
+            body: "Body",
+            cc: None,
+            bcc: None,
+        };
+        let result = ImapConnection::validate_draft_content(&draft);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn build_rfc2822_non_ascii_subject_is_encoded() {
+        let draft = DraftContent {
+            from: "sender@test.com",
+            to: "recipient@test.com",
+            subject: "Ünïcödé Subject",
+            body: "Body",
+            cc: None,
+            bcc: None,
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        // Subject must not contain raw non-ASCII bytes
+        let subject_line = msg
+            .lines()
+            .find(|l| l.starts_with("Subject:"))
+            .expect("Subject header missing");
+        assert!(
+            subject_line.is_ascii(),
+            "Subject header must be 7-bit ASCII after encoding, got: {subject_line}"
+        );
+        // The encoded form should be parseable by mailparse and round-trip correctly
+        let parsed = mailparse::parse_mail(msg.as_bytes()).expect("should parse");
+        let headers = parsed.get_headers();
+        let subject = headers.get_first_value("Subject").unwrap();
+        assert_eq!(subject, "Ünïcödé Subject");
+    }
+
+    #[test]
+    fn build_rfc2822_ascii_subject_not_encoded() {
+        let draft = DraftContent {
+            from: "sender@test.com",
+            to: "recipient@test.com",
+            subject: "Plain ASCII",
+            body: "Body",
+            cc: None,
+            bcc: None,
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        assert!(msg.contains("Subject: Plain ASCII\r\n"));
+    }
+
+    #[test]
+    fn build_rfc2822_non_ascii_from_preserves_addr_spec() {
+        let draft = DraftContent {
+            from: "Müller <muller@example.com>",
+            to: "bob@example.com",
+            subject: "Test",
+            body: "Body",
+            cc: None,
+            bcc: None,
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        let from_line = msg
+            .lines()
+            .find(|l| l.starts_with("From:"))
+            .expect("From header missing");
+        assert!(
+            from_line.contains("muller@example.com"),
+            "Addr-spec must be plain ASCII in From header, got: {from_line}"
+        );
+        // From header should be 7-bit ASCII (display name encoded)
+        assert!(
+            from_line.is_ascii(),
+            "From header must be 7-bit ASCII after encoding, got: {from_line}"
+        );
+    }
+
+    #[test]
+    fn build_rfc2822_body_bare_lf_normalized() {
+        let draft = DraftContent {
+            from: "a@b.com",
+            to: "c@d.com",
+            subject: "Sub",
+            body: "line1\nline2\nline3",
+            cc: None,
+            bcc: None,
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        // Body should not contain bare LF (LF not preceded by CR)
+        let body_start = msg.find("\r\n\r\n").unwrap() + 4;
+        let body = &msg[body_start..];
+        let has_bare_lf = body
+            .as_bytes()
+            .windows(2)
+            .any(|w| w[1] == b'\n' && w[0] != b'\r');
+        assert!(!has_bare_lf, "Body must not contain bare LF, got: {body:?}");
+        assert!(body.contains("line1"), "Body should contain original text");
+        assert!(body.contains("line2"), "Body should contain original text");
+        assert!(body.contains("line3"), "Body should contain original text");
     }
 
     #[test]
@@ -1162,5 +1399,31 @@ These are my notes.\r\n\
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].filename, Some("notes.txt".to_string()));
         assert_eq!(infos[0].mime_type, "text/plain");
+    }
+
+    // --- Address list splitting tests ---
+
+    #[test]
+    fn split_address_list_simple() {
+        let parts = split_address_list("alice@example.com, bob@example.com");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "alice@example.com");
+        assert_eq!(parts[1], "bob@example.com");
+    }
+
+    #[test]
+    fn split_address_list_quoted_comma_in_display_name() {
+        let input = r#""Smith, John" <john@example.com>, alice@example.com"#;
+        let parts = split_address_list(input);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], r#""Smith, John" <john@example.com>"#);
+        assert_eq!(parts[1], "alice@example.com");
+    }
+
+    #[test]
+    fn split_address_list_single_address() {
+        let parts = split_address_list("Alice <alice@example.com>");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0], "Alice <alice@example.com>");
     }
 }
