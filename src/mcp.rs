@@ -225,10 +225,10 @@ impl ImapMcpServer {
         // 1. Try text extraction for supported document formats (PDF, DOCX, XLSX, PPTX)
         match extract::extract_text(&attachment.data, mime) {
             Ok(Some(raw_text)) => {
-                let extracted = extract::build_extracted(raw_text, mime);
+                let format_label = extract::mime_to_format_label(mime);
+                let extracted = extract::build_extracted(raw_text, format_label);
                 let mut header = format!(
-                    "Text content extracted from: {filename} ({mime}, {size} bytes, {})",
-                    extracted.source_format
+                    "Text content extracted from: {filename} ({format_label}, {size} bytes)"
                 );
                 if extracted.truncated {
                     header.push_str(&format!(
@@ -255,7 +255,8 @@ impl ImapMcpServer {
 
         // 2. Images: return as image content if within size limit
         if mime.starts_with("image/") {
-            if size > MAX_LLM_CONTENT_SIZE {
+            // Account for ~33% base64 expansion: raw_limit * 4/3 ≈ MAX_LLM_CONTENT_SIZE
+            if size > MAX_LLM_CONTENT_SIZE * 3 / 4 {
                 let human_size = format_size(size);
                 return Ok(CallToolResult::success(vec![Content::text(format!(
                     "Image attachment: {filename} ({mime}, {size} bytes)\nNOTE: Image too large to include ({human_size}). Only metadata is shown."

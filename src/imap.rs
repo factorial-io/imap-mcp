@@ -335,8 +335,14 @@ impl ImapConnection {
     /// Build an RFC 5322 message from draft content using `mail-builder`.
     /// Handles RFC 2047 encoding, CRLF normalization, and MIME structure automatically.
     fn build_rfc2822_message(draft: &DraftContent<'_>) -> Result<String, AppError> {
+        let message_id = format!(
+            "<{}.{}@imap-mcp>",
+            uuid::Uuid::new_v4(),
+            chrono::Utc::now().timestamp()
+        );
         let mut builder = mail_builder::MessageBuilder::new();
         builder = builder
+            .message_id(message_id)
             .from(Self::parse_address(draft.from))
             .to(Self::parse_address(draft.to))
             .subject(draft.subject)
@@ -371,7 +377,17 @@ impl ImapConnection {
 
     fn parse_single_address_owned(addr: &str) -> mail_builder::headers::address::Address<'static> {
         if let Some(angle_start) = addr.rfind('<') {
-            let display_name = addr[..angle_start].trim().to_string();
+            let raw_name = addr[..angle_start].trim();
+            // Strip surrounding RFC 5322 quote delimiters if present,
+            // and unescape internal sequences, so mail-builder doesn't double-quote.
+            let display_name =
+                if raw_name.starts_with('"') && raw_name.ends_with('"') && raw_name.len() >= 2 {
+                    raw_name[1..raw_name.len() - 1]
+                        .replace("\\\"", "\"")
+                        .replace("\\\\", "\\")
+                } else {
+                    raw_name.to_string()
+                };
             let email = addr[angle_start..]
                 .trim_start_matches('<')
                 .trim_end_matches('>')
@@ -517,15 +533,34 @@ impl ImapConnection {
             .await
             .map_err(|e| AppError::Imap(format!("STORE stream failed: {e}")))?;
 
-        // Use standard EXPUNGE for compatibility with servers that don't
-        // support the UIDPLUS extension (RFC 4315).
-        self.session
-            .expunge()
+        // Prefer UID EXPUNGE (RFC 4315 / UIDPLUS) to only remove the target UID.
+        // Plain expunge() removes ALL \Deleted messages, which could destroy
+        // messages deleted by other clients. Fall back to expunge() only when
+        // the server doesn't support UIDPLUS.
+        let has_uidplus = self
+            .session
+            .capabilities()
             .await
-            .map_err(|e| AppError::Imap(format!("EXPUNGE failed: {e}")))?
-            .try_collect::<Vec<u32>>()
-            .await
-            .map_err(|e| AppError::Imap(format!("EXPUNGE stream failed: {e}")))?;
+            .map_err(|e| AppError::Imap(format!("CAPABILITY failed: {e}")))?
+            .has_str("UIDPLUS");
+
+        if has_uidplus {
+            self.session
+                .uid_expunge(uid.to_string())
+                .await
+                .map_err(|e| AppError::Imap(format!("UID EXPUNGE failed: {e}")))?
+                .try_collect::<Vec<u32>>()
+                .await
+                .map_err(|e| AppError::Imap(format!("EXPUNGE stream failed: {e}")))?;
+        } else {
+            self.session
+                .expunge()
+                .await
+                .map_err(|e| AppError::Imap(format!("EXPUNGE failed: {e}")))?
+                .try_collect::<Vec<u32>>()
+                .await
+                .map_err(|e| AppError::Imap(format!("EXPUNGE stream failed: {e}")))?;
+        }
 
         // Re-select to find the new UID
         let mailbox = self
@@ -573,23 +608,28 @@ fn split_address_list(value: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut angle_depth: usize = 0;
     let mut in_quotes = false;
+    let mut escaped = false;
     let mut current = String::new();
-    let mut prev = '\0';
     for ch in value.chars() {
         match ch {
-            '"' if prev != '\\' => {
+            '\\' => {
+                escaped = !escaped;
+                current.push(ch);
+                continue;
+            }
+            '"' if !escaped => {
                 in_quotes = !in_quotes;
                 current.push(ch);
             }
-            '<' if !in_quotes => {
+            '<' if !in_quotes && !escaped => {
                 angle_depth += 1;
                 current.push(ch);
             }
-            '>' if !in_quotes => {
+            '>' if !in_quotes && !escaped => {
                 angle_depth = angle_depth.saturating_sub(1);
                 current.push(ch);
             }
-            ',' if angle_depth == 0 && !in_quotes => {
+            ',' if angle_depth == 0 && !in_quotes && !escaped => {
                 parts.push(current.trim().to_string());
                 current = String::new();
             }
@@ -597,7 +637,7 @@ fn split_address_list(value: &str) -> Vec<String> {
                 current.push(ch);
             }
         }
-        prev = ch;
+        escaped = false;
     }
     if !current.trim().is_empty() {
         parts.push(current.trim().to_string());
