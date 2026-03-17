@@ -103,7 +103,7 @@ pub struct CreateDraftParams {
     pub to: String,
     /// Email subject line
     pub subject: String,
-    /// Plain text email body
+    /// Plain text email body (use \n for line breaks)
     pub body: String,
     /// CC recipient(s), comma-separated (optional)
     #[serde(default)]
@@ -124,7 +124,7 @@ pub struct UpdateDraftParams {
     pub to: String,
     /// Email subject line
     pub subject: String,
-    /// Plain text email body
+    /// Plain text email body (use \n for line breaks)
     pub body: String,
     /// CC recipient(s), comma-separated (optional)
     #[serde(default)]
@@ -352,11 +352,12 @@ impl ImapMcpServer {
         Parameters(params): Parameters<CreateDraftParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mut conn = self.connect().await?;
+        let body = normalize_body(&params.body);
         let draft = DraftContent {
             from: &self.email,
             to: &params.to,
             subject: &params.subject,
-            body: &params.body,
+            body: &body,
             cc: params.cc.as_deref(),
             bcc: params.bcc.as_deref(),
         };
@@ -384,11 +385,12 @@ impl ImapMcpServer {
         Parameters(params): Parameters<UpdateDraftParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mut conn = self.connect().await?;
+        let body = normalize_body(&params.body);
         let draft = DraftContent {
             from: &self.email,
             to: &params.to,
             subject: &params.subject,
-            body: &params.body,
+            body: &body,
             cc: params.cc.as_deref(),
             bcc: params.bcc.as_deref(),
         };
@@ -407,6 +409,15 @@ impl ImapMcpServer {
             params.uid, params.folder
         ))]))
     }
+}
+
+/// Normalize literal escape sequences in the email body.
+///
+/// LLMs sometimes emit literal `\n` (two-character backslash + n) in JSON
+/// string values instead of actual newline characters. This converts those
+/// literal sequences to real newlines so drafts preserve intended line breaks.
+fn normalize_body(body: &str) -> String {
+    body.replace("\\n", "\n")
 }
 
 /// Check if a MIME type is text-based (returned as-is, not extracted).
@@ -438,5 +449,35 @@ impl ServerHandler for ImapMcpServer {
         .with_instructions(
             "IMAP email server. Use the tools to list folders, read emails, search, manage read status, fetch attachments, and create or edit drafts. When reading an email with get_email, attachment metadata is included. Use get_attachment with the attachment index to fetch the actual content — for PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. Use create_draft to compose a new draft and update_draft to modify an existing one.".to_string(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_body_converts_literal_backslash_n() {
+        assert_eq!(
+            normalize_body("Hello,\\n\\nParagraph one.\\n\\nBest,\\nAlice"),
+            "Hello,\n\nParagraph one.\n\nBest,\nAlice"
+        );
+    }
+
+    #[test]
+    fn normalize_body_preserves_real_newlines() {
+        assert_eq!(
+            normalize_body("Hello,\n\nAlready has newlines."),
+            "Hello,\n\nAlready has newlines."
+        );
+    }
+
+    #[test]
+    fn normalize_body_handles_mixed() {
+        // Real newlines and literal \n mixed
+        assert_eq!(
+            normalize_body("Line1\nLine2\\nLine3"),
+            "Line1\nLine2\nLine3"
+        );
     }
 }
