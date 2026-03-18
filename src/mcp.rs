@@ -416,8 +416,17 @@ impl ImapMcpServer {
 /// LLMs sometimes emit literal `\n` (two-character backslash + n) in JSON
 /// string values instead of actual newline characters. This converts those
 /// literal sequences to real newlines so drafts preserve intended line breaks.
+///
+/// Only applies when the body contains no real newlines at all — that pattern
+/// strongly indicates the LLM collapsed everything onto one line. When real
+/// newlines are already present, the body is well-formed and replacing `\n`
+/// would corrupt intentional backslash-n sequences (e.g. in code snippets).
 fn normalize_body(body: &str) -> String {
-    body.replace("\\n", "\n")
+    if !body.contains('\n') {
+        body.replace("\\n", "\n")
+    } else {
+        body.to_string()
+    }
 }
 
 /// Check if a MIME type is text-based (returned as-is, not extracted).
@@ -473,11 +482,12 @@ mod tests {
     }
 
     #[test]
-    fn normalize_body_handles_mixed() {
-        // Real newlines and literal \n mixed
+    fn normalize_body_skips_when_real_newlines_present() {
+        // When real newlines exist, literal \n is left untouched to avoid
+        // corrupting intentional backslash-n sequences (e.g. code snippets).
         assert_eq!(
             normalize_body("Line1\nLine2\\nLine3"),
-            "Line1\nLine2\nLine3"
+            "Line1\nLine2\\nLine3"
         );
     }
 }
