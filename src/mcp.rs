@@ -103,7 +103,7 @@ pub struct CreateDraftParams {
     pub to: String,
     /// Email subject line
     pub subject: String,
-    /// Plain text email body (use \n for line breaks)
+    /// Plain text email body. IMPORTANT: Use newline characters to separate paragraphs and lines — do not put everything on a single line.
     pub body: String,
     /// CC recipient(s), comma-separated (optional)
     #[serde(default)]
@@ -124,7 +124,7 @@ pub struct UpdateDraftParams {
     pub to: String,
     /// Email subject line
     pub subject: String,
-    /// Plain text email body (use \n for line breaks)
+    /// Plain text email body. IMPORTANT: Use newline characters to separate paragraphs and lines — do not put everything on a single line.
     pub body: String,
     /// CC recipient(s), comma-separated (optional)
     #[serde(default)]
@@ -345,7 +345,7 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Create a new draft email. The draft is saved to the specified folder (default: Drafts) and can be edited later with update_draft or sent from your email client."
+        description = "Create a new draft email. The body MUST contain newline characters (\\n) to separate paragraphs and lines — never send the entire body as a single line. The draft is saved to the specified folder (default: Drafts) and can be edited later with update_draft or sent from your email client."
     )]
     async fn create_draft(
         &self,
@@ -378,7 +378,7 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Update an existing draft email by UID. Replaces the old draft with the new content in the same folder."
+        description = "Update an existing draft email by UID. Replaces the old draft with the new content in the same folder. The body MUST contain newline characters (\\n) to separate paragraphs and lines."
     )]
     async fn update_draft(
         &self,
@@ -447,7 +447,7 @@ impl ServerHandler for ImapMcpServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions(
-            "IMAP email server. Use the tools to list folders, read emails, search, manage read status, fetch attachments, and create or edit drafts. When reading an email with get_email, attachment metadata is included. Use get_attachment with the attachment index to fetch the actual content — for PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. Use create_draft to compose a new draft and update_draft to modify an existing one.".to_string(),
+            "IMAP email server. Use the tools to list folders, read emails, search, manage read status, fetch attachments, and create or edit drafts. When reading an email with get_email, attachment metadata is included. Use get_attachment with the attachment index to fetch the actual content — for PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. Use create_draft to compose a new draft and update_draft to modify an existing one. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
         )
     }
 }
