@@ -204,7 +204,7 @@ fn extract_docx(data: &[u8]) -> Result<String, ExtractError> {
             }
             Ok(Event::Text(ref e)) => {
                 if in_w_t {
-                    if let Ok(t) = e.unescape() {
+                    if let Ok(t) = e.decode() {
                         text.push_str(&t);
                     }
                 }
@@ -394,7 +394,7 @@ fn extract_pptx(data: &[u8]) -> Result<String, ExtractError> {
                 }
                 Ok(Event::Text(ref e)) => {
                     if in_a_t {
-                        if let Ok(t) = e.unescape() {
+                        if let Ok(t) = e.decode() {
                             text.push_str(&t);
                             text.push('\n');
                         }
