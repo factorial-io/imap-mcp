@@ -54,7 +54,7 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 # Text extraction
 pdf-extract = { version = "0.10" }
 calamine = { version = "0.34" }
-zip = { version = "2" }
+zip = { version = "8" }
 quick-xml = { version = "0.37" }
 
 # Misc

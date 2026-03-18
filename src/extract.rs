@@ -122,7 +122,9 @@ fn extract_pdf(data: &[u8]) -> Result<String, ExtractError> {
 /// The `file.size()` check is advisory only (the ZIP header value is attacker-controlled).
 /// The actual DoS protection is `.take(MAX_ZIP_ENTRY_SIZE)` which hard-caps bytes read
 /// regardless of what the header claims.
-fn read_zip_entry_to_string(file: &mut zip::read::ZipFile<'_>) -> Result<String, ExtractError> {
+fn read_zip_entry_to_string(
+    file: &mut zip::read::ZipFile<'_, impl std::io::Read>,
+) -> Result<String, ExtractError> {
     let uncompressed = file.size();
     // Fast-path rejection for honestly-sized files; not a security boundary.
     if uncompressed > MAX_ZIP_ENTRY_SIZE {
