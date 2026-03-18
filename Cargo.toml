@@ -65,7 +65,7 @@ futures = { version = "0.3.31" }
 url = { version = "2.5.4" }
 html2text = { version = "0.12.6" }
 mailparse = { version = "0.16.0" }
-mail-builder = { version = "0.3" }
+mail-builder = { version = "0.4" }
 imap-proto = { version = "0.16.4" }
 
 [dev-dependencies]
