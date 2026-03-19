@@ -118,6 +118,105 @@ claude.ai → POST /register (dynamic client registration)
 | `RUST_LOG` | No | Log level (default: info) |
 | `BIND_ADDR` | No | Listen address (default: 0.0.0.0:8080) |
 
+## Kubernetes Deployment
+
+You can also host imap-mcp on Kubernetes. The container image is published to `ghcr.io/factorial-io/imap-mcp`.
+
+### Requirements
+
+- A Kubernetes cluster (1.24+)
+- An **Ingress controller** (e.g. nginx-ingress, Traefik) with TLS termination — claude.ai requires HTTPS
+- A **Redis** instance accessible from the cluster (e.g. via [Bitnami Redis Helm chart](https://github.com/bitnami/charts/tree/main/bitnami/redis) or a managed service)
+- An **OIDC provider** with a configured OAuth application (see [OIDC Provider Setup](#oidc-provider-setup))
+- A **Secret** containing the environment variables listed in [Environment Variables](#environment-variables)
+
+### Minimal manifests
+
+Create a Secret with your configuration:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: imap-mcp
+stringData:
+  OIDC_ISSUER_URL: "https://gitlab.example.com"
+  OIDC_CLIENT_ID: "your-client-id"
+  OIDC_CLIENT_SECRET: "your-client-secret"
+  IMAP_HOST: "mail.example.com"
+  BASE_URL: "https://imap-mcp.example.com"
+  REDIS_URL: "redis://redis:6379"
+  ENCRYPTION_KEY: "<output of: openssl rand -base64 32>"
+```
+
+Deploy the application:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: imap-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: imap-mcp
+  template:
+    metadata:
+      labels:
+        app: imap-mcp
+    spec:
+      containers:
+        - name: imap-mcp
+          image: ghcr.io/factorial-io/imap-mcp:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: imap-mcp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: imap-mcp
+spec:
+  selector:
+    app: imap-mcp
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: imap-mcp
+spec:
+  tls:
+    - hosts:
+        - imap-mcp.example.com
+      secretName: imap-mcp-tls
+  rules:
+    - host: imap-mcp.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: imap-mcp
+                port:
+                  number: 80
+```
+
+Adjust the Ingress annotations for your ingress controller and TLS setup. The container runs as a non-root user and listens on port 8080.
+
 ## Local Development
 
 A `docker-compose.dev.yml` is provided for local testing with claude.ai using ngrok as a tunnel.
