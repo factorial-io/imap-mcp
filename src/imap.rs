@@ -383,7 +383,9 @@ impl ImapConnection {
                 .split_whitespace()
                 .map(|s| s.to_string())
                 .collect();
-            builder = builder.references(refs);
+            if !refs.is_empty() {
+                builder = builder.references(refs);
+            }
         }
         builder
             .write_to_string()
