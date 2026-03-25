@@ -365,6 +365,7 @@ impl ImapMcpServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mut conn = self.connect().await?;
         let body = normalize_body(&params.body);
+        reject_flat_body(&body)?;
         let draft = DraftContent {
             from: &self.email,
             to: &params.to,
@@ -400,6 +401,7 @@ impl ImapMcpServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mut conn = self.connect().await?;
         let body = normalize_body(&params.body);
+        reject_flat_body(&body)?;
         let draft = DraftContent {
             from: &self.email,
             to: &params.to,
@@ -443,6 +445,28 @@ fn normalize_body(body: &str) -> String {
     } else {
         body.to_string()
     }
+}
+
+/// Maximum length (in Unicode scalar values) for a single-line body before we reject it.
+/// Bodies shorter than this are likely intentionally single-line (e.g. "Thanks!").
+const FLAT_BODY_THRESHOLD: usize = 100;
+
+/// Reject email bodies that appear to be a single long line with no formatting.
+///
+/// When the body exceeds [`FLAT_BODY_THRESHOLD`] characters and contains no
+/// newline characters, it almost certainly means the caller forgot to include
+/// line breaks. Returning an error forces the LLM to retry with proper
+/// paragraph breaks rather than silently saving a badly formatted draft.
+fn reject_flat_body(body: &str) -> Result<(), rmcp::ErrorData> {
+    if !body.contains('\n') && body.chars().count() > FLAT_BODY_THRESHOLD {
+        return Err(rmcp::ErrorData::invalid_params(
+            "The email body is a single long line with no newline characters. \
+             Please reformat the body with \\n characters to separate the greeting, \
+             paragraphs, and sign-off onto separate lines.",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 /// Check if a MIME type is text-based (returned as-is, not extracted).
@@ -505,5 +529,25 @@ mod tests {
             normalize_body("Line1\nLine2\\nLine3"),
             "Line1\nLine2\\nLine3"
         );
+    }
+
+    #[test]
+    fn reject_flat_body_allows_short_single_line() {
+        // Short bodies like "Thanks!" are fine without newlines.
+        assert!(reject_flat_body("Thanks for the update!").is_ok());
+    }
+
+    #[test]
+    fn reject_flat_body_allows_body_with_newlines() {
+        let body = "Hi Alice,\n\nThis is a properly formatted email body that has paragraphs separated by newlines. It is longer than the threshold.\n\nBest,\nBob";
+        assert!(reject_flat_body(body).is_ok());
+    }
+
+    #[test]
+    fn reject_flat_body_rejects_long_single_line() {
+        let body = "Hi Alice, I wanted to follow up on our conversation from yesterday about the project timeline and make sure we are aligned on the next steps for the deliverables.";
+        assert!(body.len() > FLAT_BODY_THRESHOLD);
+        let err = reject_flat_body(body).unwrap_err();
+        assert!(err.message.contains("single long line"));
     }
 }
