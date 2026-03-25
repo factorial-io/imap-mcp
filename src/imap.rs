@@ -220,11 +220,14 @@ impl ImapConnection {
                 let references = extract_header_from_parsed(&parsed.headers, "References");
                 (body, attachments, references)
             }
-            Err(_) => (
-                String::from_utf8_lossy(body_raw).to_string(),
-                Vec::new(),
-                None,
-            ),
+            Err(e) => {
+                tracing::warn!("failed to parse email UID {uid}: {e}");
+                (
+                    String::from_utf8_lossy(body_raw).to_string(),
+                    Vec::new(),
+                    None,
+                )
+            }
         };
 
         let envelope = fetch.envelope();
