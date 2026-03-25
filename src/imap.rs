@@ -447,6 +447,11 @@ impl ImapConnection {
         }
         if let Some(in_reply_to) = draft.in_reply_to {
             Self::validate_imap_input(in_reply_to, "in_reply_to")?;
+            if in_reply_to.contains(|c: char| c.is_ascii_whitespace()) {
+                return Err(AppError::Imap(
+                    "in_reply_to must be a single Message-ID with no whitespace".to_string(),
+                ));
+            }
         }
         if let Some(references) = draft.references {
             Self::validate_imap_input(references, "references")?;
@@ -866,8 +871,6 @@ pub(crate) fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
-/// Extract plain-text body from raw email bytes.
-/// Prefers text/plain; falls back to converting text/html.
 /// Extract a header value from parsed email headers.
 fn extract_header_from_parsed(
     headers: &[mailparse::MailHeader<'_>],
