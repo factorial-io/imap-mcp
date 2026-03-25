@@ -459,6 +459,13 @@ impl ImapConnection {
         }
         if let Some(references) = draft.references {
             Self::validate_imap_input(references, "references")?;
+            for token in references.split_whitespace() {
+                if !(token.starts_with('<') && token.ends_with('>')) {
+                    return Err(AppError::Imap(format!(
+                        "each Message-ID in references must be enclosed in angle brackets, got: {token}"
+                    )));
+                }
+            }
         }
         Ok(())
     }
