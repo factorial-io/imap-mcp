@@ -209,11 +209,23 @@ impl ImapConnection {
             .ok_or_else(|| AppError::Imap(format!("email UID {uid} not found")))?;
 
         let body_raw = fetch.body().unwrap_or(b"");
-        let body = extract_body(body_raw);
-        let attachments = extract_attachment_infos(body_raw);
+        // Parse the raw message once and reuse for body, attachments, and headers.
+        let (body, attachments, references) = match mailparse::parse_mail(body_raw) {
+            Ok(parsed) => {
+                let body = extract_body_from_parsed(&parsed);
+                let mut att_infos = Vec::new();
+                collect_attachment_infos(&parsed, &mut att_infos);
+                let refs = extract_header_from_parsed(&parsed.headers, "References");
+                (body, att_infos, refs)
+            }
+            Err(_) => (
+                String::from_utf8_lossy(body_raw).to_string(),
+                Vec::new(),
+                None,
+            ),
+        };
 
         let envelope = fetch.envelope();
-        let references = extract_header_value(body_raw, "References");
         Ok(EmailDetail {
             uid: fetch.uid.unwrap_or(uid),
             date: envelope.and_then(|e| {
@@ -439,6 +451,12 @@ impl ImapConnection {
         }
         if let Some(bcc) = draft.bcc {
             Self::validate_imap_input(bcc, "bcc address")?;
+        }
+        if let Some(in_reply_to) = draft.in_reply_to {
+            Self::validate_imap_input(in_reply_to, "in_reply_to")?;
+        }
+        if let Some(references) = draft.references {
+            Self::validate_imap_input(references, "references")?;
         }
         Ok(())
     }
@@ -784,7 +802,8 @@ fn collect_attachment_infos(part: &mailparse::ParsedMail, out: &mut Vec<Attachme
 }
 
 /// Extract attachment metadata from raw email bytes.
-pub(crate) fn extract_attachment_infos(raw: &[u8]) -> Vec<AttachmentInfo> {
+#[cfg(test)]
+fn extract_attachment_infos(raw: &[u8]) -> Vec<AttachmentInfo> {
     match mailparse::parse_mail(raw) {
         Ok(parsed) => {
             let mut infos = Vec::new();
@@ -856,11 +875,12 @@ pub(crate) fn base64_encode(data: &[u8]) -> String {
 
 /// Extract plain-text body from raw email bytes.
 /// Prefers text/plain; falls back to converting text/html.
-/// Extract a header value from raw RFC 5322 message bytes.
-/// Handles unfolding (continuation lines starting with whitespace).
-fn extract_header_value(raw: &[u8], header_name: &str) -> Option<String> {
-    let parsed = mailparse::parse_mail(raw).ok()?;
-    for header in &parsed.headers {
+/// Extract a header value from parsed email headers.
+fn extract_header_from_parsed(
+    headers: &[mailparse::MailHeader<'_>],
+    header_name: &str,
+) -> Option<String> {
+    for header in headers {
         if header.get_key().eq_ignore_ascii_case(header_name) {
             let val = header.get_value().trim().to_string();
             if val.is_empty() {
@@ -872,7 +892,15 @@ fn extract_header_value(raw: &[u8], header_name: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn extract_body(raw: &[u8]) -> String {
+/// Extract a header value from raw RFC 5322 message bytes.
+#[cfg(test)]
+fn extract_header_value(raw: &[u8], header_name: &str) -> Option<String> {
+    let parsed = mailparse::parse_mail(raw).ok()?;
+    extract_header_from_parsed(&parsed.headers, header_name)
+}
+
+#[cfg(test)]
+fn extract_body(raw: &[u8]) -> String {
     match mailparse::parse_mail(raw) {
         Ok(parsed) => extract_body_from_parsed(&parsed),
         Err(_) => String::from_utf8_lossy(raw).to_string(),
