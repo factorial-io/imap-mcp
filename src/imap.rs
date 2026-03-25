@@ -211,12 +211,21 @@ impl ImapConnection {
 
         let body_raw = fetch.body().unwrap_or(b"");
         // Parse the raw message once and reuse for body, attachments, and headers.
-        let parsed = mailparse::parse_mail(body_raw)
-            .map_err(|e| AppError::Imap(format!("failed to parse message body: {e}")))?;
-        let body = extract_body_from_parsed(&parsed);
-        let mut attachments = Vec::new();
-        collect_attachment_infos(&parsed, &mut attachments);
-        let references = extract_header_from_parsed(&parsed.headers, "References");
+        // Falls back gracefully for malformed emails (spam, old messages, etc.).
+        let (body, attachments, references) = match mailparse::parse_mail(body_raw) {
+            Ok(parsed) => {
+                let body = extract_body_from_parsed(&parsed);
+                let mut attachments = Vec::new();
+                collect_attachment_infos(&parsed, &mut attachments);
+                let references = extract_header_from_parsed(&parsed.headers, "References");
+                (body, attachments, references)
+            }
+            Err(_) => (
+                String::from_utf8_lossy(body_raw).to_string(),
+                Vec::new(),
+                None,
+            ),
+        };
 
         let envelope = fetch.envelope();
         Ok(EmailDetail {
