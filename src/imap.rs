@@ -475,7 +475,7 @@ impl ImapConnection {
                     "in_reply_to must be a single Message-ID with no whitespace".to_string(),
                 ));
             }
-            if !(in_reply_to.starts_with('<') && in_reply_to.ends_with('>')) {
+            if !is_valid_message_id(in_reply_to) {
                 return Err(AppError::Imap(
                     "in_reply_to must be a Message-ID enclosed in angle brackets, e.g. <id@example.com>".to_string(),
                 ));
@@ -484,7 +484,7 @@ impl ImapConnection {
         if let Some(references) = draft.references {
             Self::validate_imap_input(references, "references")?;
             for token in references.split_whitespace() {
-                if !(token.starts_with('<') && token.ends_with('>')) {
+                if !is_valid_message_id(token) {
                     return Err(AppError::Imap(format!(
                         "each Message-ID in references must be enclosed in angle brackets, got: {token}"
                     )));
@@ -678,6 +678,15 @@ impl ImapConnection {
             .map_err(|e| AppError::Imap(format!("logout failed: {e}")))?;
         Ok(())
     }
+}
+
+/// Check if a string is a valid RFC 5322 Message-ID token: `<local@domain>`.
+/// Must start with `<`, end with `>`, and contain no interior angle brackets.
+fn is_valid_message_id(s: &str) -> bool {
+    s.len() >= 3
+        && s.starts_with('<')
+        && s.ends_with('>')
+        && !s[1..s.len() - 1].contains(['<', '>'])
 }
 
 /// Split an address list on commas that are outside angle-bracket and quoted-string groups.
