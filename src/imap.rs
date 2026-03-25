@@ -386,12 +386,23 @@ impl ImapConnection {
             builder = builder.bcc(Self::parse_address(bcc));
         }
         if let Some(in_reply_to) = draft.in_reply_to {
-            builder = builder.in_reply_to(in_reply_to.to_string());
+            // Strip angle brackets — mail_builder adds its own.
+            let id = in_reply_to
+                .strip_prefix('<')
+                .and_then(|s| s.strip_suffix('>'))
+                .unwrap_or(in_reply_to);
+            builder = builder.in_reply_to(id.to_string());
         }
         if let Some(references) = draft.references {
             let refs: Vec<String> = references
                 .split_whitespace()
-                .map(|s| s.to_string())
+                .map(|s| {
+                    // Strip angle brackets — mail_builder adds its own.
+                    s.strip_prefix('<')
+                        .and_then(|s| s.strip_suffix('>'))
+                        .unwrap_or(s)
+                        .to_string()
+                })
                 .collect();
             if !refs.is_empty() {
                 builder = builder.references(refs);
@@ -1546,11 +1557,16 @@ SIGNATUREDATA\r\n\
             msg.contains("earlier@example.com"),
             "References should include earlier message"
         );
-        // Verify it's parseable
+        // Verify it's parseable and headers have exact expected values
         let parsed = mailparse::parse_mail(msg.as_bytes()).expect("should parse");
         let headers = parsed.get_headers();
         let in_reply_to = headers.get_first_value("In-Reply-To").unwrap();
-        assert!(in_reply_to.contains("original-msg-id@example.com"));
+        assert_eq!(in_reply_to.trim(), "<original-msg-id@example.com>");
+        let references = headers.get_first_value("References").unwrap();
+        assert_eq!(
+            references.trim(),
+            "<earlier@example.com> <original-msg-id@example.com>"
+        );
     }
 
     #[test]
