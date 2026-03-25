@@ -212,19 +212,21 @@ impl ImapConnection {
         let body_raw = fetch.body().unwrap_or(b"");
         // Parse the raw message once and reuse for body, attachments, and headers.
         // Falls back gracefully for malformed emails (spam, old messages, etc.).
-        let (body, attachments, references) = match mailparse::parse_mail(body_raw) {
+        let (body, attachments, references, message_id) = match mailparse::parse_mail(body_raw) {
             Ok(parsed) => {
                 let body = extract_body_from_parsed(&parsed);
                 let mut attachments = Vec::new();
                 collect_attachment_infos(&parsed, &mut attachments);
                 let references = extract_header_from_parsed(&parsed.headers, "References");
-                (body, attachments, references)
+                let message_id = extract_header_from_parsed(&parsed.headers, "Message-ID");
+                (body, attachments, references, message_id)
             }
             Err(e) => {
                 tracing::warn!("failed to parse email UID {uid}: {e}");
                 (
                     String::from_utf8_lossy(body_raw).to_string(),
                     Vec::new(),
+                    None,
                     None,
                 )
             }
@@ -242,8 +244,7 @@ impl ImapConnection {
             to: envelope.and_then(|e| format_addresses(e.to.as_deref())),
             cc: envelope.and_then(|e| format_addresses(e.cc.as_deref())),
             subject: envelope.and_then(|e| e.subject.as_ref().map(|s| decode_header_value(s))),
-            message_id: envelope
-                .and_then(|e| e.message_id.as_ref().map(|m| decode_header_value(m))),
+            message_id,
             references,
             body,
             attachments,
