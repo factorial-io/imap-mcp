@@ -233,7 +233,7 @@ impl ImapConnection {
             message_id: envelope.and_then(|e| {
                 e.message_id
                     .as_ref()
-                    .map(|m| String::from_utf8_lossy(m).to_string())
+                    .map(|m| decode_header_value(m))
             }),
             references,
             body,
@@ -452,6 +452,11 @@ impl ImapConnection {
             if in_reply_to.contains(|c: char| c.is_ascii_whitespace()) {
                 return Err(AppError::Imap(
                     "in_reply_to must be a single Message-ID with no whitespace".to_string(),
+                ));
+            }
+            if !(in_reply_to.starts_with('<') && in_reply_to.ends_with('>')) {
+                return Err(AppError::Imap(
+                    "in_reply_to must be a Message-ID enclosed in angle brackets, e.g. <id@example.com>".to_string(),
                 ));
             }
         }
@@ -873,14 +878,16 @@ pub(crate) fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
-/// Extract a header value from parsed email headers.
+/// Extract a raw header value from parsed email headers.
+/// Uses `get_value_raw()` to return the literal bytes without RFC 2047 decoding,
+/// which is correct for structured headers like `References` containing Message-IDs.
 fn extract_header_from_parsed(
     headers: &[mailparse::MailHeader<'_>],
     header_name: &str,
 ) -> Option<String> {
     for header in headers {
         if header.get_key().eq_ignore_ascii_case(header_name) {
-            let val = header.get_value().trim().to_string();
+            let val = String::from_utf8_lossy(header.get_value_raw()).trim().to_string();
             if val.is_empty() {
                 return None;
             }
