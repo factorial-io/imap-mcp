@@ -431,7 +431,7 @@ fn normalize_body(body: &str) -> String {
     }
 }
 
-/// Maximum length (in characters) for a single-line body before we reject it.
+/// Maximum length (in Unicode scalar values) for a single-line body before we reject it.
 /// Bodies shorter than this are likely intentionally single-line (e.g. "Thanks!").
 const FLAT_BODY_THRESHOLD: usize = 100;
 
@@ -442,7 +442,7 @@ const FLAT_BODY_THRESHOLD: usize = 100;
 /// line breaks. Returning an error forces the LLM to retry with proper
 /// paragraph breaks rather than silently saving a badly formatted draft.
 fn reject_flat_body(body: &str) -> Result<(), rmcp::ErrorData> {
-    if !body.contains('\n') && body.len() > FLAT_BODY_THRESHOLD {
+    if !body.contains('\n') && body.chars().count() > FLAT_BODY_THRESHOLD {
         return Err(rmcp::ErrorData::invalid_params(
             "The email body is a single long line with no newline characters. \
              Please reformat the body with \\n characters to separate the greeting, \
