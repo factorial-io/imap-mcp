@@ -230,11 +230,8 @@ impl ImapConnection {
             to: envelope.and_then(|e| format_addresses(e.to.as_deref())),
             cc: envelope.and_then(|e| format_addresses(e.cc.as_deref())),
             subject: envelope.and_then(|e| e.subject.as_ref().map(|s| decode_header_value(s))),
-            message_id: envelope.and_then(|e| {
-                e.message_id
-                    .as_ref()
-                    .map(|m| decode_header_value(m))
-            }),
+            message_id: envelope
+                .and_then(|e| e.message_id.as_ref().map(|m| decode_header_value(m))),
             references,
             body,
             attachments,
@@ -887,7 +884,9 @@ fn extract_header_from_parsed(
 ) -> Option<String> {
     for header in headers {
         if header.get_key().eq_ignore_ascii_case(header_name) {
-            let val = String::from_utf8_lossy(header.get_value_raw()).trim().to_string();
+            let val = String::from_utf8_lossy(header.get_value_raw())
+                .trim()
+                .to_string();
             if val.is_empty() {
                 return None;
             }
