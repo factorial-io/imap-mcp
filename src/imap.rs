@@ -1358,6 +1358,25 @@ SIGNATUREDATA\r\n\
     }
 
     #[test]
+    fn validate_draft_rejects_whitespace_in_in_reply_to() {
+        let draft = DraftContent {
+            from: "a@example.com",
+            to: "b@example.com",
+            subject: "Re: X",
+            body: "Body",
+            cc: None,
+            bcc: None,
+            in_reply_to: Some("<id1@x.com> <id2@x.com>"),
+            references: None,
+        };
+        let result = ImapConnection::validate_draft_content(&draft);
+        assert!(
+            result.is_err(),
+            "in_reply_to with whitespace should be rejected"
+        );
+    }
+
+    #[test]
     fn validate_draft_accepts_clean_from() {
         let draft = DraftContent {
             from: "alice@example.com",
