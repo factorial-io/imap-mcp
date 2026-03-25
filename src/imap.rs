@@ -875,18 +875,18 @@ pub(crate) fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
-/// Extract a raw header value from parsed email headers.
-/// Uses `get_value_raw()` to return the literal bytes without RFC 2047 decoding,
-/// which is correct for structured headers like `References` containing Message-IDs.
+/// Extract a header value from parsed email headers.
+/// Uses `get_value()` which performs RFC 2822 unfolding (removing CRLF+whitespace
+/// from folded headers) and RFC 2047 decoding. For structured headers like
+/// `References`, Message-IDs are not RFC 2047-encoded in practice, so decoding
+/// is a no-op, while unfolding is essential for long headers with many Message-IDs.
 fn extract_header_from_parsed(
     headers: &[mailparse::MailHeader<'_>],
     header_name: &str,
 ) -> Option<String> {
     for header in headers {
         if header.get_key().eq_ignore_ascii_case(header_name) {
-            let val = String::from_utf8_lossy(header.get_value_raw())
-                .trim()
-                .to_string();
+            let val = header.get_value().trim().to_string();
             if val.is_empty() {
                 return None;
             }
@@ -1563,6 +1563,24 @@ SIGNATUREDATA\r\n\
         assert_eq!(refs, Some("<a@x.com> <b@x.com>".to_string()));
         let missing = extract_header_value(raw, "X-Custom");
         assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn extract_header_value_unfolds_folded_references() {
+        // RFC 5322 folded header: CRLF followed by whitespace
+        let raw =
+            b"References: <a@x.com>\r\n\t<b@x.com>\r\n <c@x.com>\r\nSubject: Test\r\n\r\nBody";
+        let refs = extract_header_value(raw, "References");
+        assert!(refs.is_some(), "should parse folded References header");
+        let refs = refs.unwrap();
+        // Should not contain CRLF after unfolding
+        assert!(
+            !refs.contains('\r') && !refs.contains('\n'),
+            "unfolded References should not contain CRLF, got: {refs:?}"
+        );
+        assert!(refs.contains("<a@x.com>"));
+        assert!(refs.contains("<b@x.com>"));
+        assert!(refs.contains("<c@x.com>"));
     }
 
     #[test]
