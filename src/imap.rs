@@ -13,7 +13,8 @@ pub struct DraftContent<'a> {
     pub body: &'a str,
     pub cc: Option<&'a str>,
     pub bcc: Option<&'a str>,
-    /// Message-ID of the email being replied to (sets In-Reply-To header).
+    /// Single Message-ID of the email being replied to (sets In-Reply-To header).
+    /// Must be exactly one Message-ID, not multiple.
     pub in_reply_to: Option<&'a str>,
     /// Space-separated Message-IDs for the References header (threading chain).
     pub references: Option<&'a str>,
