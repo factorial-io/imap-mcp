@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2](https://github.com/factorial-io/imap-mcp/compare/imap-mcp-v0.1.1...imap-mcp-v0.1.2) (2026-03-25)
+
+
+### Features
+
+* add reply support to create_draft and update_draft ([09f172f](https://github.com/factorial-io/imap-mcp/commit/09f172f01fd803b19c19a3725665dc464ce5574a))
+
+
+### Bug Fixes
+
+* reject draft bodies with no newlines ([8dc4fc0](https://github.com/factorial-io/imap-mcp/commit/8dc4fc0c646d8bb2b6ce1db509e550f146adff5c))
+
 ## [imap-mcp-v0.1.1] - 2026-03-21
 
 ### Features
