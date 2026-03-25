@@ -2,18 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.2](https://github.com/factorial-io/imap-mcp/compare/imap-mcp-v0.1.1...imap-mcp-v0.1.2) (2026-03-25)
+## [imap-mcp-v0.1.2] - 2026-03-25
 
+### Dependencies
 
-### Features
+- *(deps)* Update rust crate redis to v1.1.0 ([33c0d35](https://github.com/factorial-io/imap-mcp/commit/33c0d35495fdfa12e0d8375b211dca61afef7202))
 
-* add reply support to create_draft and update_draft ([09f172f](https://github.com/factorial-io/imap-mcp/commit/09f172f01fd803b19c19a3725665dc464ce5574a))
+### Miscellaneous
 
-
-### Bug Fixes
-
-* reject draft bodies with no newlines ([8dc4fc0](https://github.com/factorial-io/imap-mcp/commit/8dc4fc0c646d8bb2b6ce1db509e550f146adff5c))
-
+- *(main)* Release imap-mcp 0.1.2 ([ccc6769](https://github.com/factorial-io/imap-mcp/commit/ccc676954938876f53a2a637fe7f02cec360180b))
 ## [imap-mcp-v0.1.1] - 2026-03-21
 
 ### Features
