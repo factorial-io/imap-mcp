@@ -686,7 +686,7 @@ fn is_valid_message_id(s: &str) -> bool {
     s.len() >= 3
         && s.starts_with('<')
         && s.ends_with('>')
-        && !s[1..s.len() - 1].contains(['<', '>'])
+        && !s[1..s.len() - 1].contains(['<', '>', ' ', '\t'])
 }
 
 /// Split an address list on commas that are outside angle-bracket and quoted-string groups.
