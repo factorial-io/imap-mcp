@@ -13,6 +13,10 @@ pub struct DraftContent<'a> {
     pub body: &'a str,
     pub cc: Option<&'a str>,
     pub bcc: Option<&'a str>,
+    /// Message-ID of the email being replied to (sets In-Reply-To header).
+    pub in_reply_to: Option<&'a str>,
+    /// Space-separated Message-IDs for the References header (threading chain).
+    pub references: Option<&'a str>,
 }
 
 /// Maximum attachment size we'll return (25 MB).
@@ -59,7 +63,12 @@ pub struct EmailDetail {
     pub date: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+    pub cc: Option<String>,
     pub subject: Option<String>,
+    /// Message-ID of this email (use for In-Reply-To when replying).
+    pub message_id: Option<String>,
+    /// References header value (threading chain of Message-IDs).
+    pub references: Option<String>,
     pub body: String,
     /// Metadata for each attachment (use get_attachment to fetch content).
     pub attachments: Vec<AttachmentInfo>,
@@ -204,6 +213,7 @@ impl ImapConnection {
         let attachments = extract_attachment_infos(body_raw);
 
         let envelope = fetch.envelope();
+        let references = extract_header_value(body_raw, "References");
         Ok(EmailDetail {
             uid: fetch.uid.unwrap_or(uid),
             date: envelope.and_then(|e| {
@@ -213,7 +223,14 @@ impl ImapConnection {
             }),
             from: envelope.and_then(|e| format_addresses(e.from.as_deref())),
             to: envelope.and_then(|e| format_addresses(e.to.as_deref())),
+            cc: envelope.and_then(|e| format_addresses(e.cc.as_deref())),
             subject: envelope.and_then(|e| e.subject.as_ref().map(|s| decode_header_value(s))),
+            message_id: envelope.and_then(|e| {
+                e.message_id
+                    .as_ref()
+                    .map(|m| String::from_utf8_lossy(m).to_string())
+            }),
+            references,
             body,
             attachments,
         })
@@ -352,6 +369,16 @@ impl ImapConnection {
         }
         if let Some(bcc) = draft.bcc {
             builder = builder.bcc(Self::parse_address(bcc));
+        }
+        if let Some(in_reply_to) = draft.in_reply_to {
+            builder = builder.in_reply_to(in_reply_to.to_string());
+        }
+        if let Some(references) = draft.references {
+            let refs: Vec<String> = references
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            builder = builder.references(refs);
         }
         builder
             .write_to_string()
@@ -829,6 +856,22 @@ pub(crate) fn base64_encode(data: &[u8]) -> String {
 
 /// Extract plain-text body from raw email bytes.
 /// Prefers text/plain; falls back to converting text/html.
+/// Extract a header value from raw RFC 5322 message bytes.
+/// Handles unfolding (continuation lines starting with whitespace).
+fn extract_header_value(raw: &[u8], header_name: &str) -> Option<String> {
+    let parsed = mailparse::parse_mail(raw).ok()?;
+    for header in &parsed.headers {
+        if header.get_key().eq_ignore_ascii_case(header_name) {
+            let val = header.get_value().trim().to_string();
+            if val.is_empty() {
+                return None;
+            }
+            return Some(val);
+        }
+    }
+    None
+}
+
 pub(crate) fn extract_body(raw: &[u8]) -> String {
     match mailparse::parse_mail(raw) {
         Ok(parsed) => extract_body_from_parsed(&parsed),
@@ -1202,6 +1245,8 @@ SIGNATUREDATA\r\n\
             body: "Hello, Bob!",
             cc: None,
             bcc: None,
+            in_reply_to: None,
+            references: None,
         };
         let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
         assert!(msg.contains("alice@example.com"));
@@ -1224,6 +1269,8 @@ SIGNATUREDATA\r\n\
             body: "Body text",
             cc: Some("carol@example.com"),
             bcc: Some("dave@example.com"),
+            in_reply_to: None,
+            references: None,
         };
         let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
         assert!(msg.contains("carol@example.com"));
@@ -1239,6 +1286,8 @@ SIGNATUREDATA\r\n\
             body: "The body",
             cc: None,
             bcc: None,
+            in_reply_to: None,
+            references: None,
         };
         let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
         // Must have \r\n\r\n separating headers from body
@@ -1257,6 +1306,8 @@ SIGNATUREDATA\r\n\
             body: "Can mailparse handle this?",
             cc: Some("cc@test.com"),
             bcc: None,
+            in_reply_to: None,
+            references: None,
         };
         let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
         let parsed = mailparse::parse_mail(msg.as_bytes()).expect("should parse as valid email");
@@ -1273,6 +1324,8 @@ SIGNATUREDATA\r\n\
             body: "Body",
             cc: None,
             bcc: None,
+            in_reply_to: None,
+            references: None,
         };
         let result = ImapConnection::validate_draft_content(&draft);
         assert!(result.is_err(), "from field with CRLF should be rejected");
@@ -1287,6 +1340,8 @@ SIGNATUREDATA\r\n\
             body: "Body",
             cc: None,
             bcc: None,
+            in_reply_to: None,
+            references: None,
         };
         let result = ImapConnection::validate_draft_content(&draft);
         assert!(result.is_ok());
@@ -1301,6 +1356,8 @@ SIGNATUREDATA\r\n\
             body: "Body",
             cc: None,
             bcc: None,
+            in_reply_to: None,
+            references: None,
         };
         let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
         // Subject must not contain raw non-ASCII bytes
@@ -1328,6 +1385,8 @@ SIGNATUREDATA\r\n\
             body: "Body",
             cc: None,
             bcc: None,
+            in_reply_to: None,
+            references: None,
         };
         let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
         assert!(msg.contains("Subject: Plain ASCII\r\n"));
@@ -1342,6 +1401,8 @@ SIGNATUREDATA\r\n\
             body: "Body",
             cc: None,
             bcc: None,
+            in_reply_to: None,
+            references: None,
         };
         let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
         let from_line = msg
@@ -1368,6 +1429,8 @@ SIGNATUREDATA\r\n\
             body: "line1\nline2\nline3",
             cc: None,
             bcc: None,
+            in_reply_to: None,
+            references: None,
         };
         let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
         // Body should not contain bare LF (LF not preceded by CR)
@@ -1381,6 +1444,74 @@ SIGNATUREDATA\r\n\
         assert!(body.contains("line1"), "Body should contain original text");
         assert!(body.contains("line2"), "Body should contain original text");
         assert!(body.contains("line3"), "Body should contain original text");
+    }
+
+    #[test]
+    fn build_rfc2822_with_reply_headers() {
+        let draft = DraftContent {
+            from: "alice@example.com",
+            to: "bob@example.com",
+            subject: "Re: Original Subject",
+            body: "Reply body",
+            cc: None,
+            bcc: None,
+            in_reply_to: Some("<original-msg-id@example.com>"),
+            references: Some("<earlier@example.com> <original-msg-id@example.com>"),
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        assert!(
+            msg.contains("In-Reply-To:"),
+            "Should contain In-Reply-To header"
+        );
+        assert!(
+            msg.contains("original-msg-id@example.com"),
+            "In-Reply-To should reference original message"
+        );
+        assert!(
+            msg.contains("References:"),
+            "Should contain References header"
+        );
+        assert!(
+            msg.contains("earlier@example.com"),
+            "References should include earlier message"
+        );
+        // Verify it's parseable
+        let parsed = mailparse::parse_mail(msg.as_bytes()).expect("should parse");
+        let headers = parsed.get_headers();
+        let in_reply_to = headers.get_first_value("In-Reply-To").unwrap();
+        assert!(in_reply_to.contains("original-msg-id@example.com"));
+    }
+
+    #[test]
+    fn build_rfc2822_without_reply_headers() {
+        let draft = DraftContent {
+            from: "alice@example.com",
+            to: "bob@example.com",
+            subject: "New Email",
+            body: "Fresh message",
+            cc: None,
+            bcc: None,
+            in_reply_to: None,
+            references: None,
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        assert!(
+            !msg.contains("In-Reply-To:"),
+            "Should not contain In-Reply-To header"
+        );
+        assert!(
+            !msg.contains("References:"),
+            "Should not contain References header"
+        );
+    }
+
+    #[test]
+    fn extract_header_value_from_raw_message() {
+        let raw = b"Message-ID: <test@example.com>\r\nReferences: <a@x.com> <b@x.com>\r\nSubject: Test\r\n\r\nBody";
+        let refs = extract_header_value(raw, "References");
+        assert_eq!(refs, Some("<a@x.com> <b@x.com>".to_string()));
+        let missing = extract_header_value(raw, "X-Custom");
+        assert_eq!(missing, None);
     }
 
     #[test]
