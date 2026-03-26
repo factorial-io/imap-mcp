@@ -175,28 +175,65 @@ fn has_hidden_style(tag: &str) -> bool {
         {
             return true;
         }
-        // height:0 (or max-height:0) with overflow:hidden — content clipped away
-        if (no_ws.contains("height:0") || no_ws.contains("max-height:0"))
+        // height:0 or max-height:0 with overflow:hidden — content clipped away.
+        // Anchored to property boundaries to avoid matching min-height:0 (legitimate).
+        if (has_css_property(&no_ws, "height:0") || no_ws.contains("max-height:0"))
             && no_ws.contains("overflow:hidden")
         {
             return true;
         }
-        // Off-screen positioning
-        if no_ws.contains("position:absolute") || no_ws.contains("position:fixed") {
-            // left/top/margin-left with large negative values
-            if no_ws.contains("left:-")
-                || no_ws.contains("top:-")
-                || no_ws.contains("margin-left:-")
-            {
-                return true;
-            }
+        // Off-screen positioning — only flag large negative offsets (>= 200px)
+        // to avoid false-positives on centering patterns like left:50%;margin-left:-100px
+        if (no_ws.contains("position:absolute") || no_ws.contains("position:fixed"))
+            && has_large_negative_offset(&no_ws)
+        {
+            return true;
         }
         // text-indent with large negative value (common spam/SEO trick)
-        if no_ws.contains("text-indent:-") {
+        if has_large_negative_value(&no_ws, "text-indent:") {
             return true;
         }
     }
     false
+}
+
+/// Check if a CSS property appears at a property boundary in a whitespace-stripped
+/// style string. Prevents `"height:0"` from matching inside `"min-height:0"`.
+fn has_css_property(no_ws: &str, prop: &str) -> bool {
+    no_ws == prop
+        || no_ws.starts_with(&format!("{prop};"))
+        || no_ws.contains(&format!(";{prop};"))
+        || no_ws.ends_with(&format!(";{prop}"))
+}
+
+/// Check if any positioning property (left, top, margin-left) has a large negative
+/// value (>= 200px). Small negative values are legitimate centering patterns.
+fn has_large_negative_offset(no_ws: &str) -> bool {
+    for prop in &["left:-", "top:-", "margin-left:-"] {
+        if let Some(pos) = no_ws.find(prop) {
+            if parse_negative_px_value(&no_ws[pos + prop.len()..]) >= 200 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if a CSS property has a large negative value (>= 200px).
+fn has_large_negative_value(no_ws: &str, prop: &str) -> bool {
+    if let Some(pos) = no_ws.find(prop) {
+        let after = &no_ws[pos + prop.len()..];
+        if let Some(rest) = after.strip_prefix('-') {
+            return parse_negative_px_value(rest) >= 200;
+        }
+    }
+    false
+}
+
+/// Parse leading digits from a string as a pixel value.
+fn parse_negative_px_value(s: &str) -> u32 {
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().unwrap_or(0)
 }
 
 /// Extract the value of the `style` attribute from a tag string, if present.
@@ -732,7 +769,8 @@ impl ImapConnection {
             .subject(draft.subject)
             .text_body(draft.body);
         if let Some(html) = draft.html_body {
-            builder = builder.html_body(html);
+            let sanitized = sanitize_html_for_draft(html);
+            builder = builder.html_body(sanitized);
         }
         if let Some(cc) = draft.cc {
             builder = builder.cc(Self::parse_address(cc));
@@ -2462,6 +2500,50 @@ Content-Type: text/html\r\n\r\n\
         assert!(!sanitized.contains("tracker.evil"));
         assert!(sanitized.contains("Hello"));
         assert!(sanitized.contains("World"));
+    }
+
+    #[test]
+    fn strip_hidden_preserves_min_height_zero() {
+        // min-height:0 with overflow:hidden is a legitimate animation pattern
+        let html =
+            r#"<div style="min-height:0;overflow:hidden">accordion content</div><p>After</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            result.contains("accordion content"),
+            "min-height:0 should not be stripped, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_preserves_small_negative_offset() {
+        // Small negative margin-left is a centering pattern, not hiding
+        let html = r#"<div style="position:absolute;left:50%;margin-left:-100px">centered</div><p>After</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            result.contains("centered"),
+            "Small negative offset should not be stripped, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_catches_large_negative_offset() {
+        let html = r#"<div style="position:absolute;left:-9999px">hidden</div><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("hidden"),
+            "Large negative offset should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_preserves_small_text_indent() {
+        let html = r#"<div style="text-indent:-10px">slightly indented</div>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            result.contains("slightly indented"),
+            "Small text-indent should not be stripped, got: {result:?}"
+        );
     }
 
     // --- Address list splitting tests ---
