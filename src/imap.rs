@@ -259,12 +259,20 @@ fn has_large_negative_offset(no_ws: &str) -> bool {
 }
 
 /// Check if a CSS property has a large negative value (>= 200px).
+/// Uses loop+boundary pattern to avoid false matches inside other property names.
 fn has_large_negative_value(no_ws: &str, prop: &str) -> bool {
-    if let Some(pos) = no_ws.find(prop) {
-        let after = &no_ws[pos + prop.len()..];
-        if let Some(rest) = after.strip_prefix('-') {
-            return parse_negative_px_value(rest) >= 200;
+    let mut search = 0;
+    while let Some(pos) = no_ws[search..].find(prop) {
+        let abs = search + pos;
+        if abs == 0 || no_ws.as_bytes()[abs - 1] == b';' {
+            let after = &no_ws[abs + prop.len()..];
+            if let Some(rest) = after.strip_prefix('-') {
+                if parse_negative_px_value(rest) >= 200 {
+                    return true;
+                }
+            }
         }
+        search = abs + prop.len();
     }
     false
 }
@@ -280,19 +288,28 @@ fn parse_negative_px_value(s: &str) -> u32 {
 /// Strip CSS comments (`/* ... */`) from a string.
 fn strip_css_comments(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let mut i = 0;
-    let bytes = s.as_bytes();
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+    let mut chars = s.char_indices().peekable();
+    while let Some(&(i, c)) = chars.peek() {
+        if c == '/' && s.as_bytes().get(i + 1) == Some(&b'*') {
+            // Skip opening /*
+            chars.next();
+            chars.next();
             // Skip to end of comment
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
+            loop {
+                match chars.next() {
+                    Some((_, '*')) => {
+                        if chars.peek().map(|&(_, c)| c) == Some('/') {
+                            chars.next(); // skip closing /
+                            break;
+                        }
+                    }
+                    None => break, // unclosed comment — end of string
+                    _ => {}
+                }
             }
-            i += 2; // skip closing */
         } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            result.push(c);
+            chars.next();
         }
     }
     result
