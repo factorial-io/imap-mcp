@@ -182,7 +182,8 @@ fn is_style_hidden(style: &str) -> bool {
     if has_zero_css_value(&no_ws, "opacity:") {
         return true;
     }
-    if has_zero_css_value(&no_ws, "font-size:") {
+    // font-size < 2px is effectively invisible — catches 0, 0.1px, 1px, etc.
+    if has_small_css_value(&no_ws, "font-size:", 2.0) {
         return true;
     }
     if (has_zero_css_value(&no_ws, "height:") || has_zero_css_value(&no_ws, "max-height:"))
@@ -216,6 +217,31 @@ fn has_zero_css_value(no_ws: &str, prop: &str) -> bool {
             if num_end > 0 {
                 if let Ok(v) = value[..num_end].parse::<f64>() {
                     if v == 0.0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        from = abs + prop.len();
+    }
+    false
+}
+
+/// Like `has_zero_css_value` but uses a threshold instead of exact zero.
+/// Catches near-zero values like `font-size:0.1px` or `font-size:1px` that are
+/// effectively invisible to humans but render as text in `html2text`.
+fn has_small_css_value(no_ws: &str, prop: &str, threshold: f64) -> bool {
+    let mut from = 0;
+    while let Some(pos) = no_ws[from..].find(prop) {
+        let abs = from + pos;
+        if abs == 0 || no_ws.as_bytes()[abs - 1] == b';' {
+            let value = &no_ws[abs + prop.len()..];
+            let num_end = value
+                .find(|c: char| c != '.' && !c.is_ascii_digit())
+                .unwrap_or(value.len());
+            if num_end > 0 {
+                if let Ok(v) = value[..num_end].parse::<f64>() {
+                    if v < threshold {
                         return true;
                     }
                 }
@@ -449,13 +475,17 @@ fn filter_css_properties(style: &str) -> String {
                 if lower_value.contains("url(") || lower_value.contains("expression(") {
                     continue;
                 }
-                // Block transparent/rgba(0,0,0,0) in color properties
-                if prop == "color"
-                    && (lower_value == "transparent"
-                        || lower_value.contains("rgba(0,0,0,0")
-                        || lower_value.contains("rgba( 0, 0, 0, 0"))
-                {
-                    continue;
+                // Block transparent colors (strip whitespace for reliable matching
+                // across rgba(0,0,0,0), rgba(0, 0, 0, 0), rgba(0 0 0 / 0), etc.)
+                if prop == "color" || prop == "background-color" {
+                    let compact: String =
+                        lower_value.chars().filter(|c| !c.is_whitespace()).collect();
+                    if compact == "transparent"
+                        || compact.contains(",0)")
+                        || compact.contains("/0)")
+                    {
+                        continue;
+                    }
                 }
                 safe.push(format!("{prop}: {value}"));
             }
@@ -2819,6 +2849,9 @@ Content-Type: text/html\r\n\r\n\
     fn filter_css_strips_transparent_color() {
         assert_eq!(filter_css_properties("color: transparent"), "");
         assert_eq!(filter_css_properties("color: rgba(0,0,0,0)"), "");
+        assert_eq!(filter_css_properties("color: rgba(0, 0, 0, 0)"), "");
+        assert_eq!(filter_css_properties("color: rgba(0 0 0 / 0)"), "");
+        assert_eq!(filter_css_properties("color: rgb(0 0 0 / 0)"), "");
     }
 
     #[test]
@@ -2827,6 +2860,38 @@ Content-Type: text/html\r\n\r\n\
         let result = filter_css_properties(css);
         assert!(!result.contains("url"));
         assert!(result.contains("padding: 10px"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_near_zero_font_size() {
+        let html = r#"<span style="font-size:0.1px">tiny injection</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("tiny injection"),
+            "font-size:0.1px should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_one_px_font_size() {
+        let html = r#"<span style="font-size:1px">tiny</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("tiny"),
+            "font-size:1px should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_preserves_normal_font_size() {
+        let html = r#"<span style="font-size:14px">normal text</span>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            result.contains("normal text"),
+            "font-size:14px should be preserved, got: {result:?}"
+        );
     }
 
     // --- Address list splitting tests ---
