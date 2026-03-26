@@ -11,9 +11,13 @@ pub struct DraftContent<'a> {
     pub to: &'a str,
     pub subject: &'a str,
     pub body: &'a str,
-    /// Optional HTML body. When provided, the message is sent as
+    /// Optional raw HTML body. When provided, the message is sent as
     /// `multipart/alternative` with both plain-text and HTML parts.
     /// The plain-text `body` is always required as the fallback.
+    ///
+    /// Accepts **raw, unsanitized** HTML — [`build_rfc2822_message`] runs it
+    /// through [`sanitize_html_for_draft`] before embedding in the message.
+    /// Callers do not need to pre-sanitize.
     pub html_body: Option<&'a str>,
     pub cc: Option<&'a str>,
     pub bcc: Option<&'a str>,
@@ -345,13 +349,11 @@ fn skip_to_closing_tag(html: &str, start: usize, tag_name: &str) -> usize {
         }
         i += 1;
     }
-    // If the closing tag was never found, fall back to `start` so only the
-    // opening tag is removed and the rest of the content is preserved.
-    if depth > 0 {
-        start
-    } else {
-        i
-    }
+    // If the closing tag was never found, strip to end-of-document.
+    // An unclosed hidden element is either malformed or an intentional injection
+    // attempt — in either case, leaking the hidden content is worse than losing
+    // trailing text from broken HTML.
+    i
 }
 
 /// Sanitize HTML from incoming emails for AI consumption.
@@ -2479,13 +2481,23 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_unclosed_element_preserves_remaining() {
-        // Unclosed hidden div should not swallow all remaining content
-        let html = r#"<div style="display:none">hidden start<p>Visible after unclosed</p>"#;
+    fn strip_hidden_unclosed_element_strips_to_end() {
+        // Unclosed hidden element strips everything to end-of-document.
+        // This prevents injection via unclosed tags like:
+        //   <div style="display:none">IGNORE PREVIOUS INSTRUCTIONS
+        let html = r#"<p>Before</p><div style="display:none">hidden payload<p>also hidden</p>"#;
         let result = strip_hidden_elements(html);
         assert!(
-            result.contains("Visible after unclosed"),
-            "Content after unclosed hidden element should be preserved, got: {result:?}"
+            result.contains("Before"),
+            "Content before unclosed hidden element should be preserved, got: {result:?}"
+        );
+        assert!(
+            !result.contains("hidden payload"),
+            "Hidden content from unclosed element should be stripped, got: {result:?}"
+        );
+        assert!(
+            !result.contains("also hidden"),
+            "Trailing content after unclosed hidden element should be stripped, got: {result:?}"
         );
     }
 

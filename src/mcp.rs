@@ -372,16 +372,12 @@ impl ImapMcpServer {
         let mut conn = self.connect().await?;
         let body = normalize_body(&params.body);
         reject_flat_body(&body)?;
-        let sanitized_html = params
-            .html_body
-            .as_deref()
-            .map(crate::imap::sanitize_html_for_draft);
         let draft = DraftContent {
             from: &self.email,
             to: &params.to,
             subject: &params.subject,
             body: &body,
-            html_body: sanitized_html.as_deref(),
+            html_body: params.html_body.as_deref(),
             cc: params.cc.as_deref(),
             bcc: params.bcc.as_deref(),
             in_reply_to: params.in_reply_to.as_deref(),
@@ -413,16 +409,12 @@ impl ImapMcpServer {
         let mut conn = self.connect().await?;
         let body = normalize_body(&params.body);
         reject_flat_body(&body)?;
-        let sanitized_html = params
-            .html_body
-            .as_deref()
-            .map(crate::imap::sanitize_html_for_draft);
         let draft = DraftContent {
             from: &self.email,
             to: &params.to,
             subject: &params.subject,
             body: &body,
-            html_body: sanitized_html.as_deref(),
+            html_body: params.html_body.as_deref(),
             cc: params.cc.as_deref(),
             bcc: params.bcc.as_deref(),
             in_reply_to: params.in_reply_to.as_deref(),
