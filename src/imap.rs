@@ -55,7 +55,7 @@ fn strip_hidden_elements(html: &str) -> String {
             if let Some(tag_end) = find_tag_end(html, i) {
                 let tag = &html[i..=tag_end];
                 // Check if this is an opening tag (not closing/comment/doctype)
-                if is_styled_opening_tag(tag) {
+                if has_hidden_style(tag) {
                     if let Some(tag_name) = extract_tag_name(tag) {
                         // Self-closing tags or void elements have no closing tag
                         let after_close = if tag.ends_with("/>") || is_void_element(&tag_name) {
@@ -99,21 +99,71 @@ fn find_tag_end(html: &str, start: usize) -> Option<usize> {
     None
 }
 
-/// Check whether an opening tag has a `style` attribute.
+/// Check whether an opening tag's `style` attribute uses CSS that hides content.
 ///
-/// Any element with inline styles is considered potentially hidden, since there
-/// are too many CSS techniques to hide content (`display:none`, `opacity:0`,
-/// `font-size:0`, `color:transparent`, `position:absolute;left:-9999px`, etc.).
-/// Rather than maintaining an incomplete blocklist, we strip all styled elements
-/// before AI text extraction.
-fn is_styled_opening_tag(tag: &str) -> bool {
+/// Matches known hiding patterns: `display:none`, `visibility:hidden`, `opacity:0`,
+/// `font-size:0`, `height:0` with `overflow:hidden`, and off-screen positioning.
+/// Legitimate styling (`color:red`, `font-size:14px`, `max-width:600px`, etc.)
+/// is preserved so real email content is not lost.
+fn has_hidden_style(tag: &str) -> bool {
     // Must be an opening tag (not </..., <!..., etc.)
     if tag.starts_with("</") || tag.starts_with("<!") || tag.starts_with("<?") {
         return false;
     }
+    if let Some(style_value) = extract_style_value(tag) {
+        // Strip all whitespace for reliable matching regardless of formatting
+        let no_ws: String = style_value
+            .to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // display:none — element and contents are completely removed from layout
+        if no_ws.contains("display:none") {
+            return true;
+        }
+        // visibility:hidden — element is invisible but still takes up space
+        if no_ws.contains("visibility:hidden") {
+            return true;
+        }
+        // opacity:0 — fully transparent
+        if no_ws.contains("opacity:0") && !no_ws.contains("opacity:0.") {
+            return true;
+        }
+        // font-size:0 / font-size:0px — text rendered at zero size
+        if no_ws.contains("font-size:0px")
+            || no_ws.contains("font-size:0;")
+            || no_ws.ends_with("font-size:0")
+        {
+            return true;
+        }
+        // height:0 (or max-height:0) with overflow:hidden — content clipped away
+        if (no_ws.contains("height:0") || no_ws.contains("max-height:0"))
+            && no_ws.contains("overflow:hidden")
+        {
+            return true;
+        }
+        // Off-screen positioning
+        if no_ws.contains("position:absolute") || no_ws.contains("position:fixed") {
+            // left/top/margin-left with large negative values
+            if no_ws.contains("left:-")
+                || no_ws.contains("top:-")
+                || no_ws.contains("margin-left:-")
+            {
+                return true;
+            }
+        }
+        // text-indent with large negative value (common spam/SEO trick)
+        if no_ws.contains("text-indent:-") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract the value of the `style` attribute from a tag string, if present.
+/// Matches `style` as a full attribute name (not `data-style`, etc.).
+fn extract_style_value(tag: &str) -> Option<&str> {
     let lower = tag.to_lowercase();
-    // Find the `style` attribute by matching it as a full attribute name
-    // (preceded by whitespace, not a substring of another attribute like `data-style`).
     let mut search_from = 0;
     while let Some(pos) = lower[search_from..].find("style") {
         let abs_pos = search_from + pos;
@@ -126,11 +176,22 @@ fn is_styled_opening_tag(tag: &str) -> bool {
         let followed_by_eq = after.starts_with('=') || after.trim_start().starts_with('=');
 
         if preceded_by_ws && followed_by_eq {
-            return true;
+            // Find = and quote in the original tag (preserve case for the return)
+            let rest = &tag[abs_pos + 5..];
+            let eq = rest.find('=')?;
+            let after_eq = rest[eq + 1..].trim_start();
+            let quote = after_eq.as_bytes().first()?;
+            if *quote != b'"' && *quote != b'\'' {
+                search_from = abs_pos + 5;
+                continue;
+            }
+            let value_start = 1; // skip opening quote
+            let end = after_eq[value_start..].find(*quote as char)?;
+            return Some(&after_eq[value_start..value_start + end]);
         }
         search_from = abs_pos + 5;
     }
-    false
+    None
 }
 
 /// Check if a tag name is an HTML void element (no closing tag).
@@ -204,15 +265,57 @@ fn skip_to_closing_tag(html: &str, start: usize, tag_name: &str) -> usize {
     i
 }
 
+/// Sanitize HTML from incoming emails for AI consumption.
+///
+/// More restrictive than [`sanitize_html_for_draft`]: strips all attributes
+/// (including `style`) and only keeps structural/text tags. This is a separate
+/// policy from draft composition so the two can evolve independently.
+fn sanitize_html_for_reading(html: &str) -> String {
+    ammonia::Builder::empty()
+        .add_tags([
+            "p",
+            "br",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "ul",
+            "ol",
+            "li",
+            "em",
+            "strong",
+            "b",
+            "i",
+            "a",
+            "blockquote",
+            "pre",
+            "code",
+            "table",
+            "thead",
+            "tbody",
+            "tr",
+            "th",
+            "td",
+            "div",
+            "span",
+        ])
+        .add_tag_attributes("a", ["href"])
+        .clean(html)
+        .to_string()
+}
+
 /// Convert HTML to plain text safely for AI consumption.
 ///
-/// First removes elements hidden via CSS (`display:none`, `visibility:hidden`)
-/// which are a common prompt-injection vector in emails. Then sanitizes remaining
-/// HTML through ammonia (strips scripts, event handlers, etc.) before converting
-/// to plain text via `html2text`.
+/// First removes elements hidden via CSS (`display:none`, `visibility:hidden`,
+/// `opacity:0`, etc.) which are a common prompt-injection vector in emails.
+/// Then sanitizes remaining HTML through a restrictive ammonia policy (strips
+/// scripts, event handlers, style attributes) before converting to plain text
+/// via `html2text`.
 fn html_to_safe_text(html: &str) -> String {
     let stripped = strip_hidden_elements(html);
-    let sanitized = sanitize_html_for_draft(&stripped);
+    let sanitized = sanitize_html_for_reading(&stripped);
     html2text::from_read(sanitized.as_bytes(), 80)
 }
 
@@ -2098,17 +2201,81 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_styled_removes_all_styled_elements() {
-        // All styled elements are stripped regardless of the CSS property,
-        // since there are too many ways to hide content via CSS.
+    fn strip_hidden_preserves_visible_styled_content() {
+        // Legitimate styling (color, font-size, etc.) should be preserved
         let html = r#"<p style="color:red">Styled text</p><span style="display:none">hidden</span><p>Normal</p>"#;
         let result = strip_hidden_elements(html);
         assert!(
-            !result.contains("Styled text"),
-            "All styled elements should be stripped, got: {result:?}"
+            result.contains("Styled text"),
+            "Visible styled content should be preserved, got: {result:?}"
         );
         assert!(result.contains("Normal"));
         assert!(!result.contains("hidden"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_opacity_zero() {
+        let html = r#"<span style="opacity:0">invisible</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("invisible"),
+            "opacity:0 should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_allows_nonzero_opacity() {
+        let html = r#"<span style="opacity:0.5">half visible</span>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            result.contains("half visible"),
+            "opacity:0.5 should be kept, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_catches_font_size_zero() {
+        let html = r#"<span style="font-size:0px">tiny</span><p>Normal</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("tiny"),
+            "font-size:0px should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Normal"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_offscreen_positioning() {
+        let html = r#"<div style="position:absolute;left:-9999px">offscreen</div><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("offscreen"),
+            "off-screen should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_text_indent() {
+        let html = r#"<div style="text-indent:-9999px">hidden</div><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("hidden"),
+            "text-indent should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_overflow_hidden_with_zero_height() {
+        let html = r#"<div style="height:0;overflow:hidden">clipped</div><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("clipped"),
+            "height:0+overflow:hidden should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
     }
 
     #[test]
