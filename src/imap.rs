@@ -34,9 +34,9 @@ pub struct DraftContent<'a> {
 /// First removes elements hidden via CSS (prompt-injection vector), then
 /// sanitizes through ammonia's allowlist. No `<img>` (tracking pixels),
 /// no `<style>`/`<script>`, no event handlers.
-pub fn sanitize_html_for_draft(html: &str) -> String {
-    let stripped = strip_hidden_elements(html);
-    ammonia_allowlist().clean(&stripped).to_string()
+pub fn sanitize_html_for_draft(html: &str) -> Result<String, AppError> {
+    let stripped = strip_hidden_elements(html)?;
+    Ok(ammonia_allowlist().clean(&stripped).to_string())
 }
 
 /// Remove elements hidden via CSS and strip `<style>`/`<script>` blocks.
@@ -45,7 +45,7 @@ pub fn sanitize_html_for_draft(html: &str) -> String {
 /// Targets `display:none`, `visibility:hidden`, `opacity:0`, `font-size:0`,
 /// `height:0`+`overflow:hidden`, off-screen positioning, and `text-indent`
 /// hiding — common prompt-injection vectors in emails.
-fn strip_hidden_elements(html: &str) -> String {
+fn strip_hidden_elements(html: &str) -> Result<String, AppError> {
     rewrite_str(
         html,
         RewriteStrSettings {
@@ -70,10 +70,7 @@ fn strip_hidden_elements(html: &str) -> String {
             ..Default::default()
         },
     )
-    .unwrap_or_else(|e| {
-        tracing::warn!("lol_html failed to parse HTML, dropping content: {e}");
-        String::new()
-    })
+    .map_err(|e| AppError::Imap(format!("failed to sanitize HTML: {e}")))
 }
 
 /// Decode HTML entities (numeric and named) in a string.
@@ -87,7 +84,7 @@ fn decode_html_entities_simple(s: &str) -> String {
     }
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
+    'outer: while let Some(c) = chars.next() {
         if c != '&' {
             result.push(c);
             continue;
@@ -100,8 +97,17 @@ fn decode_html_entities_simple(s: &str) -> String {
                 break;
             }
             entity.push(ec);
-            if entity.len() > 10 {
-                break;
+            if entity.len() > 32 {
+                // Too long — not a real entity. Emit raw and drain to ';'.
+                result.push('&');
+                result.push_str(&entity);
+                for ec2 in chars.by_ref() {
+                    result.push(ec2);
+                    if ec2 == ';' {
+                        break;
+                    }
+                }
+                continue 'outer;
             }
         }
         if found_semi {
@@ -177,7 +183,8 @@ fn is_style_hidden(style: &str) -> bool {
     {
         return true;
     }
-    if (no_ws.contains("position:absolute") || no_ws.contains("position:fixed"))
+    if (has_property_at_boundary(&no_ws, "position:absolute")
+        || has_property_at_boundary(&no_ws, "position:fixed"))
         && has_large_negative_offset(&no_ws)
     {
         return true;
@@ -317,7 +324,13 @@ fn ammonia_allowlist() -> ammonia::Builder<'static> {
 /// Removes hidden elements (prompt-injection vector), sanitizes through ammonia,
 /// then converts to plain text via `html2text`.
 fn html_to_safe_text(html: &str) -> String {
-    let stripped = strip_hidden_elements(html);
+    let stripped = match strip_hidden_elements(html) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("HTML sanitization failed, falling back to ammonia-only: {e}");
+            html.to_string()
+        }
+    };
     let sanitized = ammonia_allowlist().clean(&stripped).to_string();
     html2text::from_read(sanitized.as_bytes(), 80)
 }
@@ -682,7 +695,7 @@ impl ImapConnection {
             .subject(draft.subject)
             .text_body(draft.body);
         if let Some(html) = draft.html_body {
-            let sanitized = sanitize_html_for_draft(html);
+            let sanitized = sanitize_html_for_draft(html)?;
             builder = builder.html_body(sanitized);
         }
         if let Some(cc) = draft.cc {
@@ -2124,7 +2137,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn sanitize_draft_strips_script_tags() {
         let html = r#"<p>Hello</p><script>alert('xss')</script><p>World</p>"#;
-        let sanitized = sanitize_html_for_draft(html);
+        let sanitized = sanitize_html_for_draft(html).unwrap();
         assert!(!sanitized.contains("<script>"));
         assert!(!sanitized.contains("alert"));
         assert!(sanitized.contains("<p>Hello</p>"));
@@ -2134,7 +2147,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn sanitize_draft_strips_style_tags() {
         let html = r#"<p>Hello</p><style>body { display: none; }</style>"#;
-        let sanitized = sanitize_html_for_draft(html);
+        let sanitized = sanitize_html_for_draft(html).unwrap();
         assert!(!sanitized.contains("<style>"));
         assert!(!sanitized.contains("display"));
         assert!(sanitized.contains("<p>Hello</p>"));
@@ -2143,7 +2156,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn sanitize_draft_strips_style_attributes() {
         let html = r#"<span style="display:none">hidden injection</span><p>visible</p>"#;
-        let sanitized = sanitize_html_for_draft(html);
+        let sanitized = sanitize_html_for_draft(html).unwrap();
         assert!(!sanitized.contains("display:none"));
         assert!(sanitized.contains("visible"));
     }
@@ -2151,7 +2164,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn sanitize_draft_preserves_safe_tags() {
         let html = "<h1>Title</h1><p>Paragraph with <strong>bold</strong> and <em>italic</em></p><ul><li>item</li></ul><a href=\"https://example.com\">link</a>";
-        let sanitized = sanitize_html_for_draft(html);
+        let sanitized = sanitize_html_for_draft(html).unwrap();
         assert!(sanitized.contains("<h1>"));
         assert!(sanitized.contains("<strong>"));
         assert!(sanitized.contains("<em>"));
@@ -2211,7 +2224,7 @@ Content-Type: text/html\r\n\r\n\
     fn strip_hidden_preserves_visible_styled_content() {
         // Legitimate styling (color, font-size, etc.) should be preserved
         let html = r#"<p style="color:red">Styled text</p><span style="display:none">hidden</span><p>Normal</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("Styled text"),
             "Visible styled content should be preserved, got: {result:?}"
@@ -2223,7 +2236,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_catches_opacity_zero() {
         let html = r#"<span style="opacity:0">invisible</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("invisible"),
             "opacity:0 should be stripped, got: {result:?}"
@@ -2234,7 +2247,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_allows_nonzero_opacity() {
         let html = r#"<span style="opacity:0.5">half visible</span>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("half visible"),
             "opacity:0.5 should be kept, got: {result:?}"
@@ -2244,7 +2257,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_catches_opacity_zero_point_zero() {
         let html = r#"<span style="opacity:0.0">hidden</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden"),
             "opacity:0.0 should be stripped, got: {result:?}"
@@ -2255,7 +2268,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_catches_font_size_zero() {
         let html = r#"<span style="font-size:0px">tiny</span><p>Normal</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("tiny"),
             "font-size:0px should be stripped, got: {result:?}"
@@ -2266,7 +2279,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_catches_offscreen_positioning() {
         let html = r#"<div style="position:absolute;left:-9999px">offscreen</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("offscreen"),
             "off-screen should be stripped, got: {result:?}"
@@ -2277,7 +2290,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_catches_text_indent() {
         let html = r#"<div style="text-indent:-9999px">hidden</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden"),
             "text-indent should be stripped, got: {result:?}"
@@ -2288,7 +2301,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_catches_overflow_hidden_with_zero_height() {
         let html = r#"<div style="height:0;overflow:hidden">clipped</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("clipped"),
             "height:0+overflow:hidden should be stripped, got: {result:?}"
@@ -2302,7 +2315,7 @@ Content-Type: text/html\r\n\r\n\
             let html = format!(
                 r#"<div style="height:0{unit};overflow:hidden">hidden</div><p>Visible</p>"#
             );
-            let result = strip_hidden_elements(&html);
+            let result = strip_hidden_elements(&html).unwrap();
             assert!(
                 !result.contains("hidden"),
                 "height:0{unit}+overflow:hidden should be stripped, got: {result:?}"
@@ -2316,7 +2329,7 @@ Content-Type: text/html\r\n\r\n\
         // "data-style" should not be confused with "style"
         let html =
             r#"<div data-style="display:none" style="display:none">hidden</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(result.contains("Visible"));
         assert!(
             !result.contains("hidden"),
@@ -2328,7 +2341,7 @@ Content-Type: text/html\r\n\r\n\
     fn strip_hidden_ignores_data_style_only() {
         // Only "data-style" attribute, no real "style" — should NOT strip
         let html = r#"<div data-style="display:none">keep this</div><p>Also keep</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("keep this"),
             "data-style should not trigger stripping, got: {result:?}"
@@ -2340,7 +2353,7 @@ Content-Type: text/html\r\n\r\n\
     fn strip_hidden_handles_void_elements() {
         // Void element with hidden style should not consume following content
         let html = r#"<input style="display:none"><p>Visible after void element</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("Visible after void element"),
             "Content after void element should be preserved, got: {result:?}"
@@ -2350,7 +2363,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_handles_self_closing_tags() {
         let html = r#"<img style="display:none"/><p>Still visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("Still visible"),
             "Content after self-closing tag should be preserved, got: {result:?}"
@@ -2361,7 +2374,7 @@ Content-Type: text/html\r\n\r\n\
     fn strip_hidden_closing_tag_word_boundary() {
         // </divider> should not match when tag_name is "div"
         let html = r#"<div style="display:none"><divider>keep</divider></div><p>After</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("After"),
             "Content after hidden div should be preserved, got: {result:?}"
@@ -2376,7 +2389,7 @@ Content-Type: text/html\r\n\r\n\
     fn strip_hidden_extra_whitespace_in_style() {
         // CSS allows arbitrary whitespace around colons
         let html = r#"<span style="display:  none">hidden</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden"),
             "Extra whitespace in display:none should still be caught, got: {result:?}"
@@ -2387,7 +2400,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_whitespace_around_colon() {
         let html = r#"<span style="display : none">hidden</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden"),
             "Whitespace around colon should still be caught, got: {result:?}"
@@ -2398,7 +2411,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_catches_unquoted_style() {
         let html = r#"<span style=display:none>hidden</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden"),
             "Unquoted style=display:none should be caught, got: {result:?}"
@@ -2412,7 +2425,7 @@ Content-Type: text/html\r\n\r\n\
         // This prevents injection via unclosed tags like:
         //   <div style="display:none">IGNORE PREVIOUS INSTRUCTIONS
         let html = r#"<p>Before</p><div style="display:none">hidden payload<p>also hidden</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("Before"),
             "Content before unclosed hidden element should be preserved, got: {result:?}"
@@ -2430,7 +2443,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn sanitize_draft_strips_img_tags() {
         let html = r#"<p>Hello</p><img src="https://tracker.evil/pixel.gif"><p>World</p>"#;
-        let sanitized = sanitize_html_for_draft(html);
+        let sanitized = sanitize_html_for_draft(html).unwrap();
         assert!(
             !sanitized.contains("<img"),
             "img tags should be stripped from drafts"
@@ -2445,7 +2458,7 @@ Content-Type: text/html\r\n\r\n\
         // min-height:0 with overflow:hidden is a legitimate animation pattern
         let html =
             r#"<div style="min-height:0;overflow:hidden">accordion content</div><p>After</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("accordion content"),
             "min-height:0 should not be stripped, got: {result:?}"
@@ -2456,7 +2469,7 @@ Content-Type: text/html\r\n\r\n\
     fn strip_hidden_preserves_fractional_zero_height() {
         // height:0.5em is non-zero and should not be stripped
         let html = r#"<div style="height:0.5em;overflow:hidden">visible content</div><p>After</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("visible content"),
             "height:0.5em should not be stripped, got: {result:?}"
@@ -2467,7 +2480,7 @@ Content-Type: text/html\r\n\r\n\
     fn strip_hidden_preserves_small_negative_offset() {
         // Small negative margin-left is a centering pattern, not hiding
         let html = r#"<div style="position:absolute;left:50%;margin-left:-100px">centered</div><p>After</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("centered"),
             "Small negative offset should not be stripped, got: {result:?}"
@@ -2477,7 +2490,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_catches_large_negative_offset() {
         let html = r#"<div style="position:absolute;left:-9999px">hidden</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden"),
             "Large negative offset should be stripped, got: {result:?}"
@@ -2488,7 +2501,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_preserves_small_text_indent() {
         let html = r#"<div style="text-indent:-10px">slightly indented</div>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("slightly indented"),
             "Small text-indent should not be stripped, got: {result:?}"
@@ -2499,7 +2512,7 @@ Content-Type: text/html\r\n\r\n\
     fn strip_hidden_catches_html_entity_encoded_style() {
         // &#58; is HTML entity for ':'
         let html = r#"<span style="display&#58;none">hidden via entity</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden via entity"),
             "HTML entity-encoded style should be caught, got: {result:?}"
@@ -2511,7 +2524,7 @@ Content-Type: text/html\r\n\r\n\
     fn strip_hidden_catches_hex_entity_encoded_style() {
         // &#x3a; is hex HTML entity for ':'
         let html = r#"<span style="display&#x3a;none">hidden via hex</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden via hex"),
             "Hex entity-encoded style should be caught, got: {result:?}"
@@ -2523,7 +2536,7 @@ Content-Type: text/html\r\n\r\n\
     fn strip_hidden_catches_named_entity_colon_bypass() {
         let html =
             r#"<span style="display&colon;none">hidden via named entity</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden via named entity"),
             "Named entity &colon; bypass should be caught, got: {result:?}"
@@ -2535,7 +2548,7 @@ Content-Type: text/html\r\n\r\n\
     fn strip_hidden_no_false_positive_on_text_overflow_hidden() {
         // text-overflow:hidden is a valid CSS truncation pattern, not a hiding technique
         let html = r#"<div style="height:0;text-overflow:hidden">truncated</div><p>After</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("truncated"),
             "text-overflow:hidden without overflow:hidden should not be stripped, got: {result:?}"
@@ -2549,14 +2562,14 @@ Content-Type: text/html\r\n\r\n\
         let html = r#"< style="display:none">payload<p>After</p>"#;
         // This is malformed HTML; browsers render it as text, but our parser
         // should handle it gracefully without panicking
-        let _result = strip_hidden_elements(html);
+        let _result = strip_hidden_elements(html).unwrap();
         // No assertion on content — just verify no panic
     }
 
     #[test]
     fn strip_hidden_catches_right_negative_offset() {
         let html = r#"<div style="position:absolute;right:-9999px">hidden</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden"),
             "right:-9999px should be stripped, got: {result:?}"
@@ -2568,7 +2581,7 @@ Content-Type: text/html\r\n\r\n\
     fn strip_hidden_no_false_positive_on_padding_left() {
         // padding-left:-200px is not an off-screen technique
         let html = r#"<div style="position:absolute;padding-left:-200px">content</div>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("content"),
             "padding-left should not trigger offset detection, got: {result:?}"
@@ -2580,7 +2593,7 @@ Content-Type: text/html\r\n\r\n\
         // In HTML5, <div/> is treated as <div>, not self-closing.
         // A crafted <div/> inside a hidden element must increment depth.
         let html = r#"<div style="display:none"><div/>ignored</div>INJECTED</div><p>Safe</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("INJECTED"),
             "Self-closing div should not cause premature depth decrement, got: {result:?}"
@@ -2591,7 +2604,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_catches_class_based_hiding() {
         let html = r#"<style>.h { display: none; }</style><div class="h">hidden via class</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         // The <style> block should be stripped, so ammonia won't see the class
         // rule and won't strip the class attr — but the style block text itself
         // should not appear in the output
@@ -2605,7 +2618,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_catches_height_zero_point_zero() {
         let html = r#"<div style="height:0.0;overflow:hidden">clipped</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("clipped"),
             "height:0.0+overflow:hidden should be stripped, got: {result:?}"
@@ -2616,7 +2629,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_catches_height_zero_point_zero_em() {
         let html = r#"<div style="height:0.00em;overflow:hidden">clipped</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html);
+        let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("clipped"),
             "height:0.00em+overflow:hidden should be stripped, got: {result:?}"
