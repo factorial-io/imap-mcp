@@ -36,7 +36,7 @@ pub struct DraftContent<'a> {
 /// no `<style>`/`<script>`, no event handlers.
 pub fn sanitize_html_for_draft(html: &str) -> Result<String, AppError> {
     let stripped = strip_hidden_elements(html)?;
-    Ok(ammonia_allowlist().clean(&stripped).to_string())
+    Ok(ammonia_draft().clean(&stripped).to_string())
 }
 
 /// Remove elements hidden via CSS and strip `<style>`/`<script>` blocks.
@@ -56,6 +56,13 @@ fn strip_hidden_elements(html: &str) -> Result<String, AppError> {
                 }),
                 element!("script", |el| {
                     el.remove();
+                    Ok(())
+                }),
+                // Strip class attributes so CSS class-based hiding
+                // (e.g. .h{display:none}) cannot target elements after
+                // the <style> block is removed.
+                element!("*[class]", |el| {
+                    el.remove_attribute("class");
                     Ok(())
                 }),
                 element!("*[style]", |el| {
@@ -281,41 +288,85 @@ fn parse_px_digits(s: &str) -> u32 {
     digits.parse().unwrap_or(0)
 }
 
-/// Shared ammonia allowlist for both draft and reading sanitization.
-fn ammonia_allowlist() -> ammonia::Builder<'static> {
+/// Tags allowed in both draft and reading sanitization.
+const ALLOWED_TAGS: [&str; 22] = [
+    "p",
+    "br",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "ul",
+    "ol",
+    "li",
+    "em",
+    "strong",
+    "b",
+    "i",
+    "a",
+    "blockquote",
+    "pre",
+    "code",
+    "table",
+    "tr",
+    "td",
+];
+
+/// Ammonia allowlist for reading: strips all attributes except `href` on links.
+/// Used by `html_to_safe_text` where everything becomes plain text anyway.
+fn ammonia_reading() -> ammonia::Builder<'static> {
     let mut builder = ammonia::Builder::empty();
     builder
-        .add_tags([
-            "p",
-            "br",
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "h5",
-            "h6",
-            "ul",
-            "ol",
-            "li",
-            "em",
-            "strong",
-            "b",
-            "i",
-            "a",
-            "blockquote",
-            "pre",
-            "code",
-            "table",
-            "thead",
-            "tbody",
-            "tr",
-            "th",
-            "td",
-            "div",
-            "span",
-        ])
+        .add_tags(ALLOWED_TAGS)
+        .add_tags(["thead", "tbody", "th", "div", "span"])
         .add_tag_attributes("a", ["href"])
         .add_url_schemes(["https", "http", "mailto"]);
+    builder
+}
+
+/// Ammonia allowlist for outgoing drafts: allows `style` on common tags with a
+/// safe subset of CSS properties for visual formatting. Hidden styles
+/// (`display:none`, etc.) are already stripped by `strip_hidden_elements`.
+fn ammonia_draft() -> ammonia::Builder<'static> {
+    let mut builder = ammonia::Builder::empty();
+    let styled_tags = [
+        "p",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "li",
+        "em",
+        "strong",
+        "b",
+        "i",
+        "a",
+        "blockquote",
+        "pre",
+        "code",
+        "table",
+        "tr",
+        "td",
+        "thead",
+        "tbody",
+        "th",
+        "div",
+        "span",
+    ];
+    builder
+        .add_tags(ALLOWED_TAGS)
+        .add_tags(["thead", "tbody", "th", "div", "span"])
+        .add_tag_attributes("a", ["href"])
+        .add_url_schemes(["https", "http", "mailto"]);
+    for tag in styled_tags {
+        builder.add_tag_attributes(tag, ["style"]);
+    }
     builder
 }
 
@@ -331,7 +382,7 @@ fn html_to_safe_text(html: &str) -> String {
             html.to_string()
         }
     };
-    let sanitized = ammonia_allowlist().clean(&stripped).to_string();
+    let sanitized = ammonia_reading().clean(&stripped).to_string();
     html2text::from_read(sanitized.as_bytes(), 80)
 }
 
@@ -2602,17 +2653,22 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_catches_class_based_hiding() {
-        let html = r#"<style>.h { display: none; }</style><div class="h">hidden via class</div><p>Visible</p>"#;
+    fn strip_hidden_strips_style_blocks_and_class_attrs() {
+        let html = r#"<style>.h { display: none; }</style><div class="h">text</div><p>Visible</p>"#;
         let result = strip_hidden_elements(html).unwrap();
-        // The <style> block should be stripped, so ammonia won't see the class
-        // rule and won't strip the class attr — but the style block text itself
-        // should not appear in the output
         assert!(
             !result.contains("<style>"),
             "Style blocks should be stripped, got: {result:?}"
         );
+        assert!(
+            !result.contains("class="),
+            "Class attributes should be stripped, got: {result:?}"
+        );
         assert!(result.contains("Visible"));
+        // Note: the element's text content remains because we cannot resolve
+        // which classes map to hidden styles without a full CSS engine.
+        // The defense is: <style> block removed + class attr removed = the
+        // hiding rule cannot be applied by email clients in outgoing drafts.
     }
 
     #[test]
