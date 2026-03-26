@@ -497,7 +497,7 @@ fn skip_to_closing_tag(html: &str, start: usize, tag_name: &str) -> usize {
                         b == b' ' || b == b'>' || b == b'/' || b == b'\t' || b == b'\n'
                     })
                     && !lower.starts_with("</")
-                    && !lower.ends_with("/>")
+                    && !(lower.ends_with("/>") && is_void_element(tag_name))
                 {
                     depth += 1;
                 } else if lower.starts_with(&format!("</{}", tag_name))
@@ -2859,6 +2859,19 @@ Content-Type: text/html\r\n\r\n\
             result.contains("content"),
             "padding-left should not trigger offset detection, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn strip_hidden_self_closing_div_does_not_leak_content() {
+        // In HTML5, <div/> is treated as <div>, not self-closing.
+        // A crafted <div/> inside a hidden element must increment depth.
+        let html = r#"<div style="display:none"><div/>ignored</div>INJECTED</div><p>Safe</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("INJECTED"),
+            "Self-closing div should not cause premature depth decrement, got: {result:?}"
+        );
+        assert!(result.contains("Safe"));
     }
 
     // --- Address list splitting tests ---
