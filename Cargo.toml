@@ -68,6 +68,7 @@ ammonia = { version = "4" }
 mailparse = { version = "0.16.0" }
 mail-builder = { version = "0.4" }
 imap-proto = { version = "0.16.4" }
+lol_html = "2.7.2"
 
 [dev-dependencies]
 http-body-util = { version = "0.1.3" }
