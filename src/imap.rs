@@ -146,10 +146,12 @@ fn has_hidden_style(tag: &str) -> bool {
         return false;
     }
     if let Some(style_value) = extract_style_value(tag) {
-        // Decode HTML entities first, then strip whitespace for reliable matching.
-        // Attackers can use entities like &#58; for ':' to bypass literal matching.
+        // Decode HTML entities first, then strip CSS comments and whitespace
+        // for reliable matching. Attackers can use entities (&#58; for ':')
+        // and CSS comments (display:/**/none) to bypass literal matching.
         let decoded = decode_html_entities(style_value);
-        let no_ws: String = decoded
+        let no_comments = strip_css_comments(&decoded);
+        let no_ws: String = no_comments
             .to_lowercase()
             .chars()
             .filter(|c| !c.is_whitespace())
@@ -232,11 +234,25 @@ fn has_zero_property(no_ws: &str, name: &str) -> bool {
 /// Check if any positioning property (left, top, margin-left) has a large negative
 /// value (>= 200px). Small negative values are legitimate centering patterns.
 fn has_large_negative_offset(no_ws: &str) -> bool {
-    for prop in &["left:-", "top:-", "margin-left:-"] {
-        if let Some(pos) = no_ws.find(prop) {
-            if parse_negative_px_value(&no_ws[pos + prop.len()..]) >= 200 {
+    for prop in &[
+        "left:-",
+        "top:-",
+        "right:-",
+        "bottom:-",
+        "margin-left:-",
+        "margin-top:-",
+    ] {
+        let mut search = 0;
+        while let Some(pos) = no_ws[search..].find(prop) {
+            let abs = search + pos;
+            // Property boundary: must be at start or after ';'
+            // Prevents "padding-left:-" from matching "left:-"
+            if (abs == 0 || no_ws.as_bytes()[abs - 1] == b';')
+                && parse_negative_px_value(&no_ws[abs + prop.len()..]) >= 200
+            {
                 return true;
             }
+            search = abs + prop.len();
         }
     }
     false
@@ -261,6 +277,27 @@ fn parse_negative_px_value(s: &str) -> u32 {
 
 /// Decode HTML entities in a string. Handles numeric (&#58; &#x3a;) and
 /// common named entities used in CSS style values.
+/// Strip CSS comments (`/* ... */`) from a string.
+fn strip_css_comments(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            // Skip to end of comment
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2; // skip closing */
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
+}
+
 fn decode_html_entities(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -2762,6 +2799,49 @@ Content-Type: text/html\r\n\r\n\
             "Zero-padded entity bypass should be caught, got: {result:?}"
         );
         assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_css_comment_bypass() {
+        let html = r#"<span style="display:/**/none">hidden via comment</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("hidden via comment"),
+            "CSS comment bypass should be caught, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_css_comments_basic() {
+        assert_eq!(strip_css_comments("display:/**/none"), "display:none");
+        assert_eq!(
+            strip_css_comments("display:/* hidden */none"),
+            "display:none"
+        );
+        assert_eq!(strip_css_comments("no comments"), "no comments");
+    }
+
+    #[test]
+    fn strip_hidden_catches_right_negative_offset() {
+        let html = r#"<div style="position:absolute;right:-9999px">hidden</div><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("hidden"),
+            "right:-9999px should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_no_false_positive_on_padding_left() {
+        // padding-left:-200px is not an off-screen technique
+        let html = r#"<div style="position:absolute;padding-left:-200px">content</div>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            result.contains("content"),
+            "padding-left should not trigger offset detection, got: {result:?}"
+        );
     }
 
     // --- Address list splitting tests ---
