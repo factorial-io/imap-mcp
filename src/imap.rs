@@ -172,16 +172,13 @@ fn has_hidden_style(tag: &str) -> bool {
                 }
             }
         }
-        // font-size:0 / font-size:0px — text rendered at zero size
-        if no_ws.contains("font-size:0px")
-            || no_ws.contains("font-size:0;")
-            || no_ws.ends_with("font-size:0")
-        {
+        // font-size:0 / font-size:0px / font-size:0em — text rendered at zero size
+        if has_zero_property(&no_ws, "font-size") {
             return true;
         }
         // height:0 or max-height:0 with overflow:hidden — content clipped away.
-        // Anchored to property boundaries to avoid matching min-height:0 (legitimate).
-        if (has_css_property(&no_ws, "height:0") || no_ws.contains("max-height:0"))
+        // Uses boundary-aware matching to avoid false-positive on min-height:0.
+        if (has_zero_property(&no_ws, "height") || has_zero_property(&no_ws, "max-height"))
             && no_ws.contains("overflow:hidden")
         {
             return true;
@@ -201,13 +198,29 @@ fn has_hidden_style(tag: &str) -> bool {
     false
 }
 
-/// Check if a CSS property appears at a property boundary in a whitespace-stripped
-/// style string. Prevents `"height:0"` from matching inside `"min-height:0"`.
-fn has_css_property(no_ws: &str, prop: &str) -> bool {
-    no_ws == prop
-        || no_ws.starts_with(&format!("{prop};"))
-        || no_ws.contains(&format!(";{prop};"))
-        || no_ws.ends_with(&format!(";{prop}"))
+/// Check if a CSS property with a zero value appears at a property boundary.
+/// Matches `height:0`, `height:0px`, `height:0em`, `height:0rem`, etc.
+/// Prevents `"height:0"` from matching inside `"min-height:0"` by requiring
+/// the property name to appear at the start or after a `;`.
+fn has_zero_property(no_ws: &str, name: &str) -> bool {
+    // Build "name:" prefix to search for
+    let prefix = format!("{name}:");
+    let mut search_from = 0;
+    while let Some(pos) = no_ws[search_from..].find(&prefix) {
+        let abs_pos = search_from + pos;
+        // Must be at start or preceded by ';' (property boundary)
+        let at_boundary = abs_pos == 0 || no_ws.as_bytes()[abs_pos - 1] == b';';
+        if at_boundary {
+            // Check that the value starts with '0' followed by a non-digit
+            // (covers 0, 0px, 0em, 0rem, 0vh, 0%, etc.)
+            let value = &no_ws[abs_pos + prefix.len()..];
+            if value.starts_with('0') && !value[1..].starts_with(|c: char| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+        search_from = abs_pos + prefix.len();
+    }
+    false
 }
 
 /// Check if any positioning property (left, top, margin-left) has a large negative
@@ -315,9 +328,9 @@ fn extract_tag_name(tag: &str) -> Option<String> {
 
 /// Skip past the matching closing tag for `tag_name`, handling nesting.
 /// Returns the byte index after the closing tag. If no closing tag is found
-/// (malformed HTML), returns `start` so only the opening tag is skipped —
-/// this prevents an unclosed hidden element from silently dropping all
-/// remaining content.
+/// (malformed HTML), returns `html.len()` — stripping to end-of-document.
+/// This prevents an unclosed hidden element from leaking its content as a
+/// prompt-injection payload.
 fn skip_to_closing_tag(html: &str, start: usize, tag_name: &str) -> usize {
     let mut depth: usize = 1;
     let mut i = start;
@@ -2383,6 +2396,21 @@ Content-Type: text/html\r\n\r\n\
             "height:0+overflow:hidden should be stripped, got: {result:?}"
         );
         assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_height_zero_with_units() {
+        for unit in &["px", "em", "rem", "vh", "%"] {
+            let html = format!(
+                r#"<div style="height:0{unit};overflow:hidden">hidden</div><p>Visible</p>"#
+            );
+            let result = strip_hidden_elements(&html);
+            assert!(
+                !result.contains("hidden"),
+                "height:0{unit}+overflow:hidden should be stripped, got: {result:?}"
+            );
+            assert!(result.contains("Visible"));
+        }
     }
 
     #[test]
