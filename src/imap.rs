@@ -214,10 +214,13 @@ fn has_zero_property(no_ws: &str, name: &str) -> bool {
         // Must be at start or preceded by ';' (property boundary)
         let at_boundary = abs_pos == 0 || no_ws.as_bytes()[abs_pos - 1] == b';';
         if at_boundary {
-            // Check that the value starts with '0' followed by a non-digit
-            // (covers 0, 0px, 0em, 0rem, 0vh, 0%, etc.)
+            // Check that the value starts with '0' followed by a non-digit,
+            // non-dot character (covers 0, 0px, 0em, 0rem, 0vh, 0%, etc.
+            // but excludes 0.5em, 0.1px, etc. which are non-zero).
             let value = &no_ws[abs_pos + prefix.len()..];
-            if value.starts_with('0') && !value[1..].starts_with(|c: char| c.is_ascii_digit()) {
+            if value.starts_with('0')
+                && !value[1..].starts_with(|c: char| c == '.' || c.is_ascii_digit())
+            {
                 return true;
             }
         }
@@ -2646,6 +2649,17 @@ Content-Type: text/html\r\n\r\n\
         assert!(
             result.contains("accordion content"),
             "min-height:0 should not be stripped, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_preserves_fractional_zero_height() {
+        // height:0.5em is non-zero and should not be stripped
+        let html = r#"<div style="height:0.5em;overflow:hidden">visible content</div><p>After</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            result.contains("visible content"),
+            "height:0.5em should not be stripped, got: {result:?}"
         );
     }
 
