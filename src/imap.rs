@@ -326,9 +326,10 @@ fn ammonia_reading() -> ammonia::Builder<'static> {
     builder
 }
 
-/// Ammonia allowlist for outgoing drafts: allows `style` on common tags with a
-/// safe subset of CSS properties for visual formatting. Hidden styles
-/// (`display:none`, etc.) are already stripped by `strip_hidden_elements`.
+/// Ammonia allowlist for outgoing drafts: uses `attribute_filter` to sanitize
+/// CSS `style` values down to safe visual properties only. Hidden styles are
+/// already stripped by `strip_hidden_elements`, but this also blocks tracking
+/// pixels via `background-image:url(...)`, overlays, `color:transparent`, etc.
 fn ammonia_draft() -> ammonia::Builder<'static> {
     let mut builder = ammonia::Builder::empty();
     let styled_tags = [
@@ -363,11 +364,104 @@ fn ammonia_draft() -> ammonia::Builder<'static> {
         .add_tags(ALLOWED_TAGS)
         .add_tags(["thead", "tbody", "th", "div", "span"])
         .add_tag_attributes("a", ["href"])
-        .add_url_schemes(["https", "http", "mailto"]);
+        .add_url_schemes(["https", "http", "mailto"])
+        .attribute_filter(|_element, attribute, value| {
+            if attribute != "style" {
+                return Some(value.into());
+            }
+            let filtered = filter_css_properties(value);
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(filtered.into())
+            }
+        });
     for tag in styled_tags {
         builder.add_tag_attributes(tag, ["style"]);
     }
     builder
+}
+
+/// CSS properties safe for email formatting. No `background-image` (tracking),
+/// no `position`/`opacity`/`display`/`visibility` (hiding/overlays), no `color`
+/// with transparent values.
+const SAFE_CSS_PROPERTIES: &[&str] = &[
+    "color",
+    "background-color",
+    "font-family",
+    "font-size",
+    "font-weight",
+    "font-style",
+    "line-height",
+    "text-align",
+    "text-decoration",
+    "text-transform",
+    "letter-spacing",
+    "word-spacing",
+    "border",
+    "border-top",
+    "border-right",
+    "border-bottom",
+    "border-left",
+    "border-collapse",
+    "border-spacing",
+    "border-color",
+    "border-style",
+    "border-width",
+    "border-radius",
+    "margin",
+    "margin-top",
+    "margin-right",
+    "margin-bottom",
+    "margin-left",
+    "padding",
+    "padding-top",
+    "padding-right",
+    "padding-bottom",
+    "padding-left",
+    "width",
+    "max-width",
+    "min-width",
+    "height",
+    "max-height",
+    "min-height",
+    "vertical-align",
+    "white-space",
+    "list-style",
+    "list-style-type",
+];
+
+/// Filter CSS style value to only permit safe properties.
+/// Returns a sanitized CSS string with only allowed properties.
+fn filter_css_properties(style: &str) -> String {
+    let mut safe = Vec::new();
+    for declaration in style.split(';') {
+        let declaration = declaration.trim();
+        if declaration.is_empty() {
+            continue;
+        }
+        if let Some((prop, value)) = declaration.split_once(':') {
+            let prop = prop.trim().to_lowercase();
+            let value = value.trim();
+            if SAFE_CSS_PROPERTIES.contains(&prop.as_str()) {
+                // Block url() in any property value (tracking pixels)
+                let lower_value = value.to_lowercase();
+                if lower_value.contains("url(") || lower_value.contains("expression(") {
+                    continue;
+                }
+                // Block transparent/rgba(0,0,0,0) in color properties
+                if prop == "color"
+                    && (lower_value == "transparent"
+                        || lower_value.contains("rgba(0,0,0,0")
+                        || lower_value.contains("rgba( 0, 0, 0, 0"))
+                {
+                    continue;
+                }
+                safe.push(format!("{prop}: {value}"));
+            }
+        }
+    }
+    safe.join("; ")
 }
 
 /// Convert HTML to plain text safely for AI consumption.
@@ -378,8 +472,8 @@ fn html_to_safe_text(html: &str) -> String {
     let stripped = match strip_hidden_elements(html) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("HTML sanitization failed, falling back to ammonia-only: {e}");
-            html.to_string()
+            tracing::warn!("HTML sanitization failed, returning empty body: {e}");
+            return String::new();
         }
     };
     let sanitized = ammonia_reading().clean(&stripped).to_string();
@@ -2691,6 +2785,48 @@ Content-Type: text/html\r\n\r\n\
             "height:0.00em+overflow:hidden should be stripped, got: {result:?}"
         );
         assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn filter_css_allows_safe_properties() {
+        let css = "color: red; font-size: 14px; text-align: center";
+        let result = filter_css_properties(css);
+        assert!(result.contains("color: red"));
+        assert!(result.contains("font-size: 14px"));
+        assert!(result.contains("text-align: center"));
+    }
+
+    #[test]
+    fn filter_css_strips_dangerous_properties() {
+        let css = "background-image: url(https://tracker.evil/pixel); color: red";
+        let result = filter_css_properties(css);
+        assert!(!result.contains("background-image"));
+        assert!(!result.contains("tracker.evil"));
+        assert!(result.contains("color: red"));
+    }
+
+    #[test]
+    fn filter_css_strips_position_and_display() {
+        let css = "position: absolute; left: -9999px; display: none; font-size: 14px";
+        let result = filter_css_properties(css);
+        assert!(!result.contains("position"));
+        assert!(!result.contains("display"));
+        assert!(!result.contains("left"));
+        assert!(result.contains("font-size: 14px"));
+    }
+
+    #[test]
+    fn filter_css_strips_transparent_color() {
+        assert_eq!(filter_css_properties("color: transparent"), "");
+        assert_eq!(filter_css_properties("color: rgba(0,0,0,0)"), "");
+    }
+
+    #[test]
+    fn filter_css_strips_url_in_any_value() {
+        let css = "background-color: url(evil); padding: 10px";
+        let result = filter_css_properties(css);
+        assert!(!result.contains("url"));
+        assert!(result.contains("padding: 10px"));
     }
 
     // --- Address list splitting tests ---
