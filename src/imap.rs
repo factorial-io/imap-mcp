@@ -163,34 +163,35 @@ fn has_hidden_style(tag: &str) -> bool {
 
 /// Extract the value of the `style` attribute from a tag string, if present.
 /// Matches `style` as a full attribute name (not `data-style`, etc.).
+///
+/// Uses ASCII case-insensitive matching directly on the original string to
+/// avoid byte-offset mismatches between `tag` and a Unicode-lowercased copy.
 fn extract_style_value(tag: &str) -> Option<&str> {
-    let lower = tag.to_lowercase();
-    let mut search_from = 0;
-    while let Some(pos) = lower[search_from..].find("style") {
-        let abs_pos = search_from + pos;
-        let preceded_by_ws = abs_pos == 0
-            || lower
-                .as_bytes()
-                .get(abs_pos - 1)
-                .is_some_and(|&b| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r');
-        let after = &lower[abs_pos + 5..];
-        let followed_by_eq = after.starts_with('=') || after.trim_start().starts_with('=');
+    let bytes = tag.as_bytes();
+    let mut i = 0;
+    while i + 5 <= bytes.len() {
+        // Find "style" (case-insensitive, ASCII only)
+        if bytes[i..i + 5].eq_ignore_ascii_case(b"style") {
+            // Check preceding byte is whitespace (attribute boundary)
+            let preceded_by_ws = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r');
+            // Check followed by '=' (possibly with whitespace)
+            let rest = &tag[i + 5..];
+            let followed_by_eq = rest.starts_with('=') || rest.trim_start().starts_with('=');
 
-        if preceded_by_ws && followed_by_eq {
-            // Find = and quote in the original tag (preserve case for the return)
-            let rest = &tag[abs_pos + 5..];
-            let eq = rest.find('=')?;
-            let after_eq = rest[eq + 1..].trim_start();
-            let quote = after_eq.as_bytes().first()?;
-            if *quote != b'"' && *quote != b'\'' {
-                search_from = abs_pos + 5;
-                continue;
+            if preceded_by_ws && followed_by_eq {
+                let eq = rest.find('=')?;
+                let after_eq = rest[eq + 1..].trim_start();
+                let quote = after_eq.as_bytes().first()?;
+                if *quote != b'"' && *quote != b'\'' {
+                    i += 5;
+                    continue;
+                }
+                let value_start = 1; // skip opening quote
+                let end = after_eq[value_start..].find(*quote as char)?;
+                return Some(&after_eq[value_start..value_start + end]);
             }
-            let value_start = 1; // skip opening quote
-            let end = after_eq[value_start..].find(*quote as char)?;
-            return Some(&after_eq[value_start..value_start + end]);
         }
-        search_from = abs_pos + 5;
+        i += 1;
     }
     None
 }
