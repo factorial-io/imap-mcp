@@ -11,6 +11,10 @@ pub struct DraftContent<'a> {
     pub to: &'a str,
     pub subject: &'a str,
     pub body: &'a str,
+    /// Optional HTML body. When provided, the message is sent as
+    /// `multipart/alternative` with both plain-text and HTML parts.
+    /// The plain-text `body` is always required as the fallback.
+    pub html_body: Option<&'a str>,
     pub cc: Option<&'a str>,
     pub bcc: Option<&'a str>,
     /// Single Message-ID of the email being replied to (sets In-Reply-To header).
@@ -71,6 +75,9 @@ pub struct EmailDetail {
     /// References header value (threading chain of Message-IDs).
     pub references: Option<String>,
     pub body: String,
+    /// Original HTML body, if the email contained an HTML part.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html_body: Option<String>,
     /// Metadata for each attachment (use get_attachment to fetch content).
     pub attachments: Vec<AttachmentInfo>,
 }
@@ -212,25 +219,33 @@ impl ImapConnection {
         let body_raw = fetch.body().unwrap_or(b"");
         // Parse the raw message once and reuse for body, attachments, and headers.
         // Falls back gracefully for malformed emails (spam, old messages, etc.).
-        let (body, attachments, references, message_id) = match mailparse::parse_mail(body_raw) {
-            Ok(parsed) => {
-                let body = extract_body_from_parsed(&parsed);
-                let mut attachments = Vec::new();
-                collect_attachment_infos(&parsed, &mut attachments);
-                let references = extract_header_from_parsed(&parsed.headers, "References");
-                let message_id = extract_header_from_parsed(&parsed.headers, "Message-ID");
-                (body, attachments, references, message_id)
-            }
-            Err(e) => {
-                tracing::warn!("failed to parse email UID {uid}: {e}");
-                (
-                    String::from_utf8_lossy(body_raw).to_string(),
-                    Vec::new(),
-                    None,
-                    None,
-                )
-            }
-        };
+        let (body, html_body, attachments, references, message_id) =
+            match mailparse::parse_mail(body_raw) {
+                Ok(parsed) => {
+                    let extracted = extract_body_from_parsed(&parsed);
+                    let mut attachments = Vec::new();
+                    collect_attachment_infos(&parsed, &mut attachments);
+                    let references = extract_header_from_parsed(&parsed.headers, "References");
+                    let message_id = extract_header_from_parsed(&parsed.headers, "Message-ID");
+                    (
+                        extracted.text,
+                        extracted.html,
+                        attachments,
+                        references,
+                        message_id,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!("failed to parse email UID {uid}: {e}");
+                    (
+                        String::from_utf8_lossy(body_raw).to_string(),
+                        None,
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                }
+            };
 
         let envelope = fetch.envelope();
         Ok(EmailDetail {
@@ -247,6 +262,7 @@ impl ImapConnection {
             message_id,
             references,
             body,
+            html_body,
             attachments,
         })
     }
@@ -379,6 +395,9 @@ impl ImapConnection {
             .to(Self::parse_address(draft.to))
             .subject(draft.subject)
             .text_body(draft.body);
+        if let Some(html) = draft.html_body {
+            builder = builder.html_body(html);
+        }
         if let Some(cc) = draft.cc {
             builder = builder.cc(Self::parse_address(cc));
         }
@@ -943,31 +962,48 @@ fn extract_header_value(raw: &[u8], header_name: &str) -> Option<String> {
     extract_header_from_parsed(&parsed.headers, header_name)
 }
 
+/// Extracted email body parts.
+struct ExtractedBody {
+    /// Plain text body (converted from HTML if no plain text part exists).
+    text: String,
+    /// Original HTML body, if the email contained an HTML part.
+    html: Option<String>,
+}
+
 #[cfg(test)]
 fn extract_body(raw: &[u8]) -> String {
     match mailparse::parse_mail(raw) {
-        Ok(parsed) => extract_body_from_parsed(&parsed),
+        Ok(parsed) => extract_body_from_parsed(&parsed).text,
         Err(_) => String::from_utf8_lossy(raw).to_string(),
     }
 }
 
-fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> String {
+fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
     let ct = parsed.ctype.mimetype.to_lowercase();
 
     // Leaf node: return text content directly
     if !ct.starts_with("multipart/") {
         if ct == "text/plain" {
             if let Ok(body) = parsed.get_body() {
-                return body;
+                return ExtractedBody {
+                    text: body,
+                    html: None,
+                };
             }
         }
         if ct == "text/html" {
             if let Ok(body) = parsed.get_body() {
-                return html2text::from_read(body.as_bytes(), 80);
+                return ExtractedBody {
+                    text: html2text::from_read(body.as_bytes(), 80),
+                    html: Some(body),
+                };
             }
         }
         // Skip non-text parts (signatures, attachments, etc.)
-        return String::new();
+        return ExtractedBody {
+            text: String::new(),
+            html: None,
+        };
     }
 
     // Multipart: recurse into subparts, prefer text/plain over text/html
@@ -987,27 +1023,48 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> String {
         } else if sub_ct.starts_with("multipart/") {
             // Recurse into nested multipart (e.g. multipart/signed → multipart/alternative)
             let nested = extract_body_from_parsed(sub);
-            if !nested.is_empty() && plain.is_empty() {
-                plain = nested;
+            if !nested.text.is_empty() && plain.is_empty() {
+                plain = nested.text;
+            }
+            if nested.html.is_some() && html.is_empty() {
+                html = nested.html.unwrap_or_default();
             }
         }
     }
 
+    let html_out = if html.is_empty() {
+        None
+    } else {
+        Some(html.clone())
+    };
+
     if !plain.is_empty() {
-        return plain;
+        return ExtractedBody {
+            text: plain,
+            html: html_out,
+        };
     }
     if !html.is_empty() {
-        return html2text::from_read(html.as_bytes(), 80);
+        return ExtractedBody {
+            text: html2text::from_read(html.as_bytes(), 80),
+            html: html_out,
+        };
     }
 
     // Last resort: top-level body (preamble text)
     if let Ok(body) = parsed.get_body() {
         if !body.trim().is_empty() && !body.contains("S/MIME") {
-            return body;
+            return ExtractedBody {
+                text: body,
+                html: None,
+            };
         }
     }
 
-    "(no text content)".to_string()
+    ExtractedBody {
+        text: "(no text content)".to_string(),
+        html: None,
+    }
 }
 
 #[cfg(test)]
@@ -1315,6 +1372,7 @@ SIGNATUREDATA\r\n\
             to: "bob@example.com",
             subject: "Test Subject",
             body: "Hello, Bob!",
+            html_body: None,
             cc: None,
             bcc: None,
             in_reply_to: None,
@@ -1339,6 +1397,7 @@ SIGNATUREDATA\r\n\
             to: "bob@example.com",
             subject: "With CC",
             body: "Body text",
+            html_body: None,
             cc: Some("carol@example.com"),
             bcc: Some("dave@example.com"),
             in_reply_to: None,
@@ -1356,6 +1415,7 @@ SIGNATUREDATA\r\n\
             to: "c@d.com",
             subject: "Sub",
             body: "The body",
+            html_body: None,
             cc: None,
             bcc: None,
             in_reply_to: None,
@@ -1376,6 +1436,7 @@ SIGNATUREDATA\r\n\
             to: "recipient@test.com",
             subject: "Parse Test",
             body: "Can mailparse handle this?",
+            html_body: None,
             cc: Some("cc@test.com"),
             bcc: None,
             in_reply_to: None,
@@ -1394,6 +1455,7 @@ SIGNATUREDATA\r\n\
             to: "bob@example.com",
             subject: "Test",
             body: "Body",
+            html_body: None,
             cc: None,
             bcc: None,
             in_reply_to: None,
@@ -1410,6 +1472,7 @@ SIGNATUREDATA\r\n\
             to: "b@example.com",
             subject: "Re: X",
             body: "Body",
+            html_body: None,
             cc: None,
             bcc: None,
             in_reply_to: Some("<id1@x.com> <id2@x.com>"),
@@ -1429,6 +1492,7 @@ SIGNATUREDATA\r\n\
             to: "bob@example.com",
             subject: "Test",
             body: "Body",
+            html_body: None,
             cc: None,
             bcc: None,
             in_reply_to: None,
@@ -1445,6 +1509,7 @@ SIGNATUREDATA\r\n\
             to: "recipient@test.com",
             subject: "Ünïcödé Subject",
             body: "Body",
+            html_body: None,
             cc: None,
             bcc: None,
             in_reply_to: None,
@@ -1474,6 +1539,7 @@ SIGNATUREDATA\r\n\
             to: "recipient@test.com",
             subject: "Plain ASCII",
             body: "Body",
+            html_body: None,
             cc: None,
             bcc: None,
             in_reply_to: None,
@@ -1490,6 +1556,7 @@ SIGNATUREDATA\r\n\
             to: "bob@example.com",
             subject: "Test",
             body: "Body",
+            html_body: None,
             cc: None,
             bcc: None,
             in_reply_to: None,
@@ -1518,6 +1585,7 @@ SIGNATUREDATA\r\n\
             to: "c@d.com",
             subject: "Sub",
             body: "line1\nline2\nline3",
+            html_body: None,
             cc: None,
             bcc: None,
             in_reply_to: None,
@@ -1544,6 +1612,7 @@ SIGNATUREDATA\r\n\
             to: "bob@example.com",
             subject: "Re: Original Subject",
             body: "Reply body",
+            html_body: None,
             cc: None,
             bcc: None,
             in_reply_to: Some("<original-msg-id@example.com>"),
@@ -1585,6 +1654,7 @@ SIGNATUREDATA\r\n\
             to: "bob@example.com",
             subject: "New Email",
             body: "Fresh message",
+            html_body: None,
             cc: None,
             bcc: None,
             in_reply_to: None,
@@ -1644,6 +1714,112 @@ These are my notes.\r\n\
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].filename, Some("notes.txt".to_string()));
         assert_eq!(infos[0].mime_type, "text/plain");
+    }
+
+    // --- HTML body tests ---
+
+    #[test]
+    fn build_rfc2822_with_html_body() {
+        let draft = DraftContent {
+            from: "alice@example.com",
+            to: "bob@example.com",
+            subject: "Formatted Email",
+            body: "Hello, Bob!",
+            html_body: Some("<p>Hello, <strong>Bob</strong>!</p>"),
+            cc: None,
+            bcc: None,
+            in_reply_to: None,
+            references: None,
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        // Should be multipart/alternative
+        assert!(
+            msg.contains("multipart/alternative"),
+            "Should produce multipart/alternative, got:\n{msg}"
+        );
+        assert!(msg.contains("text/plain"), "Should contain text/plain part");
+        assert!(msg.contains("text/html"), "Should contain text/html part");
+        assert!(
+            msg.contains("Hello, Bob!"),
+            "Should contain plain text body"
+        );
+        assert!(
+            msg.contains("<strong>Bob</strong>"),
+            "Should contain HTML body"
+        );
+    }
+
+    #[test]
+    fn build_rfc2822_html_body_parseable() {
+        let draft = DraftContent {
+            from: "sender@test.com",
+            to: "recipient@test.com",
+            subject: "HTML Test",
+            body: "Plain text version",
+            html_body: Some("<h1>HTML version</h1>"),
+            cc: None,
+            bcc: None,
+            in_reply_to: None,
+            references: None,
+        };
+        let msg = ImapConnection::build_rfc2822_message(&draft).unwrap();
+        let parsed = mailparse::parse_mail(msg.as_bytes()).expect("should parse as valid email");
+        // Should be multipart with both text and html subparts
+        assert!(
+            parsed.ctype.mimetype.contains("multipart"),
+            "Top-level should be multipart"
+        );
+        let extracted = extract_body_from_parsed(&parsed);
+        assert!(
+            extracted.text.contains("Plain text version"),
+            "Should extract plain text body"
+        );
+        assert!(extracted.html.is_some(), "Should have HTML body");
+        assert!(
+            extracted.html.unwrap().contains("<h1>HTML version</h1>"),
+            "Should extract HTML body"
+        );
+    }
+
+    #[test]
+    fn extract_html_from_multipart_alternative() {
+        let raw = b"Content-Type: multipart/alternative; boundary=bound\r\n\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\r\n\
+Plain text body\r\n\
+--bound\r\n\
+Content-Type: text/html\r\n\r\n\
+<p>HTML body</p>\r\n\
+--bound--";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let extracted = extract_body_from_parsed(&parsed);
+        assert!(extracted.text.contains("Plain text body"));
+        assert!(extracted.html.is_some());
+        assert!(extracted.html.unwrap().contains("<p>HTML body</p>"));
+    }
+
+    #[test]
+    fn extract_html_from_html_only_email() {
+        let raw = b"Content-Type: text/html\r\n\r\n<p>Only HTML</p>";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let extracted = extract_body_from_parsed(&parsed);
+        assert!(extracted.html.is_some());
+        assert!(extracted
+            .html
+            .as_ref()
+            .unwrap()
+            .contains("<p>Only HTML</p>"));
+        // Plain text should be derived from HTML
+        assert!(extracted.text.contains("Only HTML"));
+    }
+
+    #[test]
+    fn extract_no_html_from_plain_only_email() {
+        let raw = b"Content-Type: text/plain\r\n\r\nJust plain text";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let extracted = extract_body_from_parsed(&parsed);
+        assert!(extracted.text.contains("Just plain text"));
+        assert!(extracted.html.is_none());
     }
 
     // --- Address list splitting tests ---
