@@ -62,6 +62,7 @@ pub fn sanitize_html_for_draft(html: &str) -> String {
             "span",
         ])
         .add_tag_attributes("a", ["href"])
+        .add_url_schemes(["https", "http", "mailto"])
         .clean(&stripped)
         .to_string()
 }
@@ -353,6 +354,7 @@ fn sanitize_html_for_reading(html: &str) -> String {
             "span",
         ])
         .add_tag_attributes("a", ["href"])
+        .add_url_schemes(["https", "http", "mailto"])
         .clean(html)
         .to_string()
 }
@@ -2204,7 +2206,10 @@ Content-Type: text/html\r\n\r\n\
         assert!(sanitized.contains("<em>"));
         assert!(sanitized.contains("<ul>"));
         assert!(sanitized.contains("<li>"));
-        assert!(sanitized.contains("<a "));
+        assert!(
+            sanitized.contains(r#"href="https://example.com""#),
+            "href should be preserved on links, got: {sanitized:?}"
+        );
     }
 
     #[test]
