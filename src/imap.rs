@@ -90,19 +90,20 @@ fn strip_hidden_elements(html: &str) -> String {
                 let tag = &html[i..=tag_end];
                 // Check if this is an opening tag (not closing/comment/doctype)
                 if has_hidden_style(tag) {
-                    if let Some(tag_name) = extract_tag_name(tag) {
-                        // Self-closing tags or void elements have no closing tag
-                        let after_close = if tag.ends_with("/>") || is_void_element(&tag_name) {
+                    let after_close = match extract_tag_name(tag) {
+                        Some(ref tag_name) if tag.ends_with("/>") || is_void_element(tag_name) => {
                             tag_end + 1
-                        } else {
-                            skip_to_closing_tag(html, tag_end + 1, &tag_name)
-                        };
-                        // Advance the iterator past the entire element
-                        while chars.peek().is_some_and(|&(j, _)| j < after_close) {
-                            chars.next();
                         }
-                        continue;
+                        Some(ref tag_name) => skip_to_closing_tag(html, tag_end + 1, tag_name),
+                        // No tag name (e.g. `< style="display:none">`) — skip
+                        // just the tag itself to avoid leaking any content
+                        None => tag_end + 1,
+                    };
+                    // Advance the iterator past the entire element
+                    while chars.peek().is_some_and(|&(j, _)| j < after_close) {
+                        chars.next();
                     }
+                    continue;
                 }
             }
         }
@@ -145,8 +146,10 @@ fn has_hidden_style(tag: &str) -> bool {
         return false;
     }
     if let Some(style_value) = extract_style_value(tag) {
-        // Strip all whitespace for reliable matching regardless of formatting
-        let no_ws: String = style_value
+        // Decode HTML entities first, then strip whitespace for reliable matching.
+        // Attackers can use entities like &#58; for ':' to bypass literal matching.
+        let decoded = decode_html_entities(style_value);
+        let no_ws: String = decoded
             .to_lowercase()
             .chars()
             .filter(|c| !c.is_whitespace())
@@ -251,6 +254,82 @@ fn has_large_negative_value(no_ws: &str, prop: &str) -> bool {
 fn parse_negative_px_value(s: &str) -> u32 {
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().unwrap_or(0)
+}
+
+/// Decode HTML entities in a string. Handles numeric (&#58; &#x3a;) and
+/// common named entities used in CSS style values.
+fn decode_html_entities(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            let mut entity = String::new();
+            for ec in chars.by_ref() {
+                if ec == ';' {
+                    break;
+                }
+                entity.push(ec);
+                if entity.len() > 10 {
+                    // Too long — not a real entity, emit as-is
+                    result.push('&');
+                    result.push_str(&entity);
+                    entity.clear();
+                    break;
+                }
+            }
+            if entity.is_empty() {
+                // We hit ';' or '&;' — already consumed
+                result.push('&');
+                continue;
+            }
+            if let Some(decoded) = decode_entity(&entity) {
+                result.push(decoded);
+            } else {
+                // Unknown entity — emit as-is
+                result.push('&');
+                result.push_str(&entity);
+                result.push(';');
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Decode a single HTML entity reference (without & and ;).
+fn decode_entity(entity: &str) -> Option<char> {
+    // Numeric: &#58; or &#x3a;
+    if let Some(rest) = entity.strip_prefix('#') {
+        if let Some(hex) = rest.strip_prefix('x').or_else(|| rest.strip_prefix('X')) {
+            let code = u32::from_str_radix(hex, 16).ok()?;
+            return char::from_u32(code);
+        }
+        let code: u32 = rest.parse().ok()?;
+        return char::from_u32(code);
+    }
+    // Named entities commonly used in CSS obfuscation
+    match entity {
+        "colon" => Some(':'),
+        "semi" => Some(';'),
+        "comma" => Some(','),
+        "period" => Some('.'),
+        "hyphen" => Some('-'),
+        "minus" => Some('-'),
+        "lpar" => Some('('),
+        "rpar" => Some(')'),
+        "num" => Some('#'),
+        "percnt" => Some('%'),
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        "Tab" => Some('\t'),
+        "NewLine" => Some('\n'),
+        _ => None,
+    }
 }
 
 /// Extract the value of the `style` attribute from a tag string, if present.
@@ -2584,6 +2663,51 @@ Content-Type: text/html\r\n\r\n\
             result.contains("slightly indented"),
             "Small text-indent should not be stripped, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn strip_hidden_catches_html_entity_encoded_style() {
+        // &#58; is HTML entity for ':'
+        let html = r#"<span style="display&#58;none">hidden via entity</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("hidden via entity"),
+            "HTML entity-encoded style should be caught, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_hex_entity_encoded_style() {
+        // &#x3a; is hex HTML entity for ':'
+        let html = r#"<span style="display&#x3a;none">hidden via hex</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("hidden via hex"),
+            "Hex entity-encoded style should be caught, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_empty_tag_name_skips_tag() {
+        // Tag with empty name: `< style="display:none">` — should at minimum
+        // skip the tag itself and not leak content after it
+        let html = r#"< style="display:none">payload<p>After</p>"#;
+        // This is malformed HTML; browsers render it as text, but our parser
+        // should handle it gracefully without panicking
+        let _result = strip_hidden_elements(html);
+        // No assertion on content — just verify no panic
+    }
+
+    #[test]
+    fn decode_html_entities_basic() {
+        assert_eq!(decode_html_entities("display&#58;none"), "display:none");
+        assert_eq!(decode_html_entities("display&#x3a;none"), "display:none");
+        assert_eq!(decode_html_entities("display&#X3A;none"), "display:none");
+        assert_eq!(decode_html_entities("no entities"), "no entities");
+        assert_eq!(decode_html_entities("&amp;"), "&");
+        assert_eq!(decode_html_entities("a&unknown;b"), "a&unknown;b");
     }
 
     // --- Address list splitting tests ---
