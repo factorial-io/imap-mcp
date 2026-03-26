@@ -31,9 +31,10 @@ pub struct DraftContent<'a> {
 /// elements are stripped. This prevents prompt-injected AI output from producing
 /// drafts with executable or tracking payloads.
 pub fn sanitize_html_for_draft(html: &str) -> String {
+    let stripped = strip_hidden_elements(html);
     ammonia::Builder::default()
         .add_tags(["h1", "h2", "h3", "h4", "h5", "h6"])
-        .clean(html)
+        .clean(&stripped)
         .to_string()
 }
 
