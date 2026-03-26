@@ -26,14 +26,42 @@ pub struct DraftContent<'a> {
 
 /// Sanitize HTML for use in outgoing draft emails.
 ///
-/// Uses an allowlist approach: only safe, human-visible tags and attributes are
-/// preserved. Scripts, styles, event handlers, and potentially dangerous
-/// elements are stripped. This prevents prompt-injected AI output from producing
-/// drafts with executable or tracking payloads.
+/// Uses an explicit allowlist: only safe, human-visible tags are permitted.
+/// No `<img>` tags (prevents tracking pixels), no `<style>`/`<script>`,
+/// no event handlers. Links keep their `href` for clickability.
 pub fn sanitize_html_for_draft(html: &str) -> String {
     let stripped = strip_hidden_elements(html);
-    ammonia::Builder::default()
-        .add_tags(["h1", "h2", "h3", "h4", "h5", "h6"])
+    ammonia::Builder::empty()
+        .add_tags([
+            "p",
+            "br",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "ul",
+            "ol",
+            "li",
+            "em",
+            "strong",
+            "b",
+            "i",
+            "a",
+            "blockquote",
+            "pre",
+            "code",
+            "table",
+            "thead",
+            "tbody",
+            "tr",
+            "th",
+            "td",
+            "div",
+            "span",
+        ])
+        .add_tag_attributes("a", ["href"])
         .clean(&stripped)
         .to_string()
 }
@@ -126,9 +154,18 @@ fn has_hidden_style(tag: &str) -> bool {
         if no_ws.contains("visibility:hidden") {
             return true;
         }
-        // opacity:0 — fully transparent
-        if no_ws.contains("opacity:0") && !no_ws.contains("opacity:0.") {
-            return true;
+        // opacity:0 — fully transparent (catches 0, 0.0, 0.00, etc.)
+        if let Some(pos) = no_ws.find("opacity:") {
+            let after = &no_ws[pos + 8..];
+            // Parse the numeric value: 0, 0.0, 0.00, etc. are all zero
+            let val_end = after
+                .find(|c: char| c != '.' && !c.is_ascii_digit())
+                .unwrap_or(after.len());
+            if let Ok(v) = after[..val_end].parse::<f64>() {
+                if v == 0.0 {
+                    return true;
+                }
+            }
         }
         // font-size:0 / font-size:0px — text rendered at zero size
         if no_ws.contains("font-size:0px")
@@ -181,14 +218,17 @@ fn extract_style_value(tag: &str) -> Option<&str> {
             if preceded_by_ws && followed_by_eq {
                 let eq = rest.find('=')?;
                 let after_eq = rest[eq + 1..].trim_start();
-                let quote = after_eq.as_bytes().first()?;
-                if *quote != b'"' && *quote != b'\'' {
-                    i += 5;
-                    continue;
+                let first = *after_eq.as_bytes().first()?;
+                if first == b'"' || first == b'\'' {
+                    // Quoted value
+                    let end = after_eq[1..].find(first as char)?;
+                    return Some(&after_eq[1..1 + end]);
                 }
-                let value_start = 1; // skip opening quote
-                let end = after_eq[value_start..].find(*quote as char)?;
-                return Some(&after_eq[value_start..value_start + end]);
+                // Unquoted value: extends to next whitespace or '>'
+                let end = after_eq
+                    .find(|c: char| c.is_whitespace() || c == '>')
+                    .unwrap_or(after_eq.len());
+                return Some(&after_eq[..end]);
             }
         }
         i += 1;
@@ -232,7 +272,10 @@ fn extract_tag_name(tag: &str) -> Option<String> {
 }
 
 /// Skip past the matching closing tag for `tag_name`, handling nesting.
-/// Returns the byte index after the closing tag.
+/// Returns the byte index after the closing tag. If no closing tag is found
+/// (malformed HTML), returns `start` so only the opening tag is skipped —
+/// this prevents an unclosed hidden element from silently dropping all
+/// remaining content.
 fn skip_to_closing_tag(html: &str, start: usize, tag_name: &str) -> usize {
     let mut depth: usize = 1;
     let mut i = start;
@@ -264,7 +307,13 @@ fn skip_to_closing_tag(html: &str, start: usize, tag_name: &str) -> usize {
         }
         i += 1;
     }
-    i
+    // If the closing tag was never found, fall back to `start` so only the
+    // opening tag is removed and the rest of the content is preserved.
+    if depth > 0 {
+        start
+    } else {
+        i
+    }
 }
 
 /// Sanitize HTML from incoming emails for AI consumption.
@@ -2237,6 +2286,17 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
+    fn strip_hidden_catches_opacity_zero_point_zero() {
+        let html = r#"<span style="opacity:0.0">hidden</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("hidden"),
+            "opacity:0.0 should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
     fn strip_hidden_catches_font_size_zero() {
         let html = r#"<span style="font-size:0px">tiny</span><p>Normal</p>"#;
         let result = strip_hidden_elements(html);
@@ -2362,6 +2422,41 @@ Content-Type: text/html\r\n\r\n\
             "Whitespace around colon should still be caught, got: {result:?}"
         );
         assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_unquoted_style() {
+        let html = r#"<span style=display:none>hidden</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("hidden"),
+            "Unquoted style=display:none should be caught, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_unclosed_element_preserves_remaining() {
+        // Unclosed hidden div should not swallow all remaining content
+        let html = r#"<div style="display:none">hidden start<p>Visible after unclosed</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            result.contains("Visible after unclosed"),
+            "Content after unclosed hidden element should be preserved, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_draft_strips_img_tags() {
+        let html = r#"<p>Hello</p><img src="https://tracker.evil/pixel.gif"><p>World</p>"#;
+        let sanitized = sanitize_html_for_draft(html);
+        assert!(
+            !sanitized.contains("<img"),
+            "img tags should be stripped from drafts"
+        );
+        assert!(!sanitized.contains("tracker.evil"));
+        assert!(sanitized.contains("Hello"));
+        assert!(sanitized.contains("World"));
     }
 
     // --- Address list splitting tests ---
