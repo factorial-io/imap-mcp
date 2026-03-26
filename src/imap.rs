@@ -135,15 +135,12 @@ fn is_hidden_opening_tag(tag: &str) -> bool {
                 };
                 if let Some(end) = after_eq[value_start..].find(quote) {
                     let style_value = &after_eq[value_start..value_start + end];
-                    let normalized: String = style_value
-                        .chars()
-                        .map(|c| if c.is_whitespace() { ' ' } else { c })
-                        .collect();
-                    if normalized.contains("display: none")
-                        || normalized.contains("display:none")
-                        || normalized.contains("visibility: hidden")
-                        || normalized.contains("visibility:hidden")
-                    {
+                    // Strip all whitespace so patterns like "display:  none",
+                    // "display : none", etc. are all caught. CSS allows arbitrary
+                    // whitespace around colons and values.
+                    let no_ws: String =
+                        style_value.chars().filter(|c| !c.is_whitespace()).collect();
+                    if no_ws.contains("display:none") || no_ws.contains("visibility:hidden") {
                         return true;
                     }
                 }
@@ -208,7 +205,12 @@ fn skip_to_closing_tag(html: &str, start: usize, tag_name: &str) -> usize {
                     && !lower.ends_with("/>")
                 {
                     depth += 1;
-                } else if lower.starts_with(&format!("</{}", tag_name)) {
+                } else if lower.starts_with(&format!("</{}", tag_name))
+                    && lower
+                        .as_bytes()
+                        .get(2 + tag_name.len())
+                        .is_some_and(|&b| b == b'>' || b == b' ' || b == b'\t' || b == b'\n')
+                {
                     depth -= 1;
                 }
                 i = tag_end + 1;
@@ -2161,6 +2163,44 @@ Content-Type: text/html\r\n\r\n\
             result.contains("Still visible"),
             "Content after self-closing tag should be preserved, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn strip_hidden_closing_tag_word_boundary() {
+        // </divider> should not match when tag_name is "div"
+        let html = r#"<div style="display:none"><divider>keep</divider></div><p>After</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            result.contains("After"),
+            "Content after hidden div should be preserved, got: {result:?}"
+        );
+        assert!(
+            !result.contains("keep"),
+            "Content inside hidden div should be stripped, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_extra_whitespace_in_style() {
+        // CSS allows arbitrary whitespace around colons
+        let html = r#"<span style="display:  none">hidden</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("hidden"),
+            "Extra whitespace in display:none should still be caught, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_whitespace_around_colon() {
+        let html = r#"<span style="display : none">hidden</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("hidden"),
+            "Whitespace around colon should still be caught, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
     }
 
     // --- Address list splitting tests ---
