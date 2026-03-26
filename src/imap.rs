@@ -848,7 +848,7 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> String {
         }
         if ct == "text/html" {
             if let Ok(body) = parsed.get_body() {
-                return html2text::from_read(body.as_bytes(), 80);
+                return html2text::from_read(body.as_bytes(), 80).unwrap_or_default();
             }
         }
         // Skip non-text parts (signatures, attachments, etc.)
@@ -882,7 +882,7 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> String {
         return plain;
     }
     if !html.is_empty() {
-        return html2text::from_read(html.as_bytes(), 80);
+        return html2text::from_read(html.as_bytes(), 80).unwrap_or_default();
     }
 
     // Last resort: top-level body (preamble text)
