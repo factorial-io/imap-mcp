@@ -55,7 +55,7 @@ fn strip_hidden_elements(html: &str) -> String {
             if let Some(tag_end) = find_tag_end(html, i) {
                 let tag = &html[i..=tag_end];
                 // Check if this is an opening tag (not closing/comment/doctype)
-                if is_hidden_opening_tag(tag) {
+                if is_styled_opening_tag(tag) {
                     if let Some(tag_name) = extract_tag_name(tag) {
                         // Self-closing tags or void elements have no closing tag
                         let after_close = if tag.ends_with("/>") || is_void_element(&tag_name) {
@@ -99,8 +99,14 @@ fn find_tag_end(html: &str, start: usize) -> Option<usize> {
     None
 }
 
-/// Check whether a tag's inline style contains `display:none` or `visibility:hidden`.
-fn is_hidden_opening_tag(tag: &str) -> bool {
+/// Check whether an opening tag has a `style` attribute.
+///
+/// Any element with inline styles is considered potentially hidden, since there
+/// are too many CSS techniques to hide content (`display:none`, `opacity:0`,
+/// `font-size:0`, `color:transparent`, `position:absolute;left:-9999px`, etc.).
+/// Rather than maintaining an incomplete blocklist, we strip all styled elements
+/// before AI text extraction.
+fn is_styled_opening_tag(tag: &str) -> bool {
     // Must be an opening tag (not </..., <!..., etc.)
     if tag.starts_with("</") || tag.starts_with("<!") || tag.starts_with("<?") {
         return false;
@@ -111,40 +117,16 @@ fn is_hidden_opening_tag(tag: &str) -> bool {
     let mut search_from = 0;
     while let Some(pos) = lower[search_from..].find("style") {
         let abs_pos = search_from + pos;
-        // Check that "style" is preceded by whitespace (or is right after '<tag')
         let preceded_by_ws = abs_pos == 0
             || lower
                 .as_bytes()
                 .get(abs_pos - 1)
                 .is_some_and(|&b| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r');
-        // Check that "style" is followed by '=' or whitespace then '='
         let after = &lower[abs_pos + 5..];
         let followed_by_eq = after.starts_with('=') || after.trim_start().starts_with('=');
 
         if preceded_by_ws && followed_by_eq {
-            let rest = &lower[abs_pos + 5..];
-            if let Some(eq) = rest.find('=') {
-                let after_eq = rest[eq + 1..].trim_start();
-                let (quote, value_start) = if after_eq.starts_with('"') {
-                    ('"', 1)
-                } else if after_eq.starts_with('\'') {
-                    ('\'', 1)
-                } else {
-                    search_from = abs_pos + 5;
-                    continue;
-                };
-                if let Some(end) = after_eq[value_start..].find(quote) {
-                    let style_value = &after_eq[value_start..value_start + end];
-                    // Strip all whitespace so patterns like "display:  none",
-                    // "display : none", etc. are all caught. CSS allows arbitrary
-                    // whitespace around colons and values.
-                    let no_ws: String =
-                        style_value.chars().filter(|c| !c.is_whitespace()).collect();
-                    if no_ws.contains("display:none") || no_ws.contains("visibility:hidden") {
-                        return true;
-                    }
-                }
-            }
+            return true;
         }
         search_from = abs_pos + 5;
     }
@@ -1164,9 +1146,10 @@ fn extract_header_value(raw: &[u8], header_name: &str) -> Option<String> {
 struct ExtractedBody {
     /// Plain text body (converted from HTML if no plain text part exists).
     text: String,
-    /// Raw, unsanitized HTML body from the email. **Not safe for direct use in
-    /// outgoing drafts** — must be passed through [`sanitize_html_for_draft`]
-    /// before inclusion in a `DraftContent`. Only used internally for tests.
+    /// Raw, unsanitized HTML body from the email. Only populated in tests to
+    /// verify extraction logic. Gated behind `#[cfg(test)]` to avoid needless
+    /// allocation and cloning in production.
+    #[cfg(test)]
     raw_html: Option<String>,
 }
 
@@ -1187,14 +1170,17 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
             if let Ok(body) = parsed.get_body() {
                 return ExtractedBody {
                     text: body,
+                    #[cfg(test)]
                     raw_html: None,
                 };
             }
         }
         if ct == "text/html" {
             if let Ok(body) = parsed.get_body() {
+                let text = html_to_safe_text(&body);
                 return ExtractedBody {
-                    text: html_to_safe_text(&body),
+                    text,
+                    #[cfg(test)]
                     raw_html: Some(body),
                 };
             }
@@ -1202,6 +1188,7 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
         // Skip non-text parts (signatures, attachments, etc.)
         return ExtractedBody {
             text: String::new(),
+            #[cfg(test)]
             raw_html: None,
         };
     }
@@ -1226,28 +1213,26 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
             if !nested.text.is_empty() && plain.is_empty() {
                 plain = nested.text;
             }
-            if nested.raw_html.is_some() && html_raw.is_empty() {
-                html_raw = nested.raw_html.unwrap_or_default();
-            }
         }
     }
-
-    let html_out = if html_raw.is_empty() {
-        None
-    } else {
-        Some(html_raw.clone())
-    };
 
     if !plain.is_empty() {
         return ExtractedBody {
             text: plain,
-            raw_html: html_out,
+            #[cfg(test)]
+            raw_html: if html_raw.is_empty() {
+                None
+            } else {
+                Some(html_raw)
+            },
         };
     }
     if !html_raw.is_empty() {
+        let text = html_to_safe_text(&html_raw);
         return ExtractedBody {
-            text: html_to_safe_text(&html_raw),
-            raw_html: html_out,
+            text,
+            #[cfg(test)]
+            raw_html: Some(html_raw),
         };
     }
 
@@ -1256,6 +1241,7 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
         if !body.trim().is_empty() && !body.contains("S/MIME") {
             return ExtractedBody {
                 text: body,
+                #[cfg(test)]
                 raw_html: None,
             };
         }
@@ -1263,6 +1249,7 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
 
     ExtractedBody {
         text: "(no text content)".to_string(),
+        #[cfg(test)]
         raw_html: None,
     }
 }
@@ -2111,10 +2098,15 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_preserves_visible_styled_content() {
-        let html = r#"<p style="color:red">Red text</p><span style="display:none">hidden</span><p>Normal</p>"#;
+    fn strip_styled_removes_all_styled_elements() {
+        // All styled elements are stripped regardless of the CSS property,
+        // since there are too many ways to hide content via CSS.
+        let html = r#"<p style="color:red">Styled text</p><span style="display:none">hidden</span><p>Normal</p>"#;
         let result = strip_hidden_elements(html);
-        assert!(result.contains("Red text"));
+        assert!(
+            !result.contains("Styled text"),
+            "All styled elements should be stripped, got: {result:?}"
+        );
         assert!(result.contains("Normal"));
         assert!(!result.contains("hidden"));
     }
