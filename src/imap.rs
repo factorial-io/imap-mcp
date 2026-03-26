@@ -186,9 +186,10 @@ fn is_style_hidden(style: &str) -> bool {
     if has_small_css_value(&no_ws, "font-size:", 2.0) {
         return true;
     }
-    if (has_zero_css_value(&no_ws, "height:") || has_zero_css_value(&no_ws, "max-height:"))
-        && has_property_at_boundary(&no_ws, "overflow:hidden")
-    {
+    // height:0 / max-height:0 — zero-height elements serve no legitimate purpose.
+    // Strip unconditionally (previously required overflow:hidden, but zero-height
+    // elements can hide content in many email clients regardless).
+    if has_zero_css_value(&no_ws, "height:") || has_zero_css_value(&no_ws, "max-height:") {
         return true;
     }
     if (has_property_at_boundary(&no_ws, "position:absolute")
@@ -457,6 +458,41 @@ const SAFE_CSS_PROPERTIES: &[&str] = &[
     "list-style-type",
 ];
 
+/// Check if a CSS color value is transparent (alpha channel == 0).
+/// Handles `transparent`, `rgba(...)`, `rgb(... / alpha)`, `hsla(...)`.
+fn is_transparent_color(value: &str) -> bool {
+    let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact == "transparent" {
+        return true;
+    }
+    // Extract the last numeric value (alpha channel) from color functions.
+    // Patterns: rgba(r,g,b,A) or rgba(r g b / A) or hsla(h,s,l,A)
+    let alpha = if let Some(pos) = compact.rfind(',') {
+        &compact[pos + 1..compact.len().saturating_sub(1)]
+    } else if let Some(pos) = compact.rfind('/') {
+        &compact[pos + 1..compact.len().saturating_sub(1)]
+    } else {
+        return false;
+    };
+    // Parse alpha as f64 — catches 0, 0.0, 0.00, etc.
+    alpha.parse::<f64>().ok().is_some_and(|v| v == 0.0)
+}
+
+/// Check if a CSS value is zero (0, 0px, 0em, 0.0, etc.).
+fn is_zero_value(value: &str) -> bool {
+    let lower = value.trim().to_lowercase();
+    let num_end = lower
+        .find(|c: char| c != '.' && !c.is_ascii_digit())
+        .unwrap_or(lower.len());
+    if num_end == 0 {
+        return false;
+    }
+    lower[..num_end]
+        .parse::<f64>()
+        .ok()
+        .is_some_and(|v| v == 0.0)
+}
+
 /// Filter CSS style value to only permit safe properties.
 /// Returns a sanitized CSS string with only allowed properties.
 fn filter_css_properties(style: &str) -> String {
@@ -475,17 +511,17 @@ fn filter_css_properties(style: &str) -> String {
                 if lower_value.contains("url(") || lower_value.contains("expression(") {
                     continue;
                 }
-                // Block transparent colors (strip whitespace for reliable matching
-                // across rgba(0,0,0,0), rgba(0, 0, 0, 0), rgba(0 0 0 / 0), etc.)
-                if prop == "color" || prop == "background-color" {
-                    let compact: String =
-                        lower_value.chars().filter(|c| !c.is_whitespace()).collect();
-                    if compact == "transparent"
-                        || compact.contains(",0)")
-                        || compact.contains("/0)")
-                    {
-                        continue;
-                    }
+                // Block transparent colors — parse the alpha channel numerically
+                // to catch 0, 0.0, 0.00, etc. regardless of CSS syntax variant.
+                if (prop == "color" || prop == "background-color")
+                    && is_transparent_color(&lower_value)
+                {
+                    continue;
+                }
+                // Block zero height/max-height — elements with no height serve
+                // no legitimate formatting purpose and can hide content.
+                if (prop == "height" || prop == "max-height") && is_zero_value(value) {
+                    continue;
                 }
                 safe.push(format!("{prop}: {value}"));
             }
@@ -502,8 +538,8 @@ fn html_to_safe_text(html: &str) -> String {
     let stripped = match strip_hidden_elements(html) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("HTML sanitization failed, returning empty body: {e}");
-            return String::new();
+            tracing::warn!("HTML sanitization failed: {e}");
+            return "(HTML body could not be processed)".to_string();
         }
     };
     let sanitized = ammonia_reading().clean(&stripped).to_string();
@@ -2722,7 +2758,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_no_false_positive_on_text_overflow_hidden() {
         // text-overflow:hidden is a valid CSS truncation pattern, not a hiding technique
-        let html = r#"<div style="height:0;text-overflow:hidden">truncated</div><p>After</p>"#;
+        let html = r#"<div style="height:20px;text-overflow:hidden">truncated</div><p>After</p>"#;
         let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("truncated"),
@@ -2852,6 +2888,19 @@ Content-Type: text/html\r\n\r\n\
         assert_eq!(filter_css_properties("color: rgba(0, 0, 0, 0)"), "");
         assert_eq!(filter_css_properties("color: rgba(0 0 0 / 0)"), "");
         assert_eq!(filter_css_properties("color: rgb(0 0 0 / 0)"), "");
+        // Zero-point variants
+        assert_eq!(filter_css_properties("color: rgba(0,0,0,0.0)"), "");
+        assert_eq!(filter_css_properties("color: rgba(0, 0, 0, 0.00)"), "");
+        assert_eq!(filter_css_properties("color: hsla(0, 0%, 0%, 0)"), "");
+    }
+
+    #[test]
+    fn filter_css_strips_zero_height() {
+        assert_eq!(filter_css_properties("height: 0"), "");
+        assert_eq!(filter_css_properties("height: 0px"), "");
+        assert_eq!(filter_css_properties("max-height: 0"), "");
+        // Non-zero height should be kept
+        assert!(filter_css_properties("height: 100px").contains("height"));
     }
 
     #[test]
