@@ -261,37 +261,53 @@ fn parse_negative_px_value(s: &str) -> u32 {
 fn decode_html_entities(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '&' {
-            let mut entity = String::new();
-            for ec in chars.by_ref() {
-                if ec == ';' {
-                    break;
-                }
-                entity.push(ec);
-                if entity.len() > 10 {
-                    // Too long — not a real entity, emit as-is
-                    result.push('&');
-                    result.push_str(&entity);
-                    entity.clear();
-                    break;
-                }
+    'outer: while let Some(c) = chars.next() {
+        if c != '&' {
+            result.push(c);
+            continue;
+        }
+        // Collect entity content between '&' and ';'
+        let mut entity = String::new();
+        let mut found_semi = false;
+        for ec in chars.by_ref() {
+            if ec == ';' {
+                found_semi = true;
+                break;
             }
-            if entity.is_empty() {
-                // We hit ';' or '&;' — already consumed
-                result.push('&');
-                continue;
-            }
-            if let Some(decoded) = decode_entity(&entity) {
-                result.push(decoded);
-            } else {
-                // Unknown entity — emit as-is
+            entity.push(ec);
+            if entity.len() > 32 {
+                // Way too long — not a real entity. Emit everything as-is
+                // and drain up to the next ';' or give up.
                 result.push('&');
                 result.push_str(&entity);
-                result.push(';');
+                for ec2 in chars.by_ref() {
+                    result.push(ec2);
+                    if ec2 == ';' {
+                        break;
+                    }
+                }
+                continue 'outer;
             }
+        }
+        if !found_semi {
+            // Reached end of string without ';' — emit raw
+            result.push('&');
+            result.push_str(&entity);
+            continue;
+        }
+        if entity.is_empty() {
+            // "&;" — emit as-is
+            result.push('&');
+            result.push(';');
+            continue;
+        }
+        if let Some(decoded) = decode_entity(&entity) {
+            result.push(decoded);
         } else {
-            result.push(c);
+            // Unknown entity — emit as-is
+            result.push('&');
+            result.push_str(&entity);
+            result.push(';');
         }
     }
     result
@@ -2708,6 +2724,30 @@ Content-Type: text/html\r\n\r\n\
         assert_eq!(decode_html_entities("no entities"), "no entities");
         assert_eq!(decode_html_entities("&amp;"), "&");
         assert_eq!(decode_html_entities("a&unknown;b"), "a&unknown;b");
+    }
+
+    #[test]
+    fn decode_html_entities_zero_padded() {
+        // Zero-padded numeric entities must be decoded correctly
+        assert_eq!(
+            decode_html_entities("display&#0000000058;none"),
+            "display:none"
+        );
+        assert_eq!(
+            decode_html_entities("display&#x000000003a;none"),
+            "display:none"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_catches_zero_padded_entity_bypass() {
+        let html = r#"<span style="display&#0000000058;none">hidden via padded entity</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            !result.contains("hidden via padded entity"),
+            "Zero-padded entity bypass should be caught, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
     }
 
     // --- Address list splitting tests ---
