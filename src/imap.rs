@@ -56,10 +56,13 @@ fn strip_hidden_elements(html: &str) -> String {
                 let tag = &html[i..=tag_end];
                 // Check if this is an opening tag (not closing/comment/doctype)
                 if is_hidden_opening_tag(tag) {
-                    // Extract the tag name to find matching closing tag
                     if let Some(tag_name) = extract_tag_name(tag) {
-                        // Skip past the matching closing tag, handling nesting
-                        let after_close = skip_to_closing_tag(html, tag_end + 1, &tag_name);
+                        // Self-closing tags or void elements have no closing tag
+                        let after_close = if tag.ends_with("/>") || is_void_element(&tag_name) {
+                            tag_end + 1
+                        } else {
+                            skip_to_closing_tag(html, tag_end + 1, &tag_name)
+                        };
                         // Advance the iterator past the entire element
                         while chars.peek().is_some_and(|&(j, _)| j < after_close) {
                             chars.next();
@@ -103,34 +106,73 @@ fn is_hidden_opening_tag(tag: &str) -> bool {
         return false;
     }
     let lower = tag.to_lowercase();
-    // Look for style attribute with hidden patterns
-    if let Some(style_start) = lower.find("style") {
-        let rest = &lower[style_start..];
-        // Find the attribute value
-        if let Some(eq) = rest.find('=') {
-            let after_eq = rest[eq + 1..].trim_start();
-            let (quote, value_start) = if after_eq.starts_with('"') {
-                ('"', 1)
-            } else if after_eq.starts_with('\'') {
-                ('\'', 1)
-            } else {
-                return false;
-            };
-            if let Some(end) = after_eq[value_start..].find(quote) {
-                let style_value = &after_eq[value_start..value_start + end];
-                // Normalize whitespace for matching
-                let normalized: String = style_value
-                    .chars()
-                    .map(|c| if c.is_whitespace() { ' ' } else { c })
-                    .collect();
-                return normalized.contains("display: none")
-                    || normalized.contains("display:none")
-                    || normalized.contains("visibility: hidden")
-                    || normalized.contains("visibility:hidden");
+    // Find the `style` attribute by matching it as a full attribute name
+    // (preceded by whitespace, not a substring of another attribute like `data-style`).
+    let mut search_from = 0;
+    while let Some(pos) = lower[search_from..].find("style") {
+        let abs_pos = search_from + pos;
+        // Check that "style" is preceded by whitespace (or is right after '<tag')
+        let preceded_by_ws = abs_pos == 0
+            || lower
+                .as_bytes()
+                .get(abs_pos - 1)
+                .is_some_and(|&b| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r');
+        // Check that "style" is followed by '=' or whitespace then '='
+        let after = &lower[abs_pos + 5..];
+        let followed_by_eq = after.starts_with('=') || after.trim_start().starts_with('=');
+
+        if preceded_by_ws && followed_by_eq {
+            let rest = &lower[abs_pos + 5..];
+            if let Some(eq) = rest.find('=') {
+                let after_eq = rest[eq + 1..].trim_start();
+                let (quote, value_start) = if after_eq.starts_with('"') {
+                    ('"', 1)
+                } else if after_eq.starts_with('\'') {
+                    ('\'', 1)
+                } else {
+                    search_from = abs_pos + 5;
+                    continue;
+                };
+                if let Some(end) = after_eq[value_start..].find(quote) {
+                    let style_value = &after_eq[value_start..value_start + end];
+                    let normalized: String = style_value
+                        .chars()
+                        .map(|c| if c.is_whitespace() { ' ' } else { c })
+                        .collect();
+                    if normalized.contains("display: none")
+                        || normalized.contains("display:none")
+                        || normalized.contains("visibility: hidden")
+                        || normalized.contains("visibility:hidden")
+                    {
+                        return true;
+                    }
+                }
             }
         }
+        search_from = abs_pos + 5;
     }
     false
+}
+
+/// Check if a tag name is an HTML void element (no closing tag).
+fn is_void_element(tag_name: &str) -> bool {
+    matches!(
+        tag_name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
 }
 
 /// Extract the tag name from an opening tag string like `<span ...>`.
@@ -2073,6 +2115,52 @@ Content-Type: text/html\r\n\r\n\
         assert!(result.contains("Red text"));
         assert!(result.contains("Normal"));
         assert!(!result.contains("hidden"));
+    }
+
+    #[test]
+    fn strip_hidden_not_tricked_by_data_style_attribute() {
+        // "data-style" should not be confused with "style"
+        let html =
+            r#"<div data-style="display:none" style="display:none">hidden</div><p>Visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(result.contains("Visible"));
+        assert!(
+            !result.contains("hidden"),
+            "Real style=display:none should still be caught, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_ignores_data_style_only() {
+        // Only "data-style" attribute, no real "style" — should NOT strip
+        let html = r#"<div data-style="display:none">keep this</div><p>Also keep</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            result.contains("keep this"),
+            "data-style should not trigger stripping, got: {result:?}"
+        );
+        assert!(result.contains("Also keep"));
+    }
+
+    #[test]
+    fn strip_hidden_handles_void_elements() {
+        // Void element with hidden style should not consume following content
+        let html = r#"<input style="display:none"><p>Visible after void element</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            result.contains("Visible after void element"),
+            "Content after void element should be preserved, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_handles_self_closing_tags() {
+        let html = r#"<img style="display:none"/><p>Still visible</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(
+            result.contains("Still visible"),
+            "Content after self-closing tag should be preserved, got: {result:?}"
+        );
     }
 
     // --- Address list splitting tests ---
