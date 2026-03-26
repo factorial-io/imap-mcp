@@ -37,15 +37,156 @@ pub fn sanitize_html_for_draft(html: &str) -> String {
         .to_string()
 }
 
-/// Convert HTML to plain text, sanitizing first to strip hidden elements.
+/// Remove HTML elements whose inline `style` attribute hides them from humans.
 ///
-/// Raw HTML may contain elements hidden via CSS (`display:none`,
-/// `visibility:hidden`) that are invisible to humans but would be rendered as
-/// text by `html2text`. Sanitizing with ammonia first strips style attributes
-/// and dangerous elements, so the resulting plain text only contains
-/// human-visible content.
+/// Targets `display:none` and `visibility:hidden` patterns commonly used in
+/// prompt-injection attacks. Must run *before* ammonia, which strips `style`
+/// attributes but preserves the text content of hidden elements.
+///
+/// Uses a state-machine parser rather than regex to correctly handle nested tags,
+/// quoted attributes, and self-closing elements.
+fn strip_hidden_elements(html: &str) -> String {
+    let mut result = String::with_capacity(html.len());
+    let mut chars = html.char_indices().peekable();
+
+    while let Some(&(i, c)) = chars.peek() {
+        if c == '<' {
+            // Find the end of this opening tag
+            if let Some(tag_end) = find_tag_end(html, i) {
+                let tag = &html[i..=tag_end];
+                // Check if this is an opening tag (not closing/comment/doctype)
+                if is_hidden_opening_tag(tag) {
+                    // Extract the tag name to find matching closing tag
+                    if let Some(tag_name) = extract_tag_name(tag) {
+                        // Skip past the matching closing tag, handling nesting
+                        let after_close = skip_to_closing_tag(html, tag_end + 1, &tag_name);
+                        // Advance the iterator past the entire element
+                        while chars.peek().is_some_and(|&(j, _)| j < after_close) {
+                            chars.next();
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+        result.push(c);
+        chars.next();
+    }
+
+    result
+}
+
+/// Find the index of the `>` that closes a tag starting at `start`.
+/// Handles quoted attribute values correctly.
+fn find_tag_end(html: &str, start: usize) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut i = start + 1; // skip the '<'
+    let mut in_quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match in_quote {
+            Some(q) if b == q => in_quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => in_quote = Some(b),
+            None if b == b'>' => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Check whether a tag's inline style contains `display:none` or `visibility:hidden`.
+fn is_hidden_opening_tag(tag: &str) -> bool {
+    // Must be an opening tag (not </..., <!..., etc.)
+    if tag.starts_with("</") || tag.starts_with("<!") || tag.starts_with("<?") {
+        return false;
+    }
+    let lower = tag.to_lowercase();
+    // Look for style attribute with hidden patterns
+    if let Some(style_start) = lower.find("style") {
+        let rest = &lower[style_start..];
+        // Find the attribute value
+        if let Some(eq) = rest.find('=') {
+            let after_eq = rest[eq + 1..].trim_start();
+            let (quote, value_start) = if after_eq.starts_with('"') {
+                ('"', 1)
+            } else if after_eq.starts_with('\'') {
+                ('\'', 1)
+            } else {
+                return false;
+            };
+            if let Some(end) = after_eq[value_start..].find(quote) {
+                let style_value = &after_eq[value_start..value_start + end];
+                // Normalize whitespace for matching
+                let normalized: String = style_value
+                    .chars()
+                    .map(|c| if c.is_whitespace() { ' ' } else { c })
+                    .collect();
+                return normalized.contains("display: none")
+                    || normalized.contains("display:none")
+                    || normalized.contains("visibility: hidden")
+                    || normalized.contains("visibility:hidden");
+            }
+        }
+    }
+    false
+}
+
+/// Extract the tag name from an opening tag string like `<span ...>`.
+fn extract_tag_name(tag: &str) -> Option<String> {
+    let inner = tag.strip_prefix('<')?.trim_start();
+    let name_end = inner
+        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .unwrap_or(inner.len());
+    let name = &inner[..name_end];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_lowercase())
+    }
+}
+
+/// Skip past the matching closing tag for `tag_name`, handling nesting.
+/// Returns the byte index after the closing tag.
+fn skip_to_closing_tag(html: &str, start: usize, tag_name: &str) -> usize {
+    let mut depth: usize = 1;
+    let mut i = start;
+    let bytes = html.as_bytes();
+    while i < bytes.len() && depth > 0 {
+        if bytes[i] == b'<' {
+            if let Some(tag_end) = find_tag_end(html, i) {
+                let tag = &html[i..=tag_end];
+                let lower = tag.to_lowercase();
+                if lower.starts_with(&format!("<{}", tag_name))
+                    && lower.as_bytes().get(1 + tag_name.len()).is_some_and(|&b| {
+                        b == b' ' || b == b'>' || b == b'/' || b == b'\t' || b == b'\n'
+                    })
+                    && !lower.starts_with("</")
+                    && !lower.ends_with("/>")
+                {
+                    depth += 1;
+                } else if lower.starts_with(&format!("</{}", tag_name)) {
+                    depth -= 1;
+                }
+                i = tag_end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Convert HTML to plain text safely for AI consumption.
+///
+/// First removes elements hidden via CSS (`display:none`, `visibility:hidden`)
+/// which are a common prompt-injection vector in emails. Then sanitizes remaining
+/// HTML through ammonia (strips scripts, event handlers, etc.) before converting
+/// to plain text via `html2text`.
 fn html_to_safe_text(html: &str) -> String {
-    let sanitized = sanitize_html_for_draft(html);
+    let stripped = strip_hidden_elements(html);
+    let sanitized = sanitize_html_for_draft(&stripped);
     html2text::from_read(sanitized.as_bytes(), 80)
 }
 
@@ -979,8 +1120,10 @@ fn extract_header_value(raw: &[u8], header_name: &str) -> Option<String> {
 struct ExtractedBody {
     /// Plain text body (converted from HTML if no plain text part exists).
     text: String,
-    /// Original HTML body, if the email contained an HTML part.
-    html: Option<String>,
+    /// Raw, unsanitized HTML body from the email. **Not safe for direct use in
+    /// outgoing drafts** — must be passed through [`sanitize_html_for_draft`]
+    /// before inclusion in a `DraftContent`. Only used internally for tests.
+    raw_html: Option<String>,
 }
 
 #[cfg(test)]
@@ -1000,7 +1143,7 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
             if let Ok(body) = parsed.get_body() {
                 return ExtractedBody {
                     text: body,
-                    html: None,
+                    raw_html: None,
                 };
             }
         }
@@ -1008,20 +1151,20 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
             if let Ok(body) = parsed.get_body() {
                 return ExtractedBody {
                     text: html_to_safe_text(&body),
-                    html: Some(body),
+                    raw_html: Some(body),
                 };
             }
         }
         // Skip non-text parts (signatures, attachments, etc.)
         return ExtractedBody {
             text: String::new(),
-            html: None,
+            raw_html: None,
         };
     }
 
     // Multipart: recurse into subparts, prefer text/plain over text/html
     let mut plain = String::new();
-    let mut html = String::new();
+    let mut html_raw = String::new();
 
     for sub in &parsed.subparts {
         let sub_ct = sub.ctype.mimetype.to_lowercase();
@@ -1029,9 +1172,9 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
             if let Ok(body) = sub.get_body() {
                 plain = body;
             }
-        } else if sub_ct == "text/html" && html.is_empty() {
+        } else if sub_ct == "text/html" && html_raw.is_empty() {
             if let Ok(body) = sub.get_body() {
-                html = body;
+                html_raw = body;
             }
         } else if sub_ct.starts_with("multipart/") {
             // Recurse into nested multipart (e.g. multipart/signed → multipart/alternative)
@@ -1039,28 +1182,28 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
             if !nested.text.is_empty() && plain.is_empty() {
                 plain = nested.text;
             }
-            if nested.html.is_some() && html.is_empty() {
-                html = nested.html.unwrap_or_default();
+            if nested.raw_html.is_some() && html_raw.is_empty() {
+                html_raw = nested.raw_html.unwrap_or_default();
             }
         }
     }
 
-    let html_out = if html.is_empty() {
+    let html_out = if html_raw.is_empty() {
         None
     } else {
-        Some(html.clone())
+        Some(html_raw.clone())
     };
 
     if !plain.is_empty() {
         return ExtractedBody {
             text: plain,
-            html: html_out,
+            raw_html: html_out,
         };
     }
-    if !html.is_empty() {
+    if !html_raw.is_empty() {
         return ExtractedBody {
-            text: html2text::from_read(html.as_bytes(), 80),
-            html: html_out,
+            text: html_to_safe_text(&html_raw),
+            raw_html: html_out,
         };
     }
 
@@ -1069,14 +1212,14 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
         if !body.trim().is_empty() && !body.contains("S/MIME") {
             return ExtractedBody {
                 text: body,
-                html: None,
+                raw_html: None,
             };
         }
     }
 
     ExtractedBody {
         text: "(no text content)".to_string(),
-        html: None,
+        raw_html: None,
     }
 }
 
@@ -1787,9 +1930,12 @@ These are my notes.\r\n\
             extracted.text.contains("Plain text version"),
             "Should extract plain text body"
         );
-        assert!(extracted.html.is_some(), "Should have HTML body");
+        assert!(extracted.raw_html.is_some(), "Should have HTML body");
         assert!(
-            extracted.html.unwrap().contains("<h1>HTML version</h1>"),
+            extracted
+                .raw_html
+                .unwrap()
+                .contains("<h1>HTML version</h1>"),
             "Should extract HTML body"
         );
     }
@@ -1807,8 +1953,8 @@ Content-Type: text/html\r\n\r\n\
         let parsed = mailparse::parse_mail(raw).unwrap();
         let extracted = extract_body_from_parsed(&parsed);
         assert!(extracted.text.contains("Plain text body"));
-        assert!(extracted.html.is_some());
-        assert!(extracted.html.unwrap().contains("<p>HTML body</p>"));
+        assert!(extracted.raw_html.is_some());
+        assert!(extracted.raw_html.unwrap().contains("<p>HTML body</p>"));
     }
 
     #[test]
@@ -1816,9 +1962,9 @@ Content-Type: text/html\r\n\r\n\
         let raw = b"Content-Type: text/html\r\n\r\n<p>Only HTML</p>";
         let parsed = mailparse::parse_mail(raw).unwrap();
         let extracted = extract_body_from_parsed(&parsed);
-        assert!(extracted.html.is_some());
+        assert!(extracted.raw_html.is_some());
         assert!(extracted
-            .html
+            .raw_html
             .as_ref()
             .unwrap()
             .contains("<p>Only HTML</p>"));
@@ -1832,7 +1978,7 @@ Content-Type: text/html\r\n\r\n\
         let parsed = mailparse::parse_mail(raw).unwrap();
         let extracted = extract_body_from_parsed(&parsed);
         assert!(extracted.text.contains("Just plain text"));
-        assert!(extracted.html.is_none());
+        assert!(extracted.raw_html.is_none());
     }
 
     // --- HTML sanitization tests ---
@@ -1887,14 +2033,46 @@ Content-Type: text/html\r\n\r\n\
 
     #[test]
     fn html_to_safe_text_strips_hidden_elements() {
-        // Hidden-text injection: style attribute is stripped by ammonia before
-        // html2text sees the content, so the text from hidden spans is still
-        // visible (ammonia keeps text, strips attributes). This is acceptable
-        // because the hiding mechanism is removed — the text is now visible.
-        let html = r#"<p>Visible</p><span style="display:none">hidden</span>"#;
+        let html = r#"<p>Visible</p><span style="display:none">hidden injection</span>"#;
         let text = html_to_safe_text(html);
         assert!(text.contains("Visible"));
-        assert!(!text.contains("display:none"));
+        assert!(
+            !text.contains("hidden injection"),
+            "Hidden text should be stripped entirely, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn html_to_safe_text_strips_visibility_hidden() {
+        let html =
+            r#"<p>Hello</p><div style="visibility: hidden">secret payload</div><p>World</p>"#;
+        let text = html_to_safe_text(html);
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
+        assert!(
+            !text.contains("secret payload"),
+            "visibility:hidden text should be stripped, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn html_to_safe_text_strips_nested_hidden_elements() {
+        let html = r#"<div style="display:none"><p>Nested <strong>hidden</strong> content</p></div><p>Visible</p>"#;
+        let text = html_to_safe_text(html);
+        assert!(text.contains("Visible"));
+        assert!(
+            !text.contains("hidden"),
+            "Nested hidden content should be stripped, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_preserves_visible_styled_content() {
+        let html = r#"<p style="color:red">Red text</p><span style="display:none">hidden</span><p>Normal</p>"#;
+        let result = strip_hidden_elements(html);
+        assert!(result.contains("Red text"));
+        assert!(result.contains("Normal"));
+        assert!(!result.contains("hidden"));
     }
 
     // --- Address list splitting tests ---
