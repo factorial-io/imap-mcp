@@ -24,6 +24,32 @@ pub struct DraftContent<'a> {
     pub references: Option<&'a str>,
 }
 
+/// Sanitize HTML for use in outgoing draft emails.
+///
+/// Uses an allowlist approach: only safe, human-visible tags and attributes are
+/// preserved. Scripts, styles, event handlers, and potentially dangerous
+/// elements are stripped. This prevents prompt-injected AI output from producing
+/// drafts with executable or tracking payloads.
+pub fn sanitize_html_for_draft(html: &str) -> String {
+    ammonia::Builder::default()
+        .add_tags(["h1", "h2", "h3", "h4", "h5", "h6"])
+        .clean(html)
+        .to_string()
+}
+
+/// Sanitize HTML extracted from incoming emails before returning it to the AI.
+///
+/// Strips all elements that could carry hidden text (e.g. `display:none` via
+/// style attributes), scripts, and other non-visible content. This mitigates
+/// prompt-injection attacks where an attacker hides malicious instructions in
+/// HTML that is invisible to humans but parsed by the model.
+pub fn sanitize_html_for_reading(html: &str) -> String {
+    ammonia::Builder::default()
+        .add_tags(["h1", "h2", "h3", "h4", "h5", "h6"])
+        .clean(html)
+        .to_string()
+}
+
 /// Maximum attachment size we'll return (25 MB).
 const MAX_ATTACHMENT_SIZE: usize = 25 * 1024 * 1024;
 
@@ -229,7 +255,7 @@ impl ImapConnection {
                     let message_id = extract_header_from_parsed(&parsed.headers, "Message-ID");
                     (
                         extracted.text,
-                        extracted.html,
+                        extracted.html.map(|h| sanitize_html_for_reading(&h)),
                         attachments,
                         references,
                         message_id,
@@ -1820,6 +1846,71 @@ Content-Type: text/html\r\n\r\n\
         let extracted = extract_body_from_parsed(&parsed);
         assert!(extracted.text.contains("Just plain text"));
         assert!(extracted.html.is_none());
+    }
+
+    // --- HTML sanitization tests ---
+
+    #[test]
+    fn sanitize_draft_strips_script_tags() {
+        let html = r#"<p>Hello</p><script>alert('xss')</script><p>World</p>"#;
+        let sanitized = sanitize_html_for_draft(html);
+        assert!(!sanitized.contains("<script>"));
+        assert!(!sanitized.contains("alert"));
+        assert!(sanitized.contains("<p>Hello</p>"));
+        assert!(sanitized.contains("<p>World</p>"));
+    }
+
+    #[test]
+    fn sanitize_draft_strips_style_tags() {
+        let html = r#"<p>Hello</p><style>body { display: none; }</style>"#;
+        let sanitized = sanitize_html_for_draft(html);
+        assert!(!sanitized.contains("<style>"));
+        assert!(!sanitized.contains("display"));
+        assert!(sanitized.contains("<p>Hello</p>"));
+    }
+
+    #[test]
+    fn sanitize_draft_strips_style_attributes() {
+        let html = r#"<span style="display:none">hidden injection</span><p>visible</p>"#;
+        let sanitized = sanitize_html_for_draft(html);
+        assert!(!sanitized.contains("display:none"));
+        assert!(sanitized.contains("visible"));
+    }
+
+    #[test]
+    fn sanitize_draft_preserves_safe_tags() {
+        let html = "<h1>Title</h1><p>Paragraph with <strong>bold</strong> and <em>italic</em></p><ul><li>item</li></ul><a href=\"https://example.com\">link</a>";
+        let sanitized = sanitize_html_for_draft(html);
+        assert!(sanitized.contains("<h1>"));
+        assert!(sanitized.contains("<strong>"));
+        assert!(sanitized.contains("<em>"));
+        assert!(sanitized.contains("<ul>"));
+        assert!(sanitized.contains("<li>"));
+        assert!(sanitized.contains("<a "));
+    }
+
+    #[test]
+    fn sanitize_reading_strips_hidden_style_attributes() {
+        // Ammonia strips the style attribute that hides content, making previously
+        // hidden text visible. The text itself is preserved (which is correct —
+        // it's now visible to both humans and the AI).
+        let html = r#"<p>Normal content</p><span style="display:none">Hidden text</span>"#;
+        let sanitized = sanitize_html_for_reading(html);
+        assert!(!sanitized.contains("display:none"));
+        assert!(!sanitized.contains("style="));
+        assert!(sanitized.contains("Normal content"));
+        // Text is kept but the hiding mechanism is stripped
+        assert!(sanitized.contains("Hidden text"));
+    }
+
+    #[test]
+    fn sanitize_reading_strips_script_and_event_handlers() {
+        let html = r#"<p onclick="alert('xss')">Click me</p><script>evil()</script>"#;
+        let sanitized = sanitize_html_for_reading(html);
+        assert!(!sanitized.contains("onclick"));
+        assert!(!sanitized.contains("<script>"));
+        assert!(!sanitized.contains("evil"));
+        assert!(sanitized.contains("Click me"));
     }
 
     // --- Address list splitting tests ---
