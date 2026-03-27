@@ -410,10 +410,11 @@ fn ammonia_draft() -> ammonia::Builder<'static> {
 }
 
 /// CSS properties safe for email formatting. No `background-image` (tracking),
-/// no `position`/`opacity`/`display`/`visibility` (hiding/overlays), no `color`
-/// with transparent values.
+/// no `position`/`opacity`/`display`/`visibility` (hiding/overlays).
+/// `color` is excluded to prevent same-color-as-background text hiding
+/// (e.g. white text on white background). `background-color` is kept as it's
+/// less exploitable alone — text color defaults to black in email clients.
 const SAFE_CSS_PROPERTIES: &[&str] = &[
-    "color",
     "background-color",
     "font-family",
     "font-size",
@@ -525,11 +526,8 @@ fn filter_css_properties(style: &str) -> String {
                 if lower_value.contains("url(") || lower_value.contains("expression(") {
                     continue;
                 }
-                // Block transparent colors — parse the alpha channel numerically
-                // to catch 0, 0.0, 0.00, etc. regardless of CSS syntax variant.
-                if (prop == "color" || prop == "background-color")
-                    && is_transparent_color(&lower_value)
-                {
+                // Block transparent background-color (e.g. rgba(0,0,0,0)).
+                if prop == "background-color" && is_transparent_color(&lower_value) {
                     continue;
                 }
                 // Block zero height/max-height — elements with no height serve
@@ -2879,20 +2877,29 @@ Content-Type: text/html\r\n\r\n\
 
     #[test]
     fn filter_css_allows_safe_properties() {
-        let css = "color: red; font-size: 14px; text-align: center";
+        let css = "background-color: #eee; font-size: 14px; text-align: center";
         let result = filter_css_properties(css);
-        assert!(result.contains("color: red"));
+        assert!(result.contains("background-color: #eee"));
         assert!(result.contains("font-size: 14px"));
         assert!(result.contains("text-align: center"));
     }
 
     #[test]
+    fn filter_css_strips_color_property() {
+        // color is excluded to prevent same-color-as-background hiding
+        let css = "color: red; font-size: 14px";
+        let result = filter_css_properties(css);
+        assert!(!result.contains("color"));
+        assert!(result.contains("font-size: 14px"));
+    }
+
+    #[test]
     fn filter_css_strips_dangerous_properties() {
-        let css = "background-image: url(https://tracker.evil/pixel); color: red";
+        let css = "background-image: url(https://tracker.evil/pixel); padding: 10px";
         let result = filter_css_properties(css);
         assert!(!result.contains("background-image"));
         assert!(!result.contains("tracker.evil"));
-        assert!(result.contains("color: red"));
+        assert!(result.contains("padding: 10px"));
     }
 
     #[test]
@@ -2906,22 +2913,21 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn filter_css_strips_transparent_color() {
-        assert_eq!(filter_css_properties("color: transparent"), "");
-        assert_eq!(filter_css_properties("color: rgba(0,0,0,0)"), "");
-        assert_eq!(filter_css_properties("color: rgba(0, 0, 0, 0)"), "");
-        assert_eq!(filter_css_properties("color: rgba(0 0 0 / 0)"), "");
-        assert_eq!(filter_css_properties("color: rgb(0 0 0 / 0)"), "");
-        // Zero-point variants
-        assert_eq!(filter_css_properties("color: rgba(0,0,0,0.0)"), "");
-        assert_eq!(filter_css_properties("color: rgba(0, 0, 0, 0.00)"), "");
-        assert_eq!(filter_css_properties("color: hsla(0, 0%, 0%, 0)"), "");
-        // Hex alpha
-        assert_eq!(filter_css_properties("color: #00000000"), "");
-        assert_eq!(filter_css_properties("color: #0000"), "");
-        // Non-transparent hex should be kept
-        assert!(filter_css_properties("color: #000000FF").contains("color"));
-        assert!(filter_css_properties("color: #000F").contains("color"));
+    fn filter_css_strips_transparent_background() {
+        // background-color with transparent alpha is stripped
+        assert_eq!(filter_css_properties("background-color: transparent"), "");
+        assert_eq!(filter_css_properties("background-color: rgba(0,0,0,0)"), "");
+        assert_eq!(
+            filter_css_properties("background-color: rgba(0, 0, 0, 0)"),
+            ""
+        );
+        assert_eq!(
+            filter_css_properties("background-color: rgba(0,0,0,0.0)"),
+            ""
+        );
+        assert_eq!(filter_css_properties("background-color: #00000000"), "");
+        // Non-transparent background should be kept
+        assert!(filter_css_properties("background-color: #fff").contains("background-color"));
     }
 
     #[test]
