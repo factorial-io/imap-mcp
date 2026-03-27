@@ -229,6 +229,18 @@ fn is_style_hidden(style: &str) -> bool {
     if has_large_negative_value(&no_ws, "text-indent:") {
         return true;
     }
+    // width:0 or max-width:0 with overflow:hidden hides content horizontally.
+    if (has_small_css_value(&no_ws, "width:", 1.0)
+        || has_small_css_value(&no_ws, "max-width:", 1.0))
+        && has_property_at_boundary(&no_ws, "overflow:hidden")
+    {
+        return true;
+    }
+    // clip-path clips the rendered area — works on elements in normal flow.
+    // clip requires position:absolute/fixed (already checked above with offsets).
+    if no_ws.contains("clip-path:") || no_ws.contains("clip:rect(") {
+        return true;
+    }
     false
 }
 
@@ -525,8 +537,10 @@ fn is_transparent_color(value: &str) -> bool {
     } else {
         return false;
     };
-    // Parse alpha as f64 — catches 0, 0.0, 0.00, etc.
-    alpha.parse::<f64>().ok().is_some_and(|v| v == 0.0)
+    // Parse alpha as f64 — strip trailing '%' first to handle percentage notation.
+    // Catches 0, 0.0, 0.00, 0%, 0.0%, etc.
+    let alpha_clean = alpha.trim_end_matches('%');
+    alpha_clean.parse::<f64>().ok().is_some_and(|v| v == 0.0)
 }
 
 /// Check if a CSS value is effectively zero/tiny (at or below 1px threshold).
@@ -3071,6 +3085,63 @@ Content-Type: text/html\r\n\r\n\
             !result.contains("hidden"),
             "height:0em should be stripped, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn strip_hidden_catches_zero_width_overflow_hidden() {
+        let html = r#"<div style="width:0;overflow:hidden">hidden</div><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden"),
+            "width:0+overflow:hidden should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_max_width_zero_overflow_hidden() {
+        let html = r#"<div style="max-width:0px;overflow:hidden">hidden</div><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden"),
+            "max-width:0px+overflow:hidden should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn filter_css_strips_transparent_background_percentage_alpha() {
+        assert_eq!(
+            filter_css_properties("background-color: rgba(0,0,0,0%)"),
+            ""
+        );
+        assert_eq!(
+            filter_css_properties("background-color: hsla(0, 0%, 0%, 0%)"),
+            ""
+        );
+    }
+
+    #[test]
+    fn strip_hidden_catches_clip_path() {
+        let html = r#"<span style="clip-path:inset(100%)">hidden</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden"),
+            "clip-path should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_clip_rect() {
+        let html =
+            r#"<span style="clip:rect(0,0,0,0);position:absolute">hidden</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden"),
+            "clip:rect should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
     }
 
     // --- Address list splitting tests ---
