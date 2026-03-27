@@ -304,18 +304,8 @@ fn is_style_hidden(style: &str) -> bool {
     if has_property_at_boundary(&no_ws, "color:transparent") {
         return true;
     }
-    if has_property_at_boundary(&no_ws, "color:rgba(")
-        || has_property_at_boundary(&no_ws, "color:hsla(")
-        || has_property_at_boundary(&no_ws, "color:rgb(")
-    {
-        // Extract the color value and check if alpha is zero
-        if let Some(pos) = no_ws.find("color:") {
-            let value = &no_ws[pos + 6..];
-            let end = value.find(';').unwrap_or(value.len());
-            if is_transparent_css_color(&value[..end]) {
-                return true;
-            }
-        }
+    if has_transparent_color_at_boundary(&no_ws) {
+        return true;
     }
     false
 }
@@ -435,12 +425,9 @@ fn has_property_at_boundary(no_ws: &str, prop_value: &str) -> bool {
     false
 }
 
-/// Check if any boundary-anchored `clip-path:` declaration has a value other than `none`.
-/// Handles CSS last-wins semantics: `clip-path:none;clip-path:polygon(...)` IS hidden
-/// because the second declaration wins.
-/// Check if a CSS color function value has zero alpha (transparent).
-/// Handles rgba(r,g,b,0), rgba(r g b / 0), hsla(h,s,l,0), and variants
-/// with 0.0, 0.00, 0%, etc.
+/// Check if a CSS color value is transparent (zero alpha).
+/// Handles `transparent`, rgba/hsla/rgb function notation with zero alpha,
+/// and hex alpha formats (#RRGGBBAA, #RGBA).
 fn is_transparent_css_color(value: &str) -> bool {
     if value == "transparent" {
         return true;
@@ -466,8 +453,13 @@ fn is_transparent_css_color(value: &str) -> bool {
     alpha_clean.parse::<f64>().ok().is_some_and(|v| v == 0.0)
 }
 
+/// Check if the *last* boundary-anchored `clip-path:` declaration has a value
+/// other than `none`. Implements CSS last-wins semantics:
+/// - `clip-path:polygon(...);clip-path:none` → NOT hidden (none wins)
+/// - `clip-path:none;clip-path:polygon(...)` → hidden (polygon wins)
 fn has_non_none_clip_path(no_ws: &str) -> bool {
     let prop = "clip-path:";
+    let mut last_value: Option<&str> = None;
     let mut search = 0;
     while let Some(pos) = no_ws[search..].find(prop) {
         let abs = search + pos;
@@ -477,8 +469,28 @@ fn has_non_none_clip_path(no_ws: &str) -> bool {
                 .find(';')
                 .map(|p| value_start + p)
                 .unwrap_or(no_ws.len());
-            let value = &no_ws[value_start..value_end];
-            if value != "none" {
+            last_value = Some(&no_ws[value_start..value_end]);
+        }
+        search = abs + prop.len();
+    }
+    last_value.is_some_and(|v| v != "none")
+}
+
+/// Check if any boundary-anchored `color:` declaration has a transparent value.
+/// Walks all boundary-anchored occurrences to avoid matching `color:` inside
+/// `background-color:`.
+fn has_transparent_color_at_boundary(no_ws: &str) -> bool {
+    let prop = "color:";
+    let mut search = 0;
+    while let Some(pos) = no_ws[search..].find(prop) {
+        let abs = search + pos;
+        if abs == 0 || no_ws.as_bytes()[abs - 1] == b';' {
+            let value_start = abs + prop.len();
+            let value_end = no_ws[value_start..]
+                .find(';')
+                .map(|p| value_start + p)
+                .unwrap_or(no_ws.len());
+            if is_transparent_css_color(&no_ws[value_start..value_end]) {
                 return true;
             }
         }
