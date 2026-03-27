@@ -2737,8 +2737,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn strip_hidden_catches_subpixel_height_px() {
         // height:0.5px is sub-pixel and should be stripped
-        let html =
-            r#"<div style="height:0.5px;overflow:hidden">hidden content</div><p>After</p>"#;
+        let html = r#"<div style="height:0.5px;overflow:hidden">hidden content</div><p>After</p>"#;
         let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden content"),
