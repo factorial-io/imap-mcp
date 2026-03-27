@@ -186,10 +186,10 @@ fn is_style_hidden(style: &str) -> bool {
     if has_small_css_value(&no_ws, "font-size:", 2.0) {
         return true;
     }
-    // height:0 / max-height:0 — zero-height elements serve no legitimate purpose.
-    // Strip unconditionally (previously required overflow:hidden, but zero-height
-    // elements can hide content in many email clients regardless).
-    if has_zero_css_value(&no_ws, "height:") || has_zero_css_value(&no_ws, "max-height:") {
+    // height/max-height < 1px — sub-pixel heights are effectively invisible.
+    if has_small_css_value(&no_ws, "height:", 1.0)
+        || has_small_css_value(&no_ws, "max-height:", 1.0)
+    {
         return true;
     }
     if (has_property_at_boundary(&no_ws, "position:absolute")
@@ -459,11 +459,23 @@ const SAFE_CSS_PROPERTIES: &[&str] = &[
 ];
 
 /// Check if a CSS color value is transparent (alpha channel == 0).
-/// Handles `transparent`, `rgba(...)`, `rgb(... / alpha)`, `hsla(...)`.
+/// Handles `transparent`, `rgba(...)`, `rgb(... / alpha)`, `hsla(...)`,
+/// and hex alpha formats (`#RRGGBBAA`, `#RGBA`).
 fn is_transparent_color(value: &str) -> bool {
     let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
     if compact == "transparent" {
         return true;
+    }
+    // Hex alpha: #RRGGBBAA (9 chars with #) or #RGBA (5 chars with #)
+    if let Some(hex) = compact.strip_prefix('#') {
+        if hex.len() == 8 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            // Last two hex digits are alpha
+            return &hex[6..] == "00";
+        }
+        if hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            // Last hex digit is alpha
+            return &hex[3..] == "0";
+        }
     }
     // Extract the last numeric value (alpha channel) from color functions.
     // Patterns: rgba(r,g,b,A) or rgba(r g b / A) or hsla(h,s,l,A)
@@ -478,7 +490,9 @@ fn is_transparent_color(value: &str) -> bool {
     alpha.parse::<f64>().ok().is_some_and(|v| v == 0.0)
 }
 
-/// Check if a CSS value is zero (0, 0px, 0em, 0.0, etc.).
+/// Check if a CSS value is effectively zero (below 1px threshold).
+/// Catches 0, 0px, 0.001px, 0.5px — sub-pixel values are invisible
+/// in email clients but would pass an exact-zero check.
 fn is_zero_value(value: &str) -> bool {
     let lower = value.trim().to_lowercase();
     let num_end = lower
@@ -490,7 +504,7 @@ fn is_zero_value(value: &str) -> bool {
     lower[..num_end]
         .parse::<f64>()
         .ok()
-        .is_some_and(|v| v == 0.0)
+        .is_some_and(|v| v < 1.0)
 }
 
 /// Filter CSS style value to only permit safe properties.
@@ -2677,13 +2691,23 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_preserves_fractional_zero_height() {
-        // height:0.5em is non-zero and should not be stripped
-        let html = r#"<div style="height:0.5em;overflow:hidden">visible content</div><p>After</p>"#;
+    fn strip_hidden_catches_subpixel_height() {
+        // height:0.5em is sub-pixel and should be stripped
+        let html = r#"<div style="height:0.5em;overflow:hidden">hidden content</div><p>After</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden content"),
+            "height:0.5em should be stripped, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_preserves_normal_height() {
+        let html = r#"<div style="height:2em">visible content</div><p>After</p>"#;
         let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("visible content"),
-            "height:0.5em should not be stripped, got: {result:?}"
+            "height:2em should not be stripped, got: {result:?}"
         );
     }
 
@@ -2892,15 +2916,24 @@ Content-Type: text/html\r\n\r\n\
         assert_eq!(filter_css_properties("color: rgba(0,0,0,0.0)"), "");
         assert_eq!(filter_css_properties("color: rgba(0, 0, 0, 0.00)"), "");
         assert_eq!(filter_css_properties("color: hsla(0, 0%, 0%, 0)"), "");
+        // Hex alpha
+        assert_eq!(filter_css_properties("color: #00000000"), "");
+        assert_eq!(filter_css_properties("color: #0000"), "");
+        // Non-transparent hex should be kept
+        assert!(filter_css_properties("color: #000000FF").contains("color"));
+        assert!(filter_css_properties("color: #000F").contains("color"));
     }
 
     #[test]
-    fn filter_css_strips_zero_height() {
+    fn filter_css_strips_zero_and_subpixel_height() {
         assert_eq!(filter_css_properties("height: 0"), "");
         assert_eq!(filter_css_properties("height: 0px"), "");
+        assert_eq!(filter_css_properties("height: 0.001px"), "");
+        assert_eq!(filter_css_properties("height: 0.5px"), "");
         assert_eq!(filter_css_properties("max-height: 0"), "");
         // Non-zero height should be kept
         assert!(filter_css_properties("height: 100px").contains("height"));
+        assert!(filter_css_properties("height: 1px").contains("height"));
     }
 
     #[test]
