@@ -296,6 +296,27 @@ fn is_style_hidden(style: &str) -> bool {
     if has_non_none_clip_path(&no_ws) || has_property_at_boundary(&no_ws, "clip:rect(") {
         return true;
     }
+    // transform:translate moves content off-screen in clients that support CSS transforms.
+    if no_ws.contains("transform:translate") {
+        return true;
+    }
+    // Transparent text color — invisible to humans but extracted as text by html2text.
+    if has_property_at_boundary(&no_ws, "color:transparent") {
+        return true;
+    }
+    if has_property_at_boundary(&no_ws, "color:rgba(")
+        || has_property_at_boundary(&no_ws, "color:hsla(")
+        || has_property_at_boundary(&no_ws, "color:rgb(")
+    {
+        // Extract the color value and check if alpha is zero
+        if let Some(pos) = no_ws.find("color:") {
+            let value = &no_ws[pos + 6..];
+            let end = value.find(';').unwrap_or(value.len());
+            if is_transparent_css_color(&value[..end]) {
+                return true;
+            }
+        }
+    }
     false
 }
 
@@ -417,6 +438,34 @@ fn has_property_at_boundary(no_ws: &str, prop_value: &str) -> bool {
 /// Check if any boundary-anchored `clip-path:` declaration has a value other than `none`.
 /// Handles CSS last-wins semantics: `clip-path:none;clip-path:polygon(...)` IS hidden
 /// because the second declaration wins.
+/// Check if a CSS color function value has zero alpha (transparent).
+/// Handles rgba(r,g,b,0), rgba(r g b / 0), hsla(h,s,l,0), and variants
+/// with 0.0, 0.00, 0%, etc.
+fn is_transparent_css_color(value: &str) -> bool {
+    if value == "transparent" {
+        return true;
+    }
+    // Check hex alpha formats
+    if let Some(hex) = value.strip_prefix('#') {
+        if hex.len() == 8 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return &hex[6..] == "00";
+        }
+        if hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return &hex[3..] == "0";
+        }
+    }
+    // Extract alpha channel (last value after , or /)
+    let alpha = if let Some(pos) = value.rfind(',') {
+        &value[pos + 1..value.len().saturating_sub(1)]
+    } else if let Some(pos) = value.rfind('/') {
+        &value[pos + 1..value.len().saturating_sub(1)]
+    } else {
+        return false;
+    };
+    let alpha_clean = alpha.trim_end_matches('%');
+    alpha_clean.parse::<f64>().ok().is_some_and(|v| v == 0.0)
+}
+
 fn has_non_none_clip_path(no_ws: &str) -> bool {
     let prop = "clip-path:";
     let mut search = 0;
@@ -3254,6 +3303,39 @@ Content-Type: text/html\r\n\r\n\
         assert_eq!(decode_css_escapes(r"\76isibility"), "visibility");
         assert_eq!(decode_css_escapes(r"\:"), ":");
         assert_eq!(decode_css_escapes("no escapes"), "no escapes");
+    }
+
+    #[test]
+    fn strip_hidden_catches_transform_translate() {
+        let html = r#"<span style="transform:translateX(-9999px)">hidden</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden"),
+            "transform:translateX should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_transparent_color() {
+        let html = r#"<span style="color:transparent">hidden</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden"),
+            "color:transparent should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_rgba_zero_alpha_color() {
+        let html = r#"<span style="color:rgba(0,0,0,0)">hidden</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden"),
+            "color:rgba(0,0,0,0) should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
     }
 
     // --- Address list splitting tests ---
