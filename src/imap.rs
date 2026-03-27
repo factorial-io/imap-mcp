@@ -935,7 +935,14 @@ impl ImapConnection {
         // Falls back gracefully for malformed emails (spam, old messages, etc.).
         let (body, attachments, references, message_id) = match mailparse::parse_mail(body_raw) {
             Ok(parsed) => {
-                let extracted = extract_body_from_parsed(&parsed)?;
+                let extracted = extract_body_from_parsed(&parsed).unwrap_or_else(|e| {
+                    tracing::warn!("failed to sanitize HTML for email UID {uid}: {e}");
+                    ExtractedBody {
+                        text: String::new(),
+                        #[cfg(test)]
+                        raw_html: None,
+                    }
+                });
                 let mut attachments = Vec::new();
                 collect_attachment_infos(&parsed, &mut attachments);
                 let references = extract_header_from_parsed(&parsed.headers, "References");
