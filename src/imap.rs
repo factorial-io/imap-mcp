@@ -48,7 +48,7 @@ pub fn sanitize_html_for_draft(html: &str) -> Result<String, AppError> {
 fn strip_hidden_elements(html: &str) -> Result<String, AppError> {
     // Two-pass approach: first extract hidden class names from <style> blocks,
     // then strip those elements in a second pass.
-    let hidden_classes = std::sync::Arc::new(extract_hidden_classes(html));
+    let hidden_classes = std::sync::Arc::new(extract_hidden_classes(html)?);
     let hc = hidden_classes.clone();
 
     let result = rewrite_str(
@@ -101,7 +101,7 @@ fn strip_hidden_elements(html: &str) -> Result<String, AppError> {
 /// Extract class names that are associated with CSS hiding rules in `<style>` blocks.
 /// Uses simple pattern matching (not a full CSS parser) to find rules like
 /// `.hidden { display: none }` and returns the set of class names.
-fn extract_hidden_classes(html: &str) -> std::collections::HashSet<String> {
+fn extract_hidden_classes(html: &str) -> Result<std::collections::HashSet<String>, AppError> {
     use lol_html::text;
     let mut classes = std::collections::HashSet::new();
     let css_chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -109,7 +109,7 @@ fn extract_hidden_classes(html: &str) -> std::collections::HashSet<String> {
 
     // Use lol_html's text handler to correctly extract <style> content,
     // avoiding false matches on `<style` appearing in attribute values.
-    let _ = rewrite_str(
+    rewrite_str(
         html,
         RewriteStrSettings {
             element_content_handlers: vec![text!("style", move |chunk| {
@@ -120,14 +120,15 @@ fn extract_hidden_classes(html: &str) -> std::collections::HashSet<String> {
             })],
             ..Default::default()
         },
-    );
+    )
+    .map_err(|e| AppError::Imap(format!("failed to extract style blocks: {e}")))?;
 
     if let Ok(chunks) = css_chunks.lock() {
         let all_css = chunks.join("");
         let lower = all_css.to_lowercase();
         extract_hidden_classes_from_css(&lower, &mut classes);
     }
-    classes
+    Ok(classes)
 }
 
 /// Parse CSS text to find class selectors associated with hiding rules.
@@ -158,17 +159,10 @@ fn extract_hidden_classes_from_css(css: &str, classes: &mut std::collections::Ha
             continue;
         }
 
-        // Check if declarations contain hiding patterns
-        let decl_compact: String = block_content
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        let decl_compact = strip_css_comments(&decode_css_escapes(&decl_compact));
-        if !decl_compact.contains("display:none")
-            && !decl_compact.contains("visibility:hidden")
-            && !decl_compact.contains("opacity:0")
-            && !decl_compact.contains("font-size:0")
-        {
+        // Check if declarations use any hiding technique. Reuse is_style_hidden
+        // to ensure the same patterns are checked for both inline styles and
+        // stylesheet rules — prevents bypass via techniques only checked in one path.
+        if !is_style_hidden(block_content) {
             continue;
         }
 
