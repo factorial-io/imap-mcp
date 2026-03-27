@@ -103,21 +103,21 @@ fn strip_hidden_elements(html: &str) -> Result<String, AppError> {
 /// `.hidden { display: none }` and returns the set of class names.
 fn extract_hidden_classes(html: &str) -> std::collections::HashSet<String> {
     let mut classes = std::collections::HashSet::new();
-    // Extract content of <style> blocks
+    // Work entirely on the lowercased copy to avoid byte-offset mismatches
+    // between the original and lowercased strings (Unicode codepoints can
+    // change byte length when lowercased, e.g. İ U+0130).
     let lower = html.to_lowercase();
     let mut search = 0;
     while let Some(start) = lower[search..].find("<style") {
         let abs_start = search + start;
-        // Find the end of the opening tag
         let Some(tag_end) = lower[abs_start..].find('>') else {
             break;
         };
         let content_start = abs_start + tag_end + 1;
-        // Find </style>
         let Some(end) = lower[content_start..].find("</style>") else {
             break;
         };
-        let css = &html[content_start..content_start + end];
+        let css = &lower[content_start..content_start + end];
         extract_hidden_classes_from_css(css, &mut classes);
         search = content_start + end + 8;
     }
@@ -127,10 +127,9 @@ fn extract_hidden_classes(html: &str) -> std::collections::HashSet<String> {
 /// Parse CSS text to find class selectors associated with hiding rules.
 /// Only extracts the class from the *simple selector* directly before `{`,
 /// not ancestor/compound selectors earlier in the rule.
+/// Input `css` is expected to be already lowercased (from `extract_hidden_classes`).
 fn extract_hidden_classes_from_css(css: &str, classes: &mut std::collections::HashSet<String>) {
-    let lower_css = css.to_lowercase();
-    // Split on '{' to get [selector, declarations}rest, ...]
-    let mut rest = lower_css.as_str();
+    let mut rest = css;
     while let Some(brace_pos) = rest.find('{') {
         let selector = &rest[..brace_pos];
         let after_brace = &rest[brace_pos + 1..];
