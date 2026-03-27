@@ -128,25 +128,35 @@ fn extract_hidden_classes(html: &str) -> std::collections::HashSet<String> {
 /// Only extracts the class from the *simple selector* directly before `{`,
 /// not ancestor/compound selectors earlier in the rule.
 /// Input `css` is expected to be already lowercased (from `extract_hidden_classes`).
+///
+/// Handles `@media` and other at-rules by recursively processing the nested
+/// content rather than treating the first `{...}` as declarations.
 fn extract_hidden_classes_from_css(css: &str, classes: &mut std::collections::HashSet<String>) {
     let mut rest = css;
     while let Some(brace_pos) = rest.find('{') {
-        let selector = &rest[..brace_pos];
+        let selector = rest[..brace_pos].trim();
         let after_brace = &rest[brace_pos + 1..];
-        // Find matching '}'
-        let Some(close_pos) = after_brace.find('}') else {
-            break;
+
+        // Find matching '}' accounting for nesting depth
+        let close_pos = match find_matching_brace(after_brace) {
+            Some(p) => p,
+            None => break,
         };
-        let declarations = &after_brace[..close_pos];
+        let block_content = &after_brace[..close_pos];
         rest = &after_brace[close_pos + 1..];
 
+        // If this is an at-rule (@media, @supports, etc.), recursively parse
+        // the nested rules inside rather than treating the block as declarations.
+        if selector.starts_with('@') {
+            extract_hidden_classes_from_css(block_content, classes);
+            continue;
+        }
+
         // Check if declarations contain hiding patterns
-        let decl_compact: String = declarations
+        let decl_compact: String = block_content
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        // Decode CSS escapes and strip comments to match the same normalization
-        // pipeline used by is_style_hidden for inline style attributes.
         let decl_compact = strip_css_comments(&decode_css_escapes(&decl_compact));
         if !decl_compact.contains("display:none")
             && !decl_compact.contains("visibility:hidden")
@@ -175,6 +185,21 @@ fn extract_hidden_classes_from_css(css: &str, classes: &mut std::collections::Ha
             }
         }
     }
+}
+
+/// Find the position of the `}` that matches the opening brace, accounting
+/// for nested `{...}` pairs (e.g. inside `@media` blocks).
+fn find_matching_brace(s: &str) -> Option<usize> {
+    let mut depth: usize = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' if depth == 0 => return Some(i),
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Decode HTML entities (numeric and named) in a string.
@@ -436,8 +461,17 @@ fn has_small_css_value(no_ws: &str, prop: &str, threshold: f64) -> bool {
                         // Zero is zero regardless of unit
                         return true;
                     }
-                    // Threshold only applies to px or unitless values
-                    if (unit.is_empty() || *unit == "px") && v <= threshold {
+                    // Apply threshold based on unit type:
+                    // - px/unitless: use threshold directly
+                    // - em/rem: ≤ 0.15 (≈ 2.4px at 16px base)
+                    // - vh/vw/%: ≤ 0.5 (sub-pixel on most viewports)
+                    let is_small = match *unit {
+                        "" | "px" => v <= threshold,
+                        "em" | "rem" => v <= 0.15,
+                        "vh" | "vw" | "%" => v <= 0.5,
+                        _ => false,
+                    };
+                    if is_small {
                         return true;
                     }
                 }
@@ -758,7 +792,13 @@ fn is_zero_value(value: &str) -> bool {
             return true;
         }
         let unit = &lower[num_end..];
-        if (unit.is_empty() || unit == "px") && v <= 1.0 {
+        let is_small = match unit {
+            "" | "px" => v <= 1.0,
+            "em" | "rem" => v <= 0.15,
+            "vh" | "vw" | "%" => v <= 0.5,
+            _ => false,
+        };
+        if is_small {
             return true;
         }
     }
