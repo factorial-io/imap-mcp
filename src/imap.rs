@@ -291,7 +291,9 @@ fn is_style_hidden(style: &str) -> bool {
     }
     // clip-path clips the rendered area — works on elements in normal flow.
     // clip requires position:absolute/fixed (already checked above with offsets).
-    if no_ws.contains("clip-path:") || no_ws.contains("clip:rect(") {
+    if has_property_at_boundary(&no_ws, "clip-path:")
+        || has_property_at_boundary(&no_ws, "clip:rect(")
+    {
         return true;
     }
     false
@@ -413,8 +415,14 @@ fn has_property_at_boundary(no_ws: &str, prop_value: &str) -> bool {
 }
 
 /// Parse leading digits from a string as a pixel value.
+/// Parse leading digits as a pixel value.
+/// Returns 0 for empty/non-numeric input (no offset detected).
+/// Returns u32::MAX on numeric overflow (astronomically large = definitely hidden).
 fn parse_px_digits(s: &str) -> u32 {
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return 0;
+    }
     digits.parse().unwrap_or(u32::MAX)
 }
 
@@ -632,8 +640,9 @@ fn filter_css_properties(style: &str) -> String {
             let prop = prop.trim().to_lowercase();
             let value = value.trim();
             if SAFE_CSS_PROPERTIES.contains(&prop.as_str()) {
-                // Block url() in any property value (tracking pixels)
-                let lower_value = value.to_lowercase();
+                // Block url() and expression() in any property value (tracking pixels).
+                // Decode CSS escapes first so \75rl() doesn't bypass the check.
+                let lower_value = decode_css_escapes(&value.to_lowercase());
                 if lower_value.contains("url(") || lower_value.contains("expression(") {
                     continue;
                 }
