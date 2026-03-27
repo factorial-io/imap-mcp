@@ -382,12 +382,12 @@ fn strip_css_comments(s: &str) -> String {
     result
 }
 
-/// Check whether a CSS style value uses `display:none` or `visibility:hidden`.
+/// Check whether a CSS style value uses techniques to hide content.
 ///
-/// Only checks for the two most reliable hiding techniques. All other `style`
-/// attributes are stripped entirely by the lol_html handler (and again by ammonia),
-/// so exotic hiding (opacity, font-size, clip, etc.) loses its CSS — the text
-/// becomes visible, which is acceptable for text extraction.
+/// Checks `display:none`, `visibility:hidden/collapse`, `opacity` near zero,
+/// `font-size` near zero, `height`/`width` near zero with `overflow:hidden`,
+/// off-screen positioning, `text-indent` with large negative values,
+/// `transform:scale(0)`/large `translate`, and `color:transparent`.
 fn is_style_hidden(style: &str) -> bool {
     let decoded = decode_html_entities_simple(style);
     let decoded = decode_css_escapes(&decoded);
@@ -398,9 +398,185 @@ fn is_style_hidden(style: &str) -> bool {
         .collect();
     let s = strip_css_comments(&s);
 
-    s.contains("display:none")
-        || s.contains("visibility:hidden")
-        || s.contains("visibility:collapse")
+    // Parse into property map for exact key matching
+    let mut props = std::collections::HashMap::new();
+    for decl in split_css_declarations(&s) {
+        if let Some((prop, value)) = decl.split_once(':') {
+            if !prop.is_empty() {
+                let value = value.strip_suffix("!important").unwrap_or(value);
+                props.insert(prop, value);
+            }
+        }
+    }
+
+    // display:none / visibility:hidden|collapse
+    if props.get("display").is_some_and(|v| *v == "none") {
+        return true;
+    }
+    if props
+        .get("visibility")
+        .is_some_and(|v| *v == "hidden" || *v == "collapse")
+    {
+        return true;
+    }
+
+    // opacity <= 0.05
+    if let Some(v) = props.get("opacity") {
+        if let Ok(f) = v.parse::<f64>() {
+            if f <= 0.05 {
+                return true;
+            }
+        }
+    }
+
+    // font-size near zero
+    if props.get("font-size").is_some_and(|v| is_near_zero(v, 2.0)) {
+        return true;
+    }
+
+    // height/max-height/width/max-width near zero WITH overflow:hidden/clip
+    let has_overflow_hidden = props
+        .get("overflow")
+        .is_some_and(|v| *v == "hidden" || *v == "clip")
+        || props
+            .get("overflow-x")
+            .is_some_and(|v| *v == "hidden" || *v == "clip")
+        || props
+            .get("overflow-y")
+            .is_some_and(|v| *v == "hidden" || *v == "clip");
+    if has_overflow_hidden {
+        for prop in ["height", "max-height", "width", "max-width"] {
+            if props.get(prop).is_some_and(|v| is_near_zero(v, 1.0)) {
+                return true;
+            }
+        }
+    }
+
+    // Off-screen positioning
+    let is_positioned = props
+        .get("position")
+        .is_some_and(|v| *v == "absolute" || *v == "fixed");
+    if is_positioned {
+        for prop in [
+            "left",
+            "top",
+            "right",
+            "bottom",
+            "margin-left",
+            "margin-top",
+        ] {
+            if props.get(prop).is_some_and(|v| is_large_negative(v)) {
+                return true;
+            }
+        }
+    }
+
+    // text-indent with large negative value
+    if props
+        .get("text-indent")
+        .is_some_and(|v| is_large_negative(v))
+    {
+        return true;
+    }
+
+    // transform: scale(0) or large translate
+    if let Some(v) = props.get("transform") {
+        if v.contains("scale(0)") || v.contains("scalex(0)") || v.contains("scaley(0)") {
+            return true;
+        }
+        // Check for large translate values
+        for func in ["translate(", "translatex(", "translatey("] {
+            if let Some(start) = v.find(func) {
+                let args_start = start + func.len();
+                if let Some(paren_end) = v[args_start..].find(')') {
+                    let args = &v[args_start..args_start + paren_end];
+                    for arg in args.split(',') {
+                        let arg = arg.trim_start_matches('-');
+                        if parse_px_digits(arg) >= 200 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Transparent text color
+    if let Some(v) = props.get("color") {
+        if *v == "transparent" || is_transparent_alpha(v) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if a CSS numeric value is near zero, accounting for units.
+/// Threshold applies to px/unitless; em/rem use 0.25; vh/vw/% use 0.5.
+fn is_near_zero(value: &str, threshold_px: f64) -> bool {
+    let num_end = value
+        .find(|c: char| c != '.' && c != '-' && !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    if num_end == 0 {
+        return false;
+    }
+    let v: f64 = match value[..num_end].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if v <= 0.0 {
+        return true;
+    }
+    let unit = &value[num_end..];
+    match unit {
+        "" | "px" => v <= threshold_px,
+        "em" | "rem" => v <= 0.25,
+        "vh" | "vw" | "%" => v <= 0.5,
+        _ => false,
+    }
+}
+
+/// Check if a CSS color function has near-zero alpha.
+fn is_transparent_alpha(value: &str) -> bool {
+    // Check hex alpha
+    if let Some(hex) = value.strip_prefix('#') {
+        if hex.len() == 8 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return &hex[6..] == "00";
+        }
+        if hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return &hex[3..] == "0";
+        }
+    }
+    // Extract alpha from rgba/hsla/rgb (last value after , or /)
+    let alpha = if let Some(pos) = value.rfind(',') {
+        &value[pos + 1..value.len().saturating_sub(1)]
+    } else if let Some(pos) = value.rfind('/') {
+        &value[pos + 1..value.len().saturating_sub(1)]
+    } else {
+        return false;
+    };
+    let alpha_clean = alpha.trim_end_matches('%');
+    alpha_clean.parse::<f64>().ok().is_some_and(|v| {
+        if alpha.ends_with('%') {
+            v <= 5.0
+        } else {
+            v <= 0.05
+        }
+    })
+}
+
+/// Parse leading digits (including '.') as a pixel value. Returns u32::MAX on overflow.
+fn parse_px_digits(s: &str) -> u32 {
+    let num_end = s
+        .find(|c: char| c != '.' && !c.is_ascii_digit())
+        .unwrap_or(s.len());
+    if num_end == 0 {
+        return 0;
+    }
+    s[..num_end]
+        .parse::<f64>()
+        .map(|v| v.ceil() as u32)
+        .unwrap_or(u32::MAX)
 }
 
 /// Tags allowed in both draft and reading sanitization.
@@ -563,7 +739,7 @@ fn is_zero_value(value: &str) -> bool {
         let unit = &lower[num_end..];
         let is_small = match unit {
             "" | "px" => v <= 1.0,
-            "em" | "rem" => v <= 0.15,
+            "em" | "rem" => v <= 0.25,
             "vh" | "vw" | "%" => v <= 0.5,
             _ => false,
         };
@@ -3022,21 +3198,25 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_strips_style_attributes_from_non_hidden_elements() {
-        // Exotic hiding techniques (opacity, font-size, etc.) have their style
-        // attribute stripped rather than removing the element. Content is preserved.
+    fn strip_hidden_removes_elements_with_exotic_hiding() {
+        // All hiding techniques now cause element removal
         let html = r#"<span style="opacity:0">text1</span><span style="font-size:0">text2</span><div style="height:0;overflow:hidden">text3</div><p style="color:red">visible</p>"#;
         let result = strip_hidden_elements(html, true).unwrap();
         assert!(
-            result.contains("text1"),
-            "Content should be preserved when style is stripped, got: {result:?}"
+            !result.contains("text1"),
+            "opacity:0 should be removed, got: {result:?}"
         );
-        assert!(result.contains("text2"));
-        assert!(result.contains("text3"));
-        assert!(result.contains("visible"));
         assert!(
-            !result.contains("style="),
-            "All style attributes should be stripped, got: {result:?}"
+            !result.contains("text2"),
+            "font-size:0 should be removed, got: {result:?}"
+        );
+        assert!(
+            !result.contains("text3"),
+            "height:0+overflow:hidden should be removed, got: {result:?}"
+        );
+        assert!(
+            result.contains("visible"),
+            "Non-hidden should be preserved, got: {result:?}"
         );
     }
 
