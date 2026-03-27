@@ -291,7 +291,8 @@ fn is_style_hidden(style: &str) -> bool {
     }
     // clip-path clips the rendered area — works on elements in normal flow.
     // clip requires position:absolute/fixed (already checked above with offsets).
-    if has_property_at_boundary(&no_ws, "clip-path:")
+    if (has_property_at_boundary(&no_ws, "clip-path:")
+        && !has_property_at_boundary(&no_ws, "clip-path:none"))
         || has_property_at_boundary(&no_ws, "clip:rect(")
     {
         return true;
@@ -522,11 +523,9 @@ fn ammonia_draft() -> ammonia::Builder<'static> {
 
 /// CSS properties safe for email formatting. No `background-image` (tracking),
 /// no `position`/`opacity`/`display`/`visibility` (hiding/overlays).
-/// `color` is excluded to prevent same-color-as-background text hiding
-/// (e.g. white text on white background). `background-color` is kept as it's
-/// less exploitable alone — text color defaults to black in email clients.
+/// `color` and `background-color` are both excluded to prevent same-color
+/// text hiding (e.g. black text on black background, white on white).
 const SAFE_CSS_PROPERTIES: &[&str] = &[
-    "background-color",
     "font-family",
     "font-size",
     "font-weight",
@@ -570,40 +569,6 @@ const SAFE_CSS_PROPERTIES: &[&str] = &[
     "list-style-type",
 ];
 
-/// Check if a CSS color value is transparent (alpha channel == 0).
-/// Handles `transparent`, `rgba(...)`, `rgb(... / alpha)`, `hsla(...)`,
-/// and hex alpha formats (`#RRGGBBAA`, `#RGBA`).
-fn is_transparent_color(value: &str) -> bool {
-    let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
-    if compact == "transparent" {
-        return true;
-    }
-    // Hex alpha: #RRGGBBAA (9 chars with #) or #RGBA (5 chars with #)
-    if let Some(hex) = compact.strip_prefix('#') {
-        if hex.len() == 8 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            // Last two hex digits are alpha
-            return &hex[6..] == "00";
-        }
-        if hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            // Last hex digit is alpha
-            return &hex[3..] == "0";
-        }
-    }
-    // Extract the last numeric value (alpha channel) from color functions.
-    // Patterns: rgba(r,g,b,A) or rgba(r g b / A) or hsla(h,s,l,A)
-    let alpha = if let Some(pos) = compact.rfind(',') {
-        &compact[pos + 1..compact.len().saturating_sub(1)]
-    } else if let Some(pos) = compact.rfind('/') {
-        &compact[pos + 1..compact.len().saturating_sub(1)]
-    } else {
-        return false;
-    };
-    // Parse alpha as f64 — strip trailing '%' first to handle percentage notation.
-    // Catches 0, 0.0, 0.00, 0%, 0.0%, etc.
-    let alpha_clean = alpha.trim_end_matches('%');
-    alpha_clean.parse::<f64>().ok().is_some_and(|v| v == 0.0)
-}
-
 /// Check if a CSS value is effectively zero/tiny (at or below 1px threshold).
 /// Only applies the threshold for `px` or unitless values. For other units
 /// (`em`, `rem`, etc.), only exact zero is caught.
@@ -644,10 +609,6 @@ fn filter_css_properties(style: &str) -> String {
                 // Decode CSS escapes first so \75rl() doesn't bypass the check.
                 let lower_value = decode_css_escapes(&value.to_lowercase());
                 if lower_value.contains("url(") || lower_value.contains("expression(") {
-                    continue;
-                }
-                // Block transparent background-color (e.g. rgba(0,0,0,0)).
-                if prop == "background-color" && is_transparent_color(&lower_value) {
                     continue;
                 }
                 // Block zero/tiny height/max-height and font-size as secondary
@@ -2999,11 +2960,18 @@ Content-Type: text/html\r\n\r\n\
 
     #[test]
     fn filter_css_allows_safe_properties() {
-        let css = "background-color: #eee; font-size: 14px; text-align: center";
+        let css = "font-size: 14px; text-align: center; padding: 10px";
         let result = filter_css_properties(css);
-        assert!(result.contains("background-color: #eee"));
         assert!(result.contains("font-size: 14px"));
         assert!(result.contains("text-align: center"));
+        assert!(result.contains("padding: 10px"));
+    }
+
+    #[test]
+    fn filter_css_strips_color_and_background_color() {
+        // Both color and background-color are excluded to prevent same-color hiding
+        assert_eq!(filter_css_properties("color: red"), "");
+        assert_eq!(filter_css_properties("background-color: black"), "");
     }
 
     #[test]
@@ -3035,21 +3003,11 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn filter_css_strips_transparent_background() {
-        // background-color with transparent alpha is stripped
+    fn filter_css_strips_all_background_color() {
+        // background-color is excluded entirely from the allowlist
         assert_eq!(filter_css_properties("background-color: transparent"), "");
-        assert_eq!(filter_css_properties("background-color: rgba(0,0,0,0)"), "");
-        assert_eq!(
-            filter_css_properties("background-color: rgba(0, 0, 0, 0)"),
-            ""
-        );
-        assert_eq!(
-            filter_css_properties("background-color: rgba(0,0,0,0.0)"),
-            ""
-        );
-        assert_eq!(filter_css_properties("background-color: #00000000"), "");
-        // Non-transparent background should be kept
-        assert!(filter_css_properties("background-color: #fff").contains("background-color"));
+        assert_eq!(filter_css_properties("background-color: #fff"), "");
+        assert_eq!(filter_css_properties("background-color: black"), "");
     }
 
     #[test]
