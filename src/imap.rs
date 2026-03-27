@@ -165,6 +165,56 @@ fn decode_entity(entity: &str) -> Option<char> {
 }
 
 /// Strip CSS block comments (`/* ... */`) from a string.
+/// Decode CSS backslash escape sequences.
+///
+/// CSS allows `\HH` (1-6 hex digits, optionally followed by one whitespace)
+/// to encode characters. E.g. `d\69splay:none` = `display:none`.
+/// Also handles `\<non-hex>` → literal character (e.g. `\:` → `:`).
+fn decode_css_escapes(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            result.push(c);
+            continue;
+        }
+        // Collect 1-6 hex digits
+        let mut hex = String::new();
+        while hex.len() < 6 {
+            match chars.peek() {
+                Some(nc) if nc.is_ascii_hexdigit() => {
+                    hex.push(*nc);
+                    chars.next();
+                }
+                _ => break,
+            }
+        }
+        if hex.is_empty() {
+            // \<non-hex> → literal next char
+            if let Some(nc) = chars.next() {
+                result.push(nc);
+            } else {
+                result.push('\\');
+            }
+        } else {
+            if let Some(decoded) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                result.push(decoded);
+            } else {
+                result.push('\\');
+                result.push_str(&hex);
+            }
+            // CSS spec: optional single whitespace after hex escape is consumed
+            if chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+        }
+    }
+    result
+}
+
 fn strip_css_comments(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.char_indices().peekable();
@@ -196,6 +246,7 @@ fn strip_css_comments(s: &str) -> String {
 /// without entity decoding (e.g. `display&#58;none` stays as-is).
 fn is_style_hidden(style: &str) -> bool {
     let decoded = decode_html_entities_simple(style);
+    let decoded = decode_css_escapes(&decoded);
     let no_ws: String = decoded
         .to_lowercase()
         .chars()
@@ -214,9 +265,11 @@ fn is_style_hidden(style: &str) -> bool {
     if has_small_css_value(&no_ws, "font-size:", 2.0) {
         return true;
     }
-    // height/max-height < 1px — sub-pixel heights are effectively invisible.
-    if has_small_css_value(&no_ws, "height:", 1.0)
-        || has_small_css_value(&no_ws, "max-height:", 1.0)
+    // height/max-height <= 1px with overflow:hidden — content is clipped.
+    // Without overflow:hidden, content overflows and remains visible (e.g. <hr style="height:1px">).
+    if (has_small_css_value(&no_ws, "height:", 1.0)
+        || has_small_css_value(&no_ws, "max-height:", 1.0))
+        && has_property_at_boundary(&no_ws, "overflow:hidden")
     {
         return true;
     }
@@ -3078,8 +3131,8 @@ Content-Type: text/html\r\n\r\n\
 
     #[test]
     fn strip_hidden_catches_zero_em() {
-        // 0em IS zero regardless of unit
-        let html = r#"<div style="height:0em">hidden</div><p>Visible</p>"#;
+        // 0em IS zero regardless of unit — needs overflow:hidden to clip
+        let html = r#"<div style="height:0em;overflow:hidden">hidden</div><p>Visible</p>"#;
         let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden"),
@@ -3142,6 +3195,61 @@ Content-Type: text/html\r\n\r\n\
             "clip:rect should be stripped, got: {result:?}"
         );
         assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_height_1px_without_overflow_preserved() {
+        // height:1px without overflow:hidden — content overflows and is visible
+        let html = r#"<hr style="height:1px"><p>After</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            result.contains("After"),
+            "height:1px without overflow:hidden should not strip content, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_height_1px_with_overflow_hidden_stripped() {
+        let html = r#"<div style="height:1px;overflow:hidden">hidden</div><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden"),
+            "height:1px+overflow:hidden should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_css_backslash_escape() {
+        // \69 = 'i' in CSS, so d\69splay:none = display:none
+        let html = r#"<span style="d\69splay:none">hidden via css escape</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden via css escape"),
+            "CSS backslash escape should be decoded, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_catches_css_escape_visibility() {
+        // \76 = 'v', \68 = 'h' → visibility:hidden
+        let html = r#"<span style="\76isibility:\68idden">hidden</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden"),
+            "CSS escaped visibility:hidden should be caught, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn decode_css_escapes_basic() {
+        assert_eq!(decode_css_escapes(r"d\69 splay"), "display");
+        assert_eq!(decode_css_escapes(r"d\69splay"), "display");
+        assert_eq!(decode_css_escapes(r"\76isibility"), "visibility");
+        assert_eq!(decode_css_escapes(r"\:"), ":");
+        assert_eq!(decode_css_escapes("no escapes"), "no escapes");
     }
 
     // --- Address list splitting tests ---
