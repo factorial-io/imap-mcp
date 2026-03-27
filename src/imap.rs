@@ -258,7 +258,8 @@ fn is_style_hidden(style: &str) -> bool {
     if no_ws.contains("display:none") || no_ws.contains("visibility:hidden") {
         return true;
     }
-    if has_zero_css_value(&no_ws, "opacity:") {
+    // opacity <= 0.05 is effectively invisible to humans
+    if has_small_css_value(&no_ws, "opacity:", 0.05) {
         return true;
     }
     // font-size < 2px is effectively invisible — catches 0, 0.1px, 1px, etc.
@@ -297,7 +298,12 @@ fn is_style_hidden(style: &str) -> bool {
         return true;
     }
     // transform:translate moves content off-screen in clients that support CSS transforms.
-    if no_ws.contains("transform:translate") {
+    if no_ws.contains("transform:translate")
+        || no_ws.contains("transform:scale(0")
+        || no_ws.contains("transform:scalex(0")
+        || no_ws.contains("transform:scaley(0")
+        || no_ws.contains("transform:matrix(0,")
+    {
         return true;
     }
     // Transparent text color — invisible to humans but extracted as text by html2text.
@@ -310,31 +316,7 @@ fn is_style_hidden(style: &str) -> bool {
     false
 }
 
-/// Check if a CSS property has a zero (or zero-equivalent) numeric value at a
-/// property boundary (start of string or after `;`).
-fn has_zero_css_value(no_ws: &str, prop: &str) -> bool {
-    let mut from = 0;
-    while let Some(pos) = no_ws[from..].find(prop) {
-        let abs = from + pos;
-        if abs == 0 || no_ws.as_bytes()[abs - 1] == b';' {
-            let value = &no_ws[abs + prop.len()..];
-            let num_end = value
-                .find(|c: char| c != '.' && !c.is_ascii_digit())
-                .unwrap_or(value.len());
-            if num_end > 0 {
-                if let Ok(v) = value[..num_end].parse::<f64>() {
-                    if v == 0.0 {
-                        return true;
-                    }
-                }
-            }
-        }
-        from = abs + prop.len();
-    }
-    false
-}
-
-/// Like `has_zero_css_value` but uses a threshold instead of exact zero.
+/// Check if a CSS property has a small numeric value at a property boundary.
 /// Catches near-zero values like `font-size:0.1px` or `font-size:1px` that are
 /// effectively invisible to humans but render as text in `html2text`.
 ///
@@ -499,11 +481,9 @@ fn has_transparent_color_at_boundary(no_ws: &str) -> bool {
     false
 }
 
-/// Parse leading digits as a pixel value.
-/// Returns 0 for empty/non-numeric input (no offset detected).
-/// Returns u32::MAX on numeric overflow (astronomically large = definitely hidden).
 /// Parse leading numeric value (including fractional part) as a pixel value.
 /// Rounds up so 199.9 → 200, avoiding threshold bypasses.
+/// Returns 0 for empty/non-numeric input, u32::MAX on overflow.
 /// Returns 0 for empty/non-numeric input, u32::MAX on overflow.
 fn parse_px_digits(s: &str) -> u32 {
     let num_end = s
