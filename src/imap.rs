@@ -415,7 +415,7 @@ fn has_property_at_boundary(no_ws: &str, prop_value: &str) -> bool {
 /// Parse leading digits from a string as a pixel value.
 fn parse_px_digits(s: &str) -> u32 {
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().unwrap_or(0)
+    digits.parse().unwrap_or(u32::MAX)
 }
 
 /// Tags allowed in both draft and reading sanitization.
