@@ -242,7 +242,7 @@ fn has_small_css_value(no_ws: &str, prop: &str, threshold: f64) -> bool {
                 .unwrap_or(value.len());
             if num_end > 0 {
                 if let Ok(v) = value[..num_end].parse::<f64>() {
-                    if v < threshold {
+                    if v <= threshold {
                         return true;
                     }
                 }
@@ -491,8 +491,8 @@ fn is_transparent_color(value: &str) -> bool {
     alpha.parse::<f64>().ok().is_some_and(|v| v == 0.0)
 }
 
-/// Check if a CSS value is effectively zero (below 1px threshold).
-/// Catches 0, 0px, 0.001px, 0.5px — sub-pixel values are invisible
+/// Check if a CSS value is effectively zero (at or below 1px threshold).
+/// Catches 0, 0px, 0.5px, 1px — values at this size are invisible
 /// in email clients but would pass an exact-zero check.
 fn is_zero_value(value: &str) -> bool {
     let lower = value.trim().to_lowercase();
@@ -505,7 +505,7 @@ fn is_zero_value(value: &str) -> bool {
     lower[..num_end]
         .parse::<f64>()
         .ok()
-        .is_some_and(|v| v < 1.0)
+        .is_some_and(|v| v <= 1.0)
 }
 
 /// Filter CSS style value to only permit safe properties.
@@ -530,9 +530,11 @@ fn filter_css_properties(style: &str) -> String {
                 if prop == "background-color" && is_transparent_color(&lower_value) {
                     continue;
                 }
-                // Block zero height/max-height — elements with no height serve
-                // no legitimate formatting purpose and can hide content.
-                if (prop == "height" || prop == "max-height") && is_zero_value(value) {
+                // Block zero/tiny height/max-height and font-size as secondary
+                // defense (backstop for strip_hidden_elements bypass).
+                if (prop == "height" || prop == "max-height" || prop == "font-size")
+                    && is_zero_value(value)
+                {
                     continue;
                 }
                 safe.push(format!("{prop}: {value}"));
@@ -2937,9 +2939,10 @@ Content-Type: text/html\r\n\r\n\
         assert_eq!(filter_css_properties("height: 0.001px"), "");
         assert_eq!(filter_css_properties("height: 0.5px"), "");
         assert_eq!(filter_css_properties("max-height: 0"), "");
-        // Non-zero height should be kept
+        assert_eq!(filter_css_properties("height: 1px"), "");
+        // Above threshold should be kept
         assert!(filter_css_properties("height: 100px").contains("height"));
-        assert!(filter_css_properties("height: 1px").contains("height"));
+        assert!(filter_css_properties("height: 2px").contains("height"));
     }
 
     #[test]
