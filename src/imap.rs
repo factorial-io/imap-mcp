@@ -291,10 +291,9 @@ fn is_style_hidden(style: &str) -> bool {
     }
     // clip-path clips the rendered area — works on elements in normal flow.
     // clip requires position:absolute/fixed (already checked above with offsets).
-    if (has_property_at_boundary(&no_ws, "clip-path:")
-        && !has_property_at_boundary(&no_ws, "clip-path:none"))
-        || has_property_at_boundary(&no_ws, "clip:rect(")
-    {
+    // Check if any clip-path value is NOT "none" (CSS last-wins, so a later
+    // clip-path:polygon(...) overrides an earlier clip-path:none).
+    if has_non_none_clip_path(&no_ws) || has_property_at_boundary(&no_ws, "clip:rect(") {
         return true;
     }
     false
@@ -415,7 +414,30 @@ fn has_property_at_boundary(no_ws: &str, prop_value: &str) -> bool {
     false
 }
 
-/// Parse leading digits from a string as a pixel value.
+/// Check if any boundary-anchored `clip-path:` declaration has a value other than `none`.
+/// Handles CSS last-wins semantics: `clip-path:none;clip-path:polygon(...)` IS hidden
+/// because the second declaration wins.
+fn has_non_none_clip_path(no_ws: &str) -> bool {
+    let prop = "clip-path:";
+    let mut search = 0;
+    while let Some(pos) = no_ws[search..].find(prop) {
+        let abs = search + pos;
+        if abs == 0 || no_ws.as_bytes()[abs - 1] == b';' {
+            let value_start = abs + prop.len();
+            let value_end = no_ws[value_start..]
+                .find(';')
+                .map(|p| value_start + p)
+                .unwrap_or(no_ws.len());
+            let value = &no_ws[value_start..value_end];
+            if value != "none" {
+                return true;
+            }
+        }
+        search = abs + prop.len();
+    }
+    false
+}
+
 /// Parse leading digits as a pixel value.
 /// Returns 0 for empty/non-numeric input (no offset detected).
 /// Returns u32::MAX on numeric overflow (astronomically large = definitely hidden).
@@ -592,6 +614,17 @@ fn is_zero_value(value: &str) -> bool {
     false
 }
 
+/// Check if a CSS value is a large negative number (>= 200 in magnitude).
+/// Used as a backstop in filter_css_properties for margin-left/margin-top.
+fn is_large_negative(value: &str) -> bool {
+    let trimmed = value.trim().to_lowercase();
+    if let Some(rest) = trimmed.strip_prefix('-') {
+        parse_px_digits(rest) >= 200
+    } else {
+        false
+    }
+}
+
 /// Filter CSS style value to only permit safe properties.
 /// Returns a sanitized CSS string with only allowed properties.
 fn filter_css_properties(style: &str) -> String {
@@ -616,6 +649,10 @@ fn filter_css_properties(style: &str) -> String {
                 if (prop == "height" || prop == "max-height" || prop == "font-size")
                     && is_zero_value(value)
                 {
+                    continue;
+                }
+                // Block large negative margins (off-screen positioning backstop).
+                if (prop == "margin-left" || prop == "margin-top") && is_large_negative(value) {
                     continue;
                 }
                 safe.push(format!("{prop}: {value}"));
