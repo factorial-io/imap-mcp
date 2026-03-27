@@ -125,76 +125,53 @@ fn extract_hidden_classes(html: &str) -> std::collections::HashSet<String> {
 }
 
 /// Parse CSS text to find class selectors associated with hiding rules.
+/// Only extracts the class from the *simple selector* directly before `{`,
+/// not ancestor/compound selectors earlier in the rule.
 fn extract_hidden_classes_from_css(css: &str, classes: &mut std::collections::HashSet<String>) {
-    // Split on '{' to get selector/declaration pairs
-    for rule in css.split('{') {
-        // The next '}' ends the declaration block
-        let Some((declarations, _rest)) = rule.split_once('}') else {
-            // This chunk is a selector (the first one, or after a closing brace)
-            // Check if the NEXT chunk (declarations) contains hiding patterns
-            continue;
+    let lower_css = css.to_lowercase();
+    // Split on '{' to get [selector, declarations}rest, ...]
+    let mut rest = lower_css.as_str();
+    while let Some(brace_pos) = rest.find('{') {
+        let selector = &rest[..brace_pos];
+        let after_brace = &rest[brace_pos + 1..];
+        // Find matching '}'
+        let Some(close_pos) = after_brace.find('}') else {
+            break;
         };
-        // `rule` before '{' was already split off — but our split gives us
-        // [selector, declarations}rest, selector2, declarations2}rest2, ...]
-        // So `declarations` here is actually the declaration block.
-        let decl_lower: String = declarations
-            .to_lowercase()
+        let declarations = &after_brace[..close_pos];
+        rest = &after_brace[close_pos + 1..];
+
+        // Check if declarations contain hiding patterns
+        let decl_compact: String = declarations
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        let is_hidden = decl_lower.contains("display:none")
-            || decl_lower.contains("visibility:hidden")
-            || decl_lower.contains("opacity:0")
-            || decl_lower.contains("font-size:0");
-        if !is_hidden {
+        if !decl_compact.contains("display:none")
+            && !decl_compact.contains("visibility:hidden")
+            && !decl_compact.contains("opacity:0")
+            && !decl_compact.contains("font-size:0")
+        {
             continue;
         }
-        // The selector is in `rule` (the part before the '{' that was already split)
-        // But since we split on '{', the selector is actually everything before
-        // this declarations block. We need a different approach.
-    }
 
-    // Simpler approach: use regex-like scanning for `.classname { ... hiding ... }`
-    let lower_css = css.to_lowercase();
-    let mut i = 0;
-    let bytes = lower_css.as_bytes();
-    while i < bytes.len() {
-        // Find next '.'
-        if bytes[i] == b'.' {
-            // Extract class name (alphanumeric, hyphen, underscore)
-            let name_start = i + 1;
-            let mut name_end = name_start;
-            while name_end < bytes.len()
-                && (bytes[name_end].is_ascii_alphanumeric()
-                    || bytes[name_end] == b'-'
-                    || bytes[name_end] == b'_')
-            {
-                name_end += 1;
-            }
-            if name_end > name_start {
-                let class_name = &lower_css[name_start..name_end];
-                // Find the next '{' after this selector
-                if let Some(brace) = lower_css[name_end..].find('{') {
-                    let decl_start = name_end + brace + 1;
-                    // Find matching '}'
-                    if let Some(brace_end) = lower_css[decl_start..].find('}') {
-                        let declarations = &lower_css[decl_start..decl_start + brace_end];
-                        let decl_compact: String = declarations
-                            .chars()
-                            .filter(|c| !c.is_whitespace())
-                            .collect();
-                        if decl_compact.contains("display:none")
-                            || decl_compact.contains("visibility:hidden")
-                            || decl_compact.contains("opacity:0")
-                            || decl_compact.contains("font-size:0")
-                        {
-                            classes.insert(class_name.to_string());
-                        }
-                    }
+        // Extract class names from the selector. Handle comma-separated selectors
+        // (e.g. `.a, .b { display:none }`) and only take the last class in each
+        // compound/descendant selector to avoid false positives on ancestor classes.
+        for simple_selector in selector.split(',') {
+            // Take the last segment after whitespace (the targeted element, not ancestors)
+            let last_segment = simple_selector.split_whitespace().last().unwrap_or("");
+            // Extract class names from this segment (could be `.foo.bar`)
+            for part in last_segment.split('.') {
+                // Trim any pseudo-classes, attribute selectors, etc.
+                let name_end = part
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                    .unwrap_or(part.len());
+                let name = &part[..name_end];
+                if !name.is_empty() {
+                    classes.insert(name.to_string());
                 }
             }
         }
-        i += 1;
     }
 }
 
@@ -3192,6 +3169,37 @@ Content-Type: text/html\r\n\r\n\
             "visibility:hidden class should strip element, got: {result:?}"
         );
         assert!(result.contains("Safe"));
+    }
+
+    #[test]
+    fn strip_hidden_descendant_selector_does_not_strip_ancestor() {
+        // `.wrapper .hide { display:none }` should only strip elements with class "hide",
+        // not elements with class "wrapper"
+        let html = r#"<style>.wrapper .hide { display: none; }</style><div class="wrapper"><p>Visible wrapper content</p><span class="hide">hidden</span></div>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            result.contains("Visible wrapper content"),
+            "Ancestor class should not be stripped, got: {result:?}"
+        );
+        assert!(
+            !result.contains("hidden"),
+            "Targeted class should be stripped, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_comma_separated_selectors() {
+        let html = r#"<style>.a, .b { display: none; }</style><div class="a">hidden-a</div><div class="b">hidden-b</div><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden-a"),
+            "Class .a should be stripped, got: {result:?}"
+        );
+        assert!(
+            !result.contains("hidden-b"),
+            "Class .b should be stripped, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
     }
 
     #[test]
