@@ -145,6 +145,9 @@ fn extract_hidden_classes_from_css(css: &str, classes: &mut std::collections::Ha
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
+        // Decode CSS escapes and strip comments to match the same normalization
+        // pipeline used by is_style_hidden for inline style attributes.
+        let decl_compact = strip_css_comments(&decode_css_escapes(&decl_compact));
         if !decl_compact.contains("display:none")
             && !decl_compact.contains("visibility:hidden")
             && !decl_compact.contains("opacity:0")
