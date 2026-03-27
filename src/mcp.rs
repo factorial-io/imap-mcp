@@ -105,6 +105,9 @@ pub struct CreateDraftParams {
     pub subject: String,
     /// Plain text email body. IMPORTANT: Use newline characters to separate paragraphs and lines — do not put everything on a single line.
     pub body: String,
+    /// Optional HTML body. When provided, the email is sent as multipart/alternative with both plain text and HTML parts. Use a safe subset of HTML (paragraphs, headings, lists, bold/italic, links). The plain text body is always required as fallback for clients that don't render HTML.
+    #[serde(default)]
+    pub html_body: Option<String>,
     /// CC recipient(s), comma-separated (optional)
     #[serde(default)]
     pub cc: Option<String>,
@@ -132,6 +135,9 @@ pub struct UpdateDraftParams {
     pub subject: String,
     /// Plain text email body. IMPORTANT: Use newline characters to separate paragraphs and lines — do not put everything on a single line.
     pub body: String,
+    /// Optional HTML body. When provided, the email is sent as multipart/alternative with both plain text and HTML parts. Use a safe subset of HTML (paragraphs, headings, lists, bold/italic, links). The plain text body is always required as fallback for clients that don't render HTML.
+    #[serde(default)]
+    pub html_body: Option<String>,
     /// CC recipient(s), comma-separated (optional)
     #[serde(default)]
     pub cc: Option<String>,
@@ -357,7 +363,7 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Create a new draft email. The body MUST contain newline characters (\\n) to separate paragraphs and lines — never send the entire body as a single line. The draft is saved to the specified folder (default: Drafts) and can be edited later with update_draft or sent from your email client. To create a reply, first use get_email to fetch the original email, then pass its message_id as in_reply_to, and set references to the original references value (if any) plus the original message_id appended. If the original email has no references (thread root), use only its message_id as the references value."
+        description = "Create a new draft email. The body MUST contain newline characters (\\n) to separate paragraphs and lines — never send the entire body as a single line. Optionally provide html_body for formatted emails (the plain text body is always required as fallback). The draft is saved to the specified folder (default: Drafts) and can be edited later with update_draft or sent from your email client. To create a reply, first use get_email to fetch the original email, then pass its message_id as in_reply_to, and set references to the original references value (if any) plus the original message_id appended. If the original email has no references (thread root), use only its message_id as the references value."
     )]
     async fn create_draft(
         &self,
@@ -371,6 +377,7 @@ impl ImapMcpServer {
             to: &params.to,
             subject: &params.subject,
             body: &body,
+            html_body: params.html_body.as_deref(),
             cc: params.cc.as_deref(),
             bcc: params.bcc.as_deref(),
             in_reply_to: params.in_reply_to.as_deref(),
@@ -393,7 +400,7 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Update an existing draft email by UID. Replaces the old draft with the new content in the same folder. The body MUST contain newline characters (\\n) to separate paragraphs and lines."
+        description = "Update an existing draft email by UID. Replaces the old draft with the new content in the same folder. The body MUST contain newline characters (\\n) to separate paragraphs and lines. Optionally provide html_body for formatted emails."
     )]
     async fn update_draft(
         &self,
@@ -407,6 +414,7 @@ impl ImapMcpServer {
             to: &params.to,
             subject: &params.subject,
             body: &body,
+            html_body: params.html_body.as_deref(),
             cc: params.cc.as_deref(),
             bcc: params.bcc.as_deref(),
             in_reply_to: params.in_reply_to.as_deref(),
