@@ -102,24 +102,30 @@ fn strip_hidden_elements(html: &str) -> Result<String, AppError> {
 /// Uses simple pattern matching (not a full CSS parser) to find rules like
 /// `.hidden { display: none }` and returns the set of class names.
 fn extract_hidden_classes(html: &str) -> std::collections::HashSet<String> {
+    use lol_html::text;
     let mut classes = std::collections::HashSet::new();
-    // Work entirely on the lowercased copy to avoid byte-offset mismatches
-    // between the original and lowercased strings (Unicode codepoints can
-    // change byte length when lowercased, e.g. İ U+0130).
-    let lower = html.to_lowercase();
-    let mut search = 0;
-    while let Some(start) = lower[search..].find("<style") {
-        let abs_start = search + start;
-        let Some(tag_end) = lower[abs_start..].find('>') else {
-            break;
-        };
-        let content_start = abs_start + tag_end + 1;
-        let Some(end) = lower[content_start..].find("</style>") else {
-            break;
-        };
-        let css = &lower[content_start..content_start + end];
-        extract_hidden_classes_from_css(css, &mut classes);
-        search = content_start + end + 8;
+    let css_chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let css_ref = css_chunks.clone();
+
+    // Use lol_html's text handler to correctly extract <style> content,
+    // avoiding false matches on `<style` appearing in attribute values.
+    let _ = rewrite_str(
+        html,
+        RewriteStrSettings {
+            element_content_handlers: vec![text!("style", move |chunk| {
+                if let Ok(mut chunks) = css_ref.lock() {
+                    chunks.push(chunk.as_str().to_string());
+                }
+                Ok(())
+            })],
+            ..Default::default()
+        },
+    );
+
+    if let Ok(chunks) = css_chunks.lock() {
+        let all_css = chunks.join("");
+        let lower = all_css.to_lowercase();
+        extract_hidden_classes_from_css(&lower, &mut classes);
     }
     classes
 }
@@ -419,13 +425,11 @@ fn is_style_hidden(style: &str) -> bool {
     if has_non_none_clip_path(&no_ws) || has_property_at_boundary(&no_ws, "clip:rect(") {
         return true;
     }
-    // transform:translate moves content off-screen in clients that support CSS transforms.
-    if no_ws.contains("transform:translate")
-        || no_ws.contains("transform:scale(0")
-        || no_ws.contains("transform:scalex(0")
-        || no_ws.contains("transform:scaley(0")
-        || no_ws.contains("transform:matrix(")
-    {
+    // transform-based hiding: only flag specific dangerous patterns.
+    // translate: only large magnitudes (>= 200px) are off-screen hiding.
+    // scale(0)/scaleX(0)/scaleY(0): exactly zero collapses to invisible.
+    // matrix: skip entirely — too many legitimate uses and hard to parse reliably.
+    if has_hiding_transform(&no_ws) {
         return true;
     }
     // Transparent text color — invisible to humans but extracted as text by html2text.
@@ -572,10 +576,54 @@ fn is_transparent_css_color(value: &str) -> bool {
     })
 }
 
-/// Check if the *last* boundary-anchored `clip-path:` declaration has a value
-/// other than `none`. Implements CSS last-wins semantics:
-/// - `clip-path:polygon(...);clip-path:none` → NOT hidden (none wins)
-/// - `clip-path:none;clip-path:polygon(...)` → hidden (polygon wins)
+/// Check if a `transform` value hides content.
+/// Only flags translate with large values (>= 200px) and scale exactly zero.
+fn has_hiding_transform(no_ws: &str) -> bool {
+    // Must be at a property boundary to avoid matching inside -webkit-transform
+    if !has_property_at_boundary(no_ws, "transform:") {
+        return false;
+    }
+    // Extract the transform value
+    let prop = "transform:";
+    let mut search = 0;
+    while let Some(pos) = no_ws[search..].find(prop) {
+        let abs = search + pos;
+        if abs == 0 || no_ws.as_bytes()[abs - 1] == b';' {
+            let value = &no_ws[abs + prop.len()..];
+            let end = value.find(';').unwrap_or(value.len());
+            let val = &value[..end];
+
+            // scale(0) / scaleX(0) / scaleY(0) — exactly zero
+            if val.contains("scale(0)") || val.contains("scalex(0)") || val.contains("scaley(0)") {
+                return true;
+            }
+
+            // translate with large values — check for numeric args >= 200
+            if val.contains("translate") {
+                // Extract values from translate(...), translateX(...), translateY(...)
+                for func in ["translate(", "translatex(", "translatey("] {
+                    if let Some(start) = val.find(func) {
+                        let args_start = start + func.len();
+                        if let Some(paren_end) = val[args_start..].find(')') {
+                            let args = &val[args_start..args_start + paren_end];
+                            // Check each comma-separated arg for large negative/positive value
+                            for arg in args.split(',') {
+                                let arg = arg.trim_start_matches('-');
+                                if parse_px_digits(arg) >= 200 {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        search = abs + prop.len();
+    }
+    false
+}
+
+/// Check if the last boundary-anchored `clip-path:` declaration has a non-`none` value.
 fn has_non_none_clip_path(no_ws: &str) -> bool {
     let prop = "clip-path:";
     let mut last_value: Option<&str> = None;
