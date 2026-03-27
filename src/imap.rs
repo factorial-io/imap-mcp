@@ -502,12 +502,20 @@ fn has_transparent_color_at_boundary(no_ws: &str) -> bool {
 /// Parse leading digits as a pixel value.
 /// Returns 0 for empty/non-numeric input (no offset detected).
 /// Returns u32::MAX on numeric overflow (astronomically large = definitely hidden).
+/// Parse leading numeric value (including fractional part) as a pixel value.
+/// Rounds up so 199.9 → 200, avoiding threshold bypasses.
+/// Returns 0 for empty/non-numeric input, u32::MAX on overflow.
 fn parse_px_digits(s: &str) -> u32 {
-    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
+    let num_end = s
+        .find(|c: char| c != '.' && !c.is_ascii_digit())
+        .unwrap_or(s.len());
+    if num_end == 0 {
         return 0;
     }
-    digits.parse().unwrap_or(u32::MAX)
+    s[..num_end]
+        .parse::<f64>()
+        .map(|v| v.ceil() as u32)
+        .unwrap_or(u32::MAX)
 }
 
 /// Tags allowed in both draft and reading sanitization.
@@ -701,7 +709,7 @@ fn filter_css_properties(style: &str) -> String {
             if SAFE_CSS_PROPERTIES.contains(&prop.as_str()) {
                 // Block url() and expression() in any property value (tracking pixels).
                 // Decode CSS escapes first so \75rl() doesn't bypass the check.
-                let lower_value = decode_css_escapes(&value.to_lowercase());
+                let lower_value = strip_css_comments(&decode_css_escapes(&value.to_lowercase()));
                 if lower_value.contains("url(") || lower_value.contains("expression(") {
                     continue;
                 }
