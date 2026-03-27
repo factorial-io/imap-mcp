@@ -484,7 +484,6 @@ fn has_transparent_color_at_boundary(no_ws: &str) -> bool {
 /// Parse leading numeric value (including fractional part) as a pixel value.
 /// Rounds up so 199.9 → 200, avoiding threshold bypasses.
 /// Returns 0 for empty/non-numeric input, u32::MAX on overflow.
-/// Returns 0 for empty/non-numeric input, u32::MAX on overflow.
 fn parse_px_digits(s: &str) -> u32 {
     let num_end = s
         .find(|c: char| c != '.' && !c.is_ascii_digit())
@@ -674,11 +673,39 @@ fn is_large_negative(value: &str) -> bool {
     }
 }
 
+/// Split CSS declarations on `;`, respecting quoted strings and parentheses.
+/// `font-family: 'My Font; Other'` stays as one declaration.
+fn split_css_declarations(style: &str) -> Vec<&str> {
+    let mut declarations = Vec::new();
+    let mut start = 0;
+    let mut in_quote: Option<char> = None;
+    let mut paren_depth: usize = 0;
+
+    for (i, c) in style.char_indices() {
+        match in_quote {
+            Some(q) if c == q => in_quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => in_quote = Some(c),
+            None if c == '(' => paren_depth += 1,
+            None if c == ')' && paren_depth > 0 => paren_depth -= 1,
+            None if c == ';' && paren_depth == 0 => {
+                declarations.push(&style[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < style.len() {
+        declarations.push(&style[start..]);
+    }
+    declarations
+}
+
 /// Filter CSS style value to only permit safe properties.
 /// Returns a sanitized CSS string with only allowed properties.
 fn filter_css_properties(style: &str) -> String {
     let mut safe = Vec::new();
-    for declaration in style.split(';') {
+    for declaration in split_css_declarations(style) {
         let declaration = declaration.trim();
         if declaration.is_empty() {
             continue;
