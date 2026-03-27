@@ -46,7 +46,12 @@ pub fn sanitize_html_for_draft(html: &str) -> Result<String, AppError> {
 /// `height:0`+`overflow:hidden`, off-screen positioning, and `text-indent`
 /// hiding — common prompt-injection vectors in emails.
 fn strip_hidden_elements(html: &str) -> Result<String, AppError> {
-    rewrite_str(
+    // Two-pass approach: first extract hidden class names from <style> blocks,
+    // then strip those elements in a second pass.
+    let hidden_classes = std::sync::Arc::new(extract_hidden_classes(html));
+    let hc = hidden_classes.clone();
+
+    let result = rewrite_str(
         html,
         RewriteStrSettings {
             element_content_handlers: vec![
@@ -58,10 +63,21 @@ fn strip_hidden_elements(html: &str) -> Result<String, AppError> {
                     el.remove();
                     Ok(())
                 }),
-                // Strip class attributes so CSS class-based hiding
-                // (e.g. .h{display:none}) cannot target elements after
-                // the <style> block is removed.
+                // If the element has any class associated with a hiding rule
+                // in a <style> block, remove the entire element (content included).
+                // Otherwise just strip the class attribute.
                 element!("*[class]", |el| {
+                    if !hc.is_empty() {
+                        if let Some(class_attr) = el.get_attribute("class") {
+                            if class_attr
+                                .split_whitespace()
+                                .any(|c| hc.contains(&c.to_lowercase()))
+                            {
+                                el.remove();
+                                return Ok(());
+                            }
+                        }
+                    }
                     el.remove_attribute("class");
                     Ok(())
                 }),
@@ -76,8 +92,110 @@ fn strip_hidden_elements(html: &str) -> Result<String, AppError> {
             ],
             ..Default::default()
         },
-    )
-    .map_err(|e| AppError::Imap(format!("failed to sanitize HTML: {e}")))
+    );
+    // Drop Arc before returning so the temporary outlives the closures
+    drop(hidden_classes);
+    result.map_err(|e| AppError::Imap(format!("failed to sanitize HTML: {e}")))
+}
+
+/// Extract class names that are associated with CSS hiding rules in `<style>` blocks.
+/// Uses simple pattern matching (not a full CSS parser) to find rules like
+/// `.hidden { display: none }` and returns the set of class names.
+fn extract_hidden_classes(html: &str) -> std::collections::HashSet<String> {
+    let mut classes = std::collections::HashSet::new();
+    // Extract content of <style> blocks
+    let lower = html.to_lowercase();
+    let mut search = 0;
+    while let Some(start) = lower[search..].find("<style") {
+        let abs_start = search + start;
+        // Find the end of the opening tag
+        let Some(tag_end) = lower[abs_start..].find('>') else {
+            break;
+        };
+        let content_start = abs_start + tag_end + 1;
+        // Find </style>
+        let Some(end) = lower[content_start..].find("</style>") else {
+            break;
+        };
+        let css = &html[content_start..content_start + end];
+        extract_hidden_classes_from_css(css, &mut classes);
+        search = content_start + end + 8;
+    }
+    classes
+}
+
+/// Parse CSS text to find class selectors associated with hiding rules.
+fn extract_hidden_classes_from_css(css: &str, classes: &mut std::collections::HashSet<String>) {
+    // Split on '{' to get selector/declaration pairs
+    for rule in css.split('{') {
+        // The next '}' ends the declaration block
+        let Some((declarations, _rest)) = rule.split_once('}') else {
+            // This chunk is a selector (the first one, or after a closing brace)
+            // Check if the NEXT chunk (declarations) contains hiding patterns
+            continue;
+        };
+        // `rule` before '{' was already split off — but our split gives us
+        // [selector, declarations}rest, selector2, declarations2}rest2, ...]
+        // So `declarations` here is actually the declaration block.
+        let decl_lower: String = declarations
+            .to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let is_hidden = decl_lower.contains("display:none")
+            || decl_lower.contains("visibility:hidden")
+            || decl_lower.contains("opacity:0")
+            || decl_lower.contains("font-size:0");
+        if !is_hidden {
+            continue;
+        }
+        // The selector is in `rule` (the part before the '{' that was already split)
+        // But since we split on '{', the selector is actually everything before
+        // this declarations block. We need a different approach.
+    }
+
+    // Simpler approach: use regex-like scanning for `.classname { ... hiding ... }`
+    let lower_css = css.to_lowercase();
+    let mut i = 0;
+    let bytes = lower_css.as_bytes();
+    while i < bytes.len() {
+        // Find next '.'
+        if bytes[i] == b'.' {
+            // Extract class name (alphanumeric, hyphen, underscore)
+            let name_start = i + 1;
+            let mut name_end = name_start;
+            while name_end < bytes.len()
+                && (bytes[name_end].is_ascii_alphanumeric()
+                    || bytes[name_end] == b'-'
+                    || bytes[name_end] == b'_')
+            {
+                name_end += 1;
+            }
+            if name_end > name_start {
+                let class_name = &lower_css[name_start..name_end];
+                // Find the next '{' after this selector
+                if let Some(brace) = lower_css[name_end..].find('{') {
+                    let decl_start = name_end + brace + 1;
+                    // Find matching '}'
+                    if let Some(brace_end) = lower_css[decl_start..].find('}') {
+                        let declarations = &lower_css[decl_start..decl_start + brace_end];
+                        let decl_compact: String = declarations
+                            .chars()
+                            .filter(|c| !c.is_whitespace())
+                            .collect();
+                        if decl_compact.contains("display:none")
+                            || decl_compact.contains("visibility:hidden")
+                            || decl_compact.contains("opacity:0")
+                            || decl_compact.contains("font-size:0")
+                        {
+                            classes.insert(class_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Decode HTML entities (numeric and named) in a string.
@@ -3040,22 +3158,40 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_strips_style_blocks_and_class_attrs() {
-        let html = r#"<style>.h { display: none; }</style><div class="h">text</div><p>Visible</p>"#;
+    fn strip_hidden_strips_class_based_hidden_elements() {
+        let html = r#"<style>.h { display: none; }</style><div class="h">hidden via class</div><p>Visible</p>"#;
         let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("<style>"),
             "Style blocks should be stripped, got: {result:?}"
         );
         assert!(
-            !result.contains("class="),
-            "Class attributes should be stripped, got: {result:?}"
+            !result.contains("hidden via class"),
+            "Elements with hidden classes should be stripped, got: {result:?}"
         );
         assert!(result.contains("Visible"));
-        // Note: the element's text content remains because we cannot resolve
-        // which classes map to hidden styles without a full CSS engine.
-        // The defense is: <style> block removed + class attr removed = the
-        // hiding rule cannot be applied by email clients in outgoing drafts.
+    }
+
+    #[test]
+    fn strip_hidden_preserves_non_hidden_class_elements() {
+        let html =
+            r#"<style>.highlight { color: red; }</style><div class="highlight">visible text</div>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            result.contains("visible text"),
+            "Non-hidden class elements should be preserved, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_class_based_visibility_hidden() {
+        let html = r#"<style>.secret { visibility: hidden; }</style><span class="secret">injection</span><p>Safe</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("injection"),
+            "visibility:hidden class should strip element, got: {result:?}"
+        );
+        assert!(result.contains("Safe"));
     }
 
     #[test]
