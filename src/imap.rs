@@ -159,7 +159,7 @@ fn extract_hidden_classes(html: &str) -> Result<std::collections::HashSet<String
 fn extract_hidden_classes_from_css(css: &str, classes: &mut std::collections::HashSet<String>) {
     let mut rest = css;
     while let Some(brace_pos) = rest.find('{') {
-        let selector = rest[..brace_pos].trim();
+        let raw_selector = rest[..brace_pos].trim();
         let after_brace = &rest[brace_pos + 1..];
 
         // Find matching '}' accounting for nesting depth
@@ -169,6 +169,15 @@ fn extract_hidden_classes_from_css(css: &str, classes: &mut std::collections::Ha
         };
         let block_content = &after_brace[..close_pos];
         rest = &after_brace[close_pos + 1..];
+
+        // Strip any brace-less at-rule statements (@charset, @import, @namespace)
+        // that end with ';' and may have been absorbed into the selector.
+        // E.g. `@charset"utf-8";.inject` → selector is `.inject`.
+        let selector = if let Some(pos) = raw_selector.rfind(';') {
+            raw_selector[pos + 1..].trim()
+        } else {
+            raw_selector
+        };
 
         // If this is an at-rule (@media, @supports, etc.), recursively parse
         // the nested rules inside rather than treating the block as declarations.
