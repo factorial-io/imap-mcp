@@ -164,6 +164,32 @@ fn decode_entity(entity: &str) -> Option<char> {
     }
 }
 
+/// Strip CSS block comments (`/* ... */`) from a string.
+fn strip_css_comments(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.char_indices().peekable();
+    while let Some(&(i, c)) = chars.peek() {
+        if c == '/' && s.as_bytes().get(i + 1) == Some(&b'*') {
+            chars.next();
+            chars.next();
+            loop {
+                match chars.next() {
+                    Some((_, '*')) if chars.peek().map(|&(_, c)| c) == Some('/') => {
+                        chars.next();
+                        break;
+                    }
+                    None => break,
+                    _ => {}
+                }
+            }
+        } else {
+            result.push(c);
+            chars.next();
+        }
+    }
+    result
+}
+
 /// Check whether a CSS style value uses techniques to hide content from humans.
 ///
 /// Decodes HTML entities first since lol_html returns raw attribute values
@@ -175,6 +201,8 @@ fn is_style_hidden(style: &str) -> bool {
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
+    // Strip CSS block comments to prevent display:/**/none bypass.
+    let no_ws = strip_css_comments(&no_ws);
 
     if no_ws.contains("display:none") || no_ws.contains("visibility:hidden") {
         return true;
@@ -231,6 +259,10 @@ fn has_zero_css_value(no_ws: &str, prop: &str) -> bool {
 /// Like `has_zero_css_value` but uses a threshold instead of exact zero.
 /// Catches near-zero values like `font-size:0.1px` or `font-size:1px` that are
 /// effectively invisible to humans but render as text in `html2text`.
+///
+/// The threshold comparison only applies to `px` values and unitless values.
+/// For other units (`em`, `rem`, `vh`, `%`, etc.), only exact zero is caught
+/// since unit conversion is not possible without context.
 fn has_small_css_value(no_ws: &str, prop: &str, threshold: f64) -> bool {
     let mut from = 0;
     while let Some(pos) = no_ws[from..].find(prop) {
@@ -242,7 +274,13 @@ fn has_small_css_value(no_ws: &str, prop: &str, threshold: f64) -> bool {
                 .unwrap_or(value.len());
             if num_end > 0 {
                 if let Ok(v) = value[..num_end].parse::<f64>() {
-                    if v <= threshold {
+                    let unit = &value[num_end..].split(';').next().unwrap_or("");
+                    if v == 0.0 {
+                        // Zero is zero regardless of unit
+                        return true;
+                    }
+                    // Threshold only applies to px or unitless values
+                    if (unit.is_empty() || *unit == "px") && v <= threshold {
                         return true;
                     }
                 }
@@ -491,9 +529,9 @@ fn is_transparent_color(value: &str) -> bool {
     alpha.parse::<f64>().ok().is_some_and(|v| v == 0.0)
 }
 
-/// Check if a CSS value is effectively zero (at or below 1px threshold).
-/// Catches 0, 0px, 0.5px, 1px — values at this size are invisible
-/// in email clients but would pass an exact-zero check.
+/// Check if a CSS value is effectively zero/tiny (at or below 1px threshold).
+/// Only applies the threshold for `px` or unitless values. For other units
+/// (`em`, `rem`, etc.), only exact zero is caught.
 fn is_zero_value(value: &str) -> bool {
     let lower = value.trim().to_lowercase();
     let num_end = lower
@@ -502,10 +540,16 @@ fn is_zero_value(value: &str) -> bool {
     if num_end == 0 {
         return false;
     }
-    lower[..num_end]
-        .parse::<f64>()
-        .ok()
-        .is_some_and(|v| v <= 1.0)
+    if let Ok(v) = lower[..num_end].parse::<f64>() {
+        if v == 0.0 {
+            return true;
+        }
+        let unit = &lower[num_end..];
+        if (unit.is_empty() || unit == "px") && v <= 1.0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Filter CSS style value to only permit safe properties.
@@ -2691,13 +2735,14 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_catches_subpixel_height() {
-        // height:0.5em is sub-pixel and should be stripped
-        let html = r#"<div style="height:0.5em;overflow:hidden">hidden content</div><p>After</p>"#;
+    fn strip_hidden_catches_subpixel_height_px() {
+        // height:0.5px is sub-pixel and should be stripped
+        let html =
+            r#"<div style="height:0.5px;overflow:hidden">hidden content</div><p>After</p>"#;
         let result = strip_hidden_elements(html).unwrap();
         assert!(
             !result.contains("hidden content"),
-            "height:0.5em should be stripped, got: {result:?}"
+            "height:0.5px should be stripped, got: {result:?}"
         );
     }
 
@@ -2982,6 +3027,50 @@ Content-Type: text/html\r\n\r\n\
         assert!(
             result.contains("normal text"),
             "font-size:14px should be preserved, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_catches_css_comment_bypass() {
+        let html = r#"<span style="display:/**/none">hidden</span><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden"),
+            "CSS comment bypass should be caught, got: {result:?}"
+        );
+        assert!(result.contains("Visible"));
+    }
+
+    #[test]
+    fn strip_hidden_preserves_em_height() {
+        // 1em ≈ 16px — should NOT be stripped
+        let html = r#"<div style="height:1em">content</div>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            result.contains("content"),
+            "height:1em should not be stripped, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_preserves_rem_font_size() {
+        // 2rem ≈ 32px — should NOT be stripped
+        let html = r#"<span style="font-size:2rem">text</span>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            result.contains("text"),
+            "font-size:2rem should not be stripped, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_hidden_catches_zero_em() {
+        // 0em IS zero regardless of unit
+        let html = r#"<div style="height:0em">hidden</div><p>Visible</p>"#;
+        let result = strip_hidden_elements(html).unwrap();
+        assert!(
+            !result.contains("hidden"),
+            "height:0em should be stripped, got: {result:?}"
         );
     }
 
