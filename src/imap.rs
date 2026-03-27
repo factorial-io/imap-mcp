@@ -41,11 +41,18 @@ pub fn sanitize_html_for_draft(html: &str) -> Result<String, AppError> {
 
 /// Remove elements hidden via CSS and strip `<style>`/`<script>` blocks.
 ///
-/// Uses `lol_html` for proper HTML parsing instead of hand-rolled tokenization.
-/// Targets `display:none`, `visibility:hidden`, `opacity:0`, `font-size:0`,
-/// `height:0`+`overflow:hidden`, off-screen positioning, and `text-indent`
-/// hiding — common prompt-injection vectors in emails.
-/// Remove elements hidden via CSS and strip `<style>`/`<script>` blocks.
+/// **Elements removed entirely** (including text content):
+/// - Inline `display:none` or `visibility:hidden/collapse`
+/// - Elements with classes/IDs that map to hiding rules in `<style>` blocks
+///
+/// **Attributes stripped** (text content preserved):
+/// - `class` attributes (after checking against hidden class set)
+/// - `style` attributes on non-hidden elements (when `strip_all_styles` is true)
+///
+/// Other CSS hiding techniques (`opacity:0`, `font-size:0`, `height:0`, etc.)
+/// are handled by `ammonia_draft`'s `filter_css_properties` on the draft path.
+/// On the reading path, all styles are stripped and `ammonia_reading` handles
+/// the rest — the text becomes visible to the AI regardless.
 ///
 /// When `strip_all_styles` is true (reading path), all `style` attributes are
 /// removed from non-hidden elements. When false (draft path), non-hidden styles
@@ -184,8 +191,10 @@ fn extract_hidden_classes_from_css(css: &str, classes: &mut std::collections::Ha
             // Take the last segment after whitespace (the targeted element, not ancestors)
             let last_segment = simple_selector.split_whitespace().last().unwrap_or("");
             // Extract class names from this segment (could be `.foo.bar`)
-            for part in last_segment.split('.') {
-                // Trim any pseudo-classes, attribute selectors, etc.
+            // Extract class names from this segment (could be `.foo.bar` or `div.foo`).
+            // Skip the first part if it's a tag name (not preceded by '.').
+            let skip = if last_segment.starts_with('.') { 0 } else { 1 };
+            for part in last_segment.split('.').skip(skip) {
                 let name_end = part
                     .find(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
                     .unwrap_or(part.len());
