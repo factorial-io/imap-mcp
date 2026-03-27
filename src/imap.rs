@@ -85,8 +85,13 @@ fn strip_hidden_elements(html: &str) -> Result<String, AppError> {
                     if let Some(style) = el.get_attribute("style") {
                         if is_style_hidden(&style) {
                             el.remove();
+                            return Ok(());
                         }
                     }
+                    // Strip style attributes from all non-hidden elements.
+                    // Ammonia would strip them anyway; doing it here means no
+                    // CSS survives into later pipeline stages.
+                    el.remove_attribute("style");
                     Ok(())
                 }),
             ],
@@ -362,318 +367,25 @@ fn strip_css_comments(s: &str) -> String {
     result
 }
 
-/// Check whether a CSS style value uses techniques to hide content from humans.
+/// Check whether a CSS style value uses `display:none` or `visibility:hidden`.
 ///
-/// Decodes HTML entities first since lol_html returns raw attribute values
-/// without entity decoding (e.g. `display&#58;none` stays as-is).
+/// Only checks for the two most reliable hiding techniques. All other `style`
+/// attributes are stripped entirely by the lol_html handler (and again by ammonia),
+/// so exotic hiding (opacity, font-size, clip, etc.) loses its CSS — the text
+/// becomes visible, which is acceptable for text extraction.
 fn is_style_hidden(style: &str) -> bool {
     let decoded = decode_html_entities_simple(style);
     let decoded = decode_css_escapes(&decoded);
-    let no_ws: String = decoded
+    let s: String = decoded
         .to_lowercase()
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
-    // Strip CSS block comments to prevent display:/**/none bypass.
-    let no_ws = strip_css_comments(&no_ws);
+    let s = strip_css_comments(&s);
 
-    if no_ws.contains("display:none") || no_ws.contains("visibility:hidden") {
-        return true;
-    }
-    // opacity <= 0.05 is effectively invisible to humans
-    if has_small_css_value(&no_ws, "opacity:", 0.05) {
-        return true;
-    }
-    // font-size < 2px is effectively invisible — catches 0, 0.1px, 1px, etc.
-    if has_small_css_value(&no_ws, "font-size:", 2.0) {
-        return true;
-    }
-    // height/max-height <= 1px with overflow:hidden — content is clipped.
-    // Without overflow:hidden, content overflows and remains visible (e.g. <hr style="height:1px">).
-    if (has_small_css_value(&no_ws, "height:", 1.0)
-        || has_small_css_value(&no_ws, "max-height:", 1.0))
-        && has_property_at_boundary(&no_ws, "overflow:hidden")
-    {
-        return true;
-    }
-    if (has_property_at_boundary(&no_ws, "position:absolute")
-        || has_property_at_boundary(&no_ws, "position:fixed"))
-        && has_large_negative_offset(&no_ws)
-    {
-        return true;
-    }
-    if has_large_negative_value(&no_ws, "text-indent:") {
-        return true;
-    }
-    // width:0 or max-width:0 with overflow:hidden hides content horizontally.
-    if (has_small_css_value(&no_ws, "width:", 1.0)
-        || has_small_css_value(&no_ws, "max-width:", 1.0))
-        && has_property_at_boundary(&no_ws, "overflow:hidden")
-    {
-        return true;
-    }
-    // clip-path clips the rendered area — works on elements in normal flow.
-    // clip requires position:absolute/fixed (already checked above with offsets).
-    // Check if any clip-path value is NOT "none" (CSS last-wins, so a later
-    // clip-path:polygon(...) overrides an earlier clip-path:none).
-    if has_non_none_clip_path(&no_ws) || has_property_at_boundary(&no_ws, "clip:rect(") {
-        return true;
-    }
-    // transform-based hiding: only flag specific dangerous patterns.
-    // translate: only large magnitudes (>= 200px) are off-screen hiding.
-    // scale(0)/scaleX(0)/scaleY(0): exactly zero collapses to invisible.
-    // matrix: skip entirely — too many legitimate uses and hard to parse reliably.
-    if has_hiding_transform(&no_ws) {
-        return true;
-    }
-    // Transparent text color — invisible to humans but extracted as text by html2text.
-    if has_property_at_boundary(&no_ws, "color:transparent") {
-        return true;
-    }
-    if has_transparent_color_at_boundary(&no_ws) {
-        return true;
-    }
-    false
-}
-
-/// Check if a CSS property has a small numeric value at a property boundary.
-/// Catches near-zero values like `font-size:0.1px` or `font-size:1px` that are
-/// effectively invisible to humans but render as text in `html2text`.
-///
-/// The threshold comparison only applies to `px` values and unitless values.
-/// For other units (`em`, `rem`, `vh`, `%`, etc.), only exact zero is caught
-/// since unit conversion is not possible without context.
-fn has_small_css_value(no_ws: &str, prop: &str, threshold: f64) -> bool {
-    let mut from = 0;
-    while let Some(pos) = no_ws[from..].find(prop) {
-        let abs = from + pos;
-        if abs == 0 || no_ws.as_bytes()[abs - 1] == b';' {
-            let value = &no_ws[abs + prop.len()..];
-            let num_end = value
-                .find(|c: char| c != '.' && !c.is_ascii_digit())
-                .unwrap_or(value.len());
-            if num_end > 0 {
-                if let Ok(v) = value[..num_end].parse::<f64>() {
-                    let unit = &value[num_end..].split(';').next().unwrap_or("");
-                    if v == 0.0 {
-                        // Zero is zero regardless of unit
-                        return true;
-                    }
-                    // Apply threshold based on unit type:
-                    // - px/unitless: use threshold directly
-                    // - em/rem: ≤ 0.15 (≈ 2.4px at 16px base)
-                    // - vh/vw/%: ≤ 0.5 (sub-pixel on most viewports)
-                    let is_small = match *unit {
-                        "" | "px" => v <= threshold,
-                        "em" | "rem" => v <= 0.15,
-                        "vh" | "vw" | "%" => v <= 0.5,
-                        _ => false,
-                    };
-                    if is_small {
-                        return true;
-                    }
-                }
-            }
-        }
-        from = abs + prop.len();
-    }
-    false
-}
-
-/// Check if any positioning property has a large negative value (>= 200px).
-fn has_large_negative_offset(no_ws: &str) -> bool {
-    for prop in &[
-        "left:-",
-        "top:-",
-        "right:-",
-        "bottom:-",
-        "margin-left:-",
-        "margin-top:-",
-    ] {
-        let mut search = 0;
-        while let Some(pos) = no_ws[search..].find(prop) {
-            let abs = search + pos;
-            if (abs == 0 || no_ws.as_bytes()[abs - 1] == b';')
-                && parse_px_digits(&no_ws[abs + prop.len()..]) >= 200
-            {
-                return true;
-            }
-            search = abs + prop.len();
-        }
-    }
-    false
-}
-
-/// Check if a CSS property has a large negative value (>= 200px).
-fn has_large_negative_value(no_ws: &str, prop: &str) -> bool {
-    let mut search = 0;
-    while let Some(pos) = no_ws[search..].find(prop) {
-        let abs = search + pos;
-        if abs == 0 || no_ws.as_bytes()[abs - 1] == b';' {
-            let after = &no_ws[abs + prop.len()..];
-            if let Some(rest) = after.strip_prefix('-') {
-                if parse_px_digits(rest) >= 200 {
-                    return true;
-                }
-            }
-        }
-        search = abs + prop.len();
-    }
-    false
-}
-
-/// Check if a CSS property:value pair appears at a property boundary.
-/// Prevents `text-overflow:hidden` from matching a check for `overflow:hidden`.
-fn has_property_at_boundary(no_ws: &str, prop_value: &str) -> bool {
-    let mut search = 0;
-    while let Some(pos) = no_ws[search..].find(prop_value) {
-        let abs = search + pos;
-        if abs == 0 || no_ws.as_bytes()[abs - 1] == b';' {
-            return true;
-        }
-        search = abs + prop_value.len();
-    }
-    false
-}
-
-/// Check if a CSS color value is transparent (zero alpha).
-/// Handles `transparent`, rgba/hsla/rgb function notation with zero alpha,
-/// and hex alpha formats (#RRGGBBAA, #RGBA).
-fn is_transparent_css_color(value: &str) -> bool {
-    if value == "transparent" {
-        return true;
-    }
-    // Check hex alpha formats
-    if let Some(hex) = value.strip_prefix('#') {
-        if hex.len() == 8 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return &hex[6..] == "00";
-        }
-        if hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return &hex[3..] == "0";
-        }
-    }
-    // Extract alpha channel (last value after , or /)
-    let alpha = if let Some(pos) = value.rfind(',') {
-        &value[pos + 1..value.len().saturating_sub(1)]
-    } else if let Some(pos) = value.rfind('/') {
-        &value[pos + 1..value.len().saturating_sub(1)]
-    } else {
-        return false;
-    };
-    let alpha_clean = alpha.trim_end_matches('%');
-    alpha_clean.parse::<f64>().ok().is_some_and(|v| {
-        if alpha.ends_with('%') {
-            v <= 5.0
-        } else {
-            v <= 0.05
-        }
-    })
-}
-
-/// Check if a `transform` value hides content.
-/// Only flags translate with large values (>= 200px) and scale exactly zero.
-fn has_hiding_transform(no_ws: &str) -> bool {
-    // Must be at a property boundary to avoid matching inside -webkit-transform
-    if !has_property_at_boundary(no_ws, "transform:") {
-        return false;
-    }
-    // Extract the transform value
-    let prop = "transform:";
-    let mut search = 0;
-    while let Some(pos) = no_ws[search..].find(prop) {
-        let abs = search + pos;
-        if abs == 0 || no_ws.as_bytes()[abs - 1] == b';' {
-            let value = &no_ws[abs + prop.len()..];
-            let end = value.find(';').unwrap_or(value.len());
-            let val = &value[..end];
-
-            // scale(0) / scaleX(0) / scaleY(0) — exactly zero
-            if val.contains("scale(0)") || val.contains("scalex(0)") || val.contains("scaley(0)") {
-                return true;
-            }
-
-            // translate with large values — check for numeric args >= 200
-            if val.contains("translate") {
-                // Extract values from translate(...), translateX(...), translateY(...)
-                for func in ["translate(", "translatex(", "translatey("] {
-                    if let Some(start) = val.find(func) {
-                        let args_start = start + func.len();
-                        if let Some(paren_end) = val[args_start..].find(')') {
-                            let args = &val[args_start..args_start + paren_end];
-                            // Check each comma-separated arg for large negative/positive value
-                            for arg in args.split(',') {
-                                let arg = arg.trim_start_matches('-');
-                                if parse_px_digits(arg) >= 200 {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        search = abs + prop.len();
-    }
-    false
-}
-
-/// Check if the last boundary-anchored `clip-path:` declaration has a non-`none` value.
-fn has_non_none_clip_path(no_ws: &str) -> bool {
-    let prop = "clip-path:";
-    let mut last_value: Option<&str> = None;
-    let mut search = 0;
-    while let Some(pos) = no_ws[search..].find(prop) {
-        let abs = search + pos;
-        if abs == 0 || no_ws.as_bytes()[abs - 1] == b';' {
-            let value_start = abs + prop.len();
-            let value_end = no_ws[value_start..]
-                .find(';')
-                .map(|p| value_start + p)
-                .unwrap_or(no_ws.len());
-            last_value = Some(&no_ws[value_start..value_end]);
-        }
-        search = abs + prop.len();
-    }
-    last_value.is_some_and(|v| v != "none")
-}
-
-/// Check if any boundary-anchored `color:` declaration has a transparent value.
-/// Walks all boundary-anchored occurrences to avoid matching `color:` inside
-/// `background-color:`.
-fn has_transparent_color_at_boundary(no_ws: &str) -> bool {
-    let prop = "color:";
-    let mut search = 0;
-    while let Some(pos) = no_ws[search..].find(prop) {
-        let abs = search + pos;
-        if abs == 0 || no_ws.as_bytes()[abs - 1] == b';' {
-            let value_start = abs + prop.len();
-            let value_end = no_ws[value_start..]
-                .find(';')
-                .map(|p| value_start + p)
-                .unwrap_or(no_ws.len());
-            if is_transparent_css_color(&no_ws[value_start..value_end]) {
-                return true;
-            }
-        }
-        search = abs + prop.len();
-    }
-    false
-}
-
-/// Parse leading numeric value (including fractional part) as a pixel value.
-/// Rounds up so 199.9 → 200, avoiding threshold bypasses.
-/// Returns 0 for empty/non-numeric input, u32::MAX on overflow.
-fn parse_px_digits(s: &str) -> u32 {
-    let num_end = s
-        .find(|c: char| c != '.' && !c.is_ascii_digit())
-        .unwrap_or(s.len());
-    if num_end == 0 {
-        return 0;
-    }
-    s[..num_end]
-        .parse::<f64>()
-        .map(|v| v.ceil() as u32)
-        .unwrap_or(u32::MAX)
+    s.contains("display:none")
+        || s.contains("visibility:hidden")
+        || s.contains("visibility:collapse")
 }
 
 /// Tags allowed in both draft and reading sanitization.
@@ -852,10 +564,17 @@ fn is_zero_value(value: &str) -> bool {
 fn is_large_negative(value: &str) -> bool {
     let trimmed = value.trim().to_lowercase();
     if let Some(rest) = trimmed.strip_prefix('-') {
-        parse_px_digits(rest) >= 200
-    } else {
-        false
+        let num_end = rest
+            .find(|c: char| c != '.' && !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if num_end > 0 {
+            return rest[..num_end]
+                .parse::<f64>()
+                .ok()
+                .is_some_and(|v| v >= 200.0);
+        }
     }
+    false
 }
 
 /// Split CSS declarations on `;`, respecting quoted strings and parentheses.
@@ -2829,7 +2548,6 @@ Content-Type: text/html\r\n\r\n\
 
     #[test]
     fn strip_hidden_preserves_visible_styled_content() {
-        // Legitimate styling (color, font-size, etc.) should be preserved
         let html = r#"<p style="color:red">Styled text</p><span style="display:none">hidden</span><p>Normal</p>"#;
         let result = strip_hidden_elements(html).unwrap();
         assert!(
@@ -2838,17 +2556,10 @@ Content-Type: text/html\r\n\r\n\
         );
         assert!(result.contains("Normal"));
         assert!(!result.contains("hidden"));
-    }
-
-    #[test]
-    fn strip_hidden_catches_opacity_zero() {
-        let html = r#"<span style="opacity:0">invisible</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
         assert!(
-            !result.contains("invisible"),
-            "opacity:0 should be stripped, got: {result:?}"
+            !result.contains("style="),
+            "Style attributes should be stripped, got: {result:?}"
         );
-        assert!(result.contains("Visible"));
     }
 
     #[test]
@@ -2857,78 +2568,12 @@ Content-Type: text/html\r\n\r\n\
         let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("half visible"),
-            "opacity:0.5 should be kept, got: {result:?}"
+            "Content should be preserved, got: {result:?}"
         );
-    }
-
-    #[test]
-    fn strip_hidden_catches_opacity_zero_point_zero() {
-        let html = r#"<span style="opacity:0.0">hidden</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
         assert!(
-            !result.contains("hidden"),
-            "opacity:0.0 should be stripped, got: {result:?}"
+            !result.contains("style="),
+            "Style attribute should be stripped, got: {result:?}"
         );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
-    fn strip_hidden_catches_font_size_zero() {
-        let html = r#"<span style="font-size:0px">tiny</span><p>Normal</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("tiny"),
-            "font-size:0px should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Normal"));
-    }
-
-    #[test]
-    fn strip_hidden_catches_offscreen_positioning() {
-        let html = r#"<div style="position:absolute;left:-9999px">offscreen</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("offscreen"),
-            "off-screen should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
-    fn strip_hidden_catches_text_indent() {
-        let html = r#"<div style="text-indent:-9999px">hidden</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("hidden"),
-            "text-indent should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
-    fn strip_hidden_catches_overflow_hidden_with_zero_height() {
-        let html = r#"<div style="height:0;overflow:hidden">clipped</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("clipped"),
-            "height:0+overflow:hidden should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
-    fn strip_hidden_catches_height_zero_with_units() {
-        for unit in &["px", "em", "rem", "vh", "%"] {
-            let html = format!(
-                r#"<div style="height:0{unit};overflow:hidden">hidden</div><p>Visible</p>"#
-            );
-            let result = strip_hidden_elements(&html).unwrap();
-            assert!(
-                !result.contains("hidden"),
-                "height:0{unit}+overflow:hidden should be stripped, got: {result:?}"
-            );
-            assert!(result.contains("Visible"));
-        }
     }
 
     #[test]
@@ -3061,71 +2706,6 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_preserves_min_height_zero() {
-        // min-height:0 with overflow:hidden is a legitimate animation pattern
-        let html =
-            r#"<div style="min-height:0;overflow:hidden">accordion content</div><p>After</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            result.contains("accordion content"),
-            "min-height:0 should not be stripped, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn strip_hidden_catches_subpixel_height_px() {
-        // height:0.5px is sub-pixel and should be stripped
-        let html = r#"<div style="height:0.5px;overflow:hidden">hidden content</div><p>After</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("hidden content"),
-            "height:0.5px should be stripped, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn strip_hidden_preserves_normal_height() {
-        let html = r#"<div style="height:2em">visible content</div><p>After</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            result.contains("visible content"),
-            "height:2em should not be stripped, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn strip_hidden_preserves_small_negative_offset() {
-        // Small negative margin-left is a centering pattern, not hiding
-        let html = r#"<div style="position:absolute;left:50%;margin-left:-100px">centered</div><p>After</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            result.contains("centered"),
-            "Small negative offset should not be stripped, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn strip_hidden_catches_large_negative_offset() {
-        let html = r#"<div style="position:absolute;left:-9999px">hidden</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("hidden"),
-            "Large negative offset should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
-    fn strip_hidden_preserves_small_text_indent() {
-        let html = r#"<div style="text-indent:-10px">slightly indented</div>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            result.contains("slightly indented"),
-            "Small text-indent should not be stripped, got: {result:?}"
-        );
-    }
-
-    #[test]
     fn strip_hidden_catches_html_entity_encoded_style() {
         // &#58; is HTML entity for ':'
         let html = r#"<span style="display&#58;none">hidden via entity</span><p>Visible</p>"#;
@@ -3163,12 +2743,11 @@ Content-Type: text/html\r\n\r\n\
 
     #[test]
     fn strip_hidden_no_false_positive_on_text_overflow_hidden() {
-        // text-overflow:hidden is a valid CSS truncation pattern, not a hiding technique
         let html = r#"<div style="height:20px;text-overflow:hidden">truncated</div><p>After</p>"#;
         let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("truncated"),
-            "text-overflow:hidden without overflow:hidden should not be stripped, got: {result:?}"
+            "Content should be preserved, got: {result:?}"
         );
     }
 
@@ -3184,24 +2763,12 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_catches_right_negative_offset() {
-        let html = r#"<div style="position:absolute;right:-9999px">hidden</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("hidden"),
-            "right:-9999px should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
     fn strip_hidden_no_false_positive_on_padding_left() {
-        // padding-left:-200px is not an off-screen technique
         let html = r#"<div style="position:absolute;padding-left:-200px">content</div>"#;
         let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("content"),
-            "padding-left should not trigger offset detection, got: {result:?}"
+            "padding-left should not trigger stripping, got: {result:?}"
         );
     }
 
@@ -3287,28 +2854,6 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_catches_height_zero_point_zero() {
-        let html = r#"<div style="height:0.0;overflow:hidden">clipped</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("clipped"),
-            "height:0.0+overflow:hidden should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
-    fn strip_hidden_catches_height_zero_point_zero_em() {
-        let html = r#"<div style="height:0.00em;overflow:hidden">clipped</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("clipped"),
-            "height:0.00em+overflow:hidden should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
     fn filter_css_allows_safe_properties() {
         let css = "font-size: 14px; text-align: center; padding: 10px";
         let result = filter_css_properties(css);
@@ -3382,34 +2927,16 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_catches_near_zero_font_size() {
-        let html = r#"<span style="font-size:0.1px">tiny injection</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("tiny injection"),
-            "font-size:0.1px should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
-    fn strip_hidden_catches_one_px_font_size() {
-        let html = r#"<span style="font-size:1px">tiny</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("tiny"),
-            "font-size:1px should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
     fn strip_hidden_preserves_normal_font_size() {
         let html = r#"<span style="font-size:14px">normal text</span>"#;
         let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("normal text"),
-            "font-size:14px should be preserved, got: {result:?}"
+            "font-size:14px content should be preserved, got: {result:?}"
+        );
+        assert!(
+            !result.contains("style="),
+            "Style attribute should be stripped, got: {result:?}"
         );
     }
 
@@ -3420,61 +2947,6 @@ Content-Type: text/html\r\n\r\n\
         assert!(
             !result.contains("hidden"),
             "CSS comment bypass should be caught, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
-    fn strip_hidden_preserves_em_height() {
-        // 1em ≈ 16px — should NOT be stripped
-        let html = r#"<div style="height:1em">content</div>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            result.contains("content"),
-            "height:1em should not be stripped, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn strip_hidden_preserves_rem_font_size() {
-        // 2rem ≈ 32px — should NOT be stripped
-        let html = r#"<span style="font-size:2rem">text</span>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            result.contains("text"),
-            "font-size:2rem should not be stripped, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn strip_hidden_catches_zero_em() {
-        // 0em IS zero regardless of unit — needs overflow:hidden to clip
-        let html = r#"<div style="height:0em;overflow:hidden">hidden</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("hidden"),
-            "height:0em should be stripped, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn strip_hidden_catches_zero_width_overflow_hidden() {
-        let html = r#"<div style="width:0;overflow:hidden">hidden</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("hidden"),
-            "width:0+overflow:hidden should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
-    fn strip_hidden_catches_max_width_zero_overflow_hidden() {
-        let html = r#"<div style="max-width:0px;overflow:hidden">hidden</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("hidden"),
-            "max-width:0px+overflow:hidden should be stripped, got: {result:?}"
         );
         assert!(result.contains("Visible"));
     }
@@ -3492,48 +2964,13 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_catches_clip_path() {
-        let html = r#"<span style="clip-path:inset(100%)">hidden</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("hidden"),
-            "clip-path should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
-    fn strip_hidden_catches_clip_rect() {
-        let html =
-            r#"<span style="clip:rect(0,0,0,0);position:absolute">hidden</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("hidden"),
-            "clip:rect should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
     fn strip_hidden_height_1px_without_overflow_preserved() {
-        // height:1px without overflow:hidden — content overflows and is visible
         let html = r#"<hr style="height:1px"><p>After</p>"#;
         let result = strip_hidden_elements(html).unwrap();
         assert!(
             result.contains("After"),
-            "height:1px without overflow:hidden should not strip content, got: {result:?}"
+            "Content should be preserved, got: {result:?}"
         );
-    }
-
-    #[test]
-    fn strip_hidden_height_1px_with_overflow_hidden_stripped() {
-        let html = r#"<div style="height:1px;overflow:hidden">hidden</div><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("hidden"),
-            "height:1px+overflow:hidden should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
     }
 
     #[test]
@@ -3570,36 +3007,22 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn strip_hidden_catches_transform_translate() {
-        let html = r#"<span style="transform:translateX(-9999px)">hidden</span><p>Visible</p>"#;
+    fn strip_hidden_strips_style_attributes_from_non_hidden_elements() {
+        // Exotic hiding techniques (opacity, font-size, etc.) have their style
+        // attribute stripped rather than removing the element. Content is preserved.
+        let html = r#"<span style="opacity:0">text1</span><span style="font-size:0">text2</span><div style="height:0;overflow:hidden">text3</div><p style="color:red">visible</p>"#;
         let result = strip_hidden_elements(html).unwrap();
         assert!(
-            !result.contains("hidden"),
-            "transform:translateX should be stripped, got: {result:?}"
+            result.contains("text1"),
+            "Content should be preserved when style is stripped, got: {result:?}"
         );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
-    fn strip_hidden_catches_transparent_color() {
-        let html = r#"<span style="color:transparent">hidden</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
+        assert!(result.contains("text2"));
+        assert!(result.contains("text3"));
+        assert!(result.contains("visible"));
         assert!(
-            !result.contains("hidden"),
-            "color:transparent should be stripped, got: {result:?}"
+            !result.contains("style="),
+            "All style attributes should be stripped, got: {result:?}"
         );
-        assert!(result.contains("Visible"));
-    }
-
-    #[test]
-    fn strip_hidden_catches_rgba_zero_alpha_color() {
-        let html = r#"<span style="color:rgba(0,0,0,0)">hidden</span><p>Visible</p>"#;
-        let result = strip_hidden_elements(html).unwrap();
-        assert!(
-            !result.contains("hidden"),
-            "color:rgba(0,0,0,0) should be stripped, got: {result:?}"
-        );
-        assert!(result.contains("Visible"));
     }
 
     // --- Address list splitting tests ---
