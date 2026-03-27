@@ -302,7 +302,7 @@ fn is_style_hidden(style: &str) -> bool {
         || no_ws.contains("transform:scale(0")
         || no_ws.contains("transform:scalex(0")
         || no_ws.contains("transform:scaley(0")
-        || no_ws.contains("transform:matrix(0,")
+        || no_ws.contains("transform:matrix(")
     {
         return true;
     }
@@ -432,7 +432,13 @@ fn is_transparent_css_color(value: &str) -> bool {
         return false;
     };
     let alpha_clean = alpha.trim_end_matches('%');
-    alpha_clean.parse::<f64>().ok().is_some_and(|v| v == 0.0)
+    alpha_clean.parse::<f64>().ok().is_some_and(|v| {
+        if alpha.ends_with('%') {
+            v <= 5.0
+        } else {
+            v <= 0.05
+        }
+    })
 }
 
 /// Check if the *last* boundary-anchored `clip-path:` declaration has a value
