@@ -580,10 +580,21 @@ fn is_transparent_alpha(value: &str) -> bool {
             return &hex[3..] == "0";
         }
     }
-    // Extract alpha from rgba/hsla/rgb (last value after , or /)
-    let alpha = if let Some(pos) = value.rfind(',') {
+    // Distinguish 3-arg rgb(r,g,b) / hsl(h,s,l) (no alpha) from 4-arg rgba/hsla.
+    // 3-arg forms have exactly 2 commas and no slash — no alpha channel, not transparent.
+    let comma_count = value.chars().filter(|&c| c == ',').count();
+    let slash_count = value.chars().filter(|&c| c == '/').count();
+
+    if comma_count == 2 && slash_count == 0 {
+        return false;
+    }
+
+    let alpha = if slash_count > 0 {
+        // Modern CSS4: rgb(r g b / a) or hsl(h s l / a)
+        let pos = value.rfind('/').unwrap();
         &value[pos + 1..value.len().saturating_sub(1)]
-    } else if let Some(pos) = value.rfind('/') {
+    } else if let Some(pos) = value.rfind(',') {
+        // Legacy rgba(r,g,b,a) / hsla(h,s,l,a) — 3+ commas
         &value[pos + 1..value.len().saturating_sub(1)]
     } else {
         return false;
