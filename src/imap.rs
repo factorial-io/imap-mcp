@@ -60,8 +60,10 @@ pub fn sanitize_html_for_draft(html: &str) -> Result<String, AppError> {
 fn strip_hidden_elements(html: &str, strip_all_styles: bool) -> Result<String, AppError> {
     // Two-pass approach: first extract hidden class names from <style> blocks,
     // then strip those elements in a second pass.
-    let hidden_classes = std::sync::Arc::new(extract_hidden_classes(html)?);
-    let hc = hidden_classes.clone();
+    // Hidden set contains class names and IDs (prefixed with #) from <style> blocks.
+    let hidden = std::sync::Arc::new(extract_hidden_classes(html)?);
+    let hc = hidden.clone();
+    let hi = hidden.clone();
 
     let result = rewrite_str(
         html,
@@ -93,6 +95,16 @@ fn strip_hidden_elements(html: &str, strip_all_styles: bool) -> Result<String, A
                     el.remove_attribute("class");
                     Ok(())
                 }),
+                // If the element has an ID associated with a hiding rule, remove it.
+                element!("*[id]", |el| {
+                    if let Some(id_attr) = el.get_attribute("id") {
+                        if hi.contains(&format!("#{}", id_attr.to_lowercase())) {
+                            el.remove();
+                            return Ok(());
+                        }
+                    }
+                    Ok(())
+                }),
                 element!("*[style]", |el| {
                     if let Some(style) = el.get_attribute("style") {
                         if is_style_hidden(&style) {
@@ -112,7 +124,7 @@ fn strip_hidden_elements(html: &str, strip_all_styles: bool) -> Result<String, A
         },
     );
     // Drop Arc before returning so the temporary outlives the closures
-    drop(hidden_classes);
+    drop(hidden);
     result.map_err(|e| AppError::Imap(format!("failed to sanitize HTML: {e}")))
 }
 
@@ -210,6 +222,16 @@ fn extract_hidden_classes_from_css(css: &str, classes: &mut std::collections::Ha
                 let name = &part[..name_end];
                 if !name.is_empty() {
                     classes.insert(name.to_string());
+                }
+            }
+            // Extract IDs (#foo)
+            for part in last_segment.split('#').skip(1) {
+                let name_end = part
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                    .unwrap_or(part.len());
+                let name = &part[..name_end];
+                if !name.is_empty() {
+                    classes.insert(format!("#{name}"));
                 }
             }
         }
@@ -310,7 +332,9 @@ fn decode_entity(entity: &str) -> Option<char> {
         "gt" => Some('>'),
         "quot" => Some('"'),
         "apos" => Some('\''),
-        "nbsp" => Some(' '),
+        "nbsp" | "ensp" | "emsp" | "thinsp" => Some(' '),
+        "Tab" | "tab" => Some('\t'),
+        "NewLine" | "newline" => Some('\n'),
         _ => None,
     }
 }
