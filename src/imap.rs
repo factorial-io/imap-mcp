@@ -735,16 +735,10 @@ fn filter_css_properties(style: &str) -> String {
 ///
 /// Removes hidden elements (prompt-injection vector), sanitizes through ammonia,
 /// then converts to plain text via `html2text`.
-fn html_to_safe_text(html: &str) -> String {
-    let stripped = match strip_hidden_elements(html) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("HTML sanitization failed: {e}");
-            return "(HTML body could not be processed)".to_string();
-        }
-    };
+fn html_to_safe_text(html: &str) -> Result<String, AppError> {
+    let stripped = strip_hidden_elements(html)?;
     let sanitized = ammonia_reading().clean(&stripped).to_string();
-    html2text::from_read(sanitized.as_bytes(), 80)
+    Ok(html2text::from_read(sanitized.as_bytes(), 80))
 }
 
 /// Maximum attachment size we'll return (25 MB).
@@ -941,7 +935,7 @@ impl ImapConnection {
         // Falls back gracefully for malformed emails (spam, old messages, etc.).
         let (body, attachments, references, message_id) = match mailparse::parse_mail(body_raw) {
             Ok(parsed) => {
-                let extracted = extract_body_from_parsed(&parsed);
+                let extracted = extract_body_from_parsed(&parsed)?;
                 let mut attachments = Vec::new();
                 collect_attachment_infos(&parsed, &mut attachments);
                 let references = extract_header_from_parsed(&parsed.headers, "References");
@@ -1688,41 +1682,43 @@ struct ExtractedBody {
 #[cfg(test)]
 fn extract_body(raw: &[u8]) -> String {
     match mailparse::parse_mail(raw) {
-        Ok(parsed) => extract_body_from_parsed(&parsed).text,
+        Ok(parsed) => extract_body_from_parsed(&parsed)
+            .map(|e| e.text)
+            .unwrap_or_else(|_| String::from_utf8_lossy(raw).to_string()),
         Err(_) => String::from_utf8_lossy(raw).to_string(),
     }
 }
 
-fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
+fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> Result<ExtractedBody, AppError> {
     let ct = parsed.ctype.mimetype.to_lowercase();
 
     // Leaf node: return text content directly
     if !ct.starts_with("multipart/") {
         if ct == "text/plain" {
             if let Ok(body) = parsed.get_body() {
-                return ExtractedBody {
+                return Ok(ExtractedBody {
                     text: body,
                     #[cfg(test)]
                     raw_html: None,
-                };
+                });
             }
         }
         if ct == "text/html" {
             if let Ok(body) = parsed.get_body() {
-                let text = html_to_safe_text(&body);
-                return ExtractedBody {
+                let text = html_to_safe_text(&body)?;
+                return Ok(ExtractedBody {
                     text,
                     #[cfg(test)]
                     raw_html: Some(body),
-                };
+                });
             }
         }
         // Skip non-text parts (signatures, attachments, etc.)
-        return ExtractedBody {
+        return Ok(ExtractedBody {
             text: String::new(),
             #[cfg(test)]
             raw_html: None,
-        };
+        });
     }
 
     // Multipart: recurse into subparts, prefer text/plain over text/html
@@ -1741,7 +1737,7 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
             }
         } else if sub_ct.starts_with("multipart/") {
             // Recurse into nested multipart (e.g. multipart/signed → multipart/alternative)
-            let nested = extract_body_from_parsed(sub);
+            let nested = extract_body_from_parsed(sub)?;
             if !nested.text.is_empty() && plain.is_empty() {
                 plain = nested.text;
             }
@@ -1749,7 +1745,7 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
     }
 
     if !plain.is_empty() {
-        return ExtractedBody {
+        return Ok(ExtractedBody {
             text: plain,
             #[cfg(test)]
             raw_html: if html_raw.is_empty() {
@@ -1757,33 +1753,33 @@ fn extract_body_from_parsed(parsed: &mailparse::ParsedMail) -> ExtractedBody {
             } else {
                 Some(html_raw)
             },
-        };
+        });
     }
     if !html_raw.is_empty() {
-        let text = html_to_safe_text(&html_raw);
-        return ExtractedBody {
+        let text = html_to_safe_text(&html_raw)?;
+        return Ok(ExtractedBody {
             text,
             #[cfg(test)]
             raw_html: Some(html_raw),
-        };
+        });
     }
 
     // Last resort: top-level body (preamble text)
     if let Ok(body) = parsed.get_body() {
         if !body.trim().is_empty() && !body.contains("S/MIME") {
-            return ExtractedBody {
+            return Ok(ExtractedBody {
                 text: body,
                 #[cfg(test)]
                 raw_html: None,
-            };
+            });
         }
     }
 
-    ExtractedBody {
+    Ok(ExtractedBody {
         text: "(no text content)".to_string(),
         #[cfg(test)]
         raw_html: None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -2488,7 +2484,7 @@ These are my notes.\r\n\
             parsed.ctype.mimetype.contains("multipart"),
             "Top-level should be multipart"
         );
-        let extracted = extract_body_from_parsed(&parsed);
+        let extracted = extract_body_from_parsed(&parsed).unwrap();
         assert!(
             extracted.text.contains("Plain text version"),
             "Should extract plain text body"
@@ -2514,7 +2510,7 @@ Content-Type: text/html\r\n\r\n\
 <p>HTML body</p>\r\n\
 --bound--";
         let parsed = mailparse::parse_mail(raw).unwrap();
-        let extracted = extract_body_from_parsed(&parsed);
+        let extracted = extract_body_from_parsed(&parsed).unwrap();
         assert!(extracted.text.contains("Plain text body"));
         assert!(extracted.raw_html.is_some());
         assert!(extracted.raw_html.unwrap().contains("<p>HTML body</p>"));
@@ -2524,7 +2520,7 @@ Content-Type: text/html\r\n\r\n\
     fn extract_html_from_html_only_email() {
         let raw = b"Content-Type: text/html\r\n\r\n<p>Only HTML</p>";
         let parsed = mailparse::parse_mail(raw).unwrap();
-        let extracted = extract_body_from_parsed(&parsed);
+        let extracted = extract_body_from_parsed(&parsed).unwrap();
         assert!(extracted.raw_html.is_some());
         assert!(extracted
             .raw_html
@@ -2539,7 +2535,7 @@ Content-Type: text/html\r\n\r\n\
     fn extract_no_html_from_plain_only_email() {
         let raw = b"Content-Type: text/plain\r\n\r\nJust plain text";
         let parsed = mailparse::parse_mail(raw).unwrap();
-        let extracted = extract_body_from_parsed(&parsed);
+        let extracted = extract_body_from_parsed(&parsed).unwrap();
         assert!(extracted.text.contains("Just plain text"));
         assert!(extracted.raw_html.is_none());
     }
@@ -2591,7 +2587,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn html_to_safe_text_strips_scripts() {
         let html = r#"<p>Hello</p><script>evil()</script>"#;
-        let text = html_to_safe_text(html);
+        let text = html_to_safe_text(html).unwrap();
         assert!(text.contains("Hello"));
         assert!(!text.contains("evil"));
         assert!(!text.contains("<script>"));
@@ -2600,7 +2596,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn html_to_safe_text_strips_hidden_elements() {
         let html = r#"<p>Visible</p><span style="display:none">hidden injection</span>"#;
-        let text = html_to_safe_text(html);
+        let text = html_to_safe_text(html).unwrap();
         assert!(text.contains("Visible"));
         assert!(
             !text.contains("hidden injection"),
@@ -2612,7 +2608,7 @@ Content-Type: text/html\r\n\r\n\
     fn html_to_safe_text_strips_visibility_hidden() {
         let html =
             r#"<p>Hello</p><div style="visibility: hidden">secret payload</div><p>World</p>"#;
-        let text = html_to_safe_text(html);
+        let text = html_to_safe_text(html).unwrap();
         assert!(text.contains("Hello"));
         assert!(text.contains("World"));
         assert!(
@@ -2624,7 +2620,7 @@ Content-Type: text/html\r\n\r\n\
     #[test]
     fn html_to_safe_text_strips_nested_hidden_elements() {
         let html = r#"<div style="display:none"><p>Nested <strong>hidden</strong> content</p></div><p>Visible</p>"#;
-        let text = html_to_safe_text(html);
+        let text = html_to_safe_text(html).unwrap();
         assert!(text.contains("Visible"));
         assert!(
             !text.contains("hidden"),
