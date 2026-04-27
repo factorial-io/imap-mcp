@@ -240,8 +240,14 @@ impl ImapMcpServer {
             .clone()
             .unwrap_or_else(|| format!("attachment_{}", params.attachment_index));
 
-        // 1. Try text extraction for supported document formats (PDF, DOCX, XLSX, PPTX)
-        match extract::extract_text(&attachment.data, mime) {
+        // 1. Try text extraction for supported document formats. In-memory
+        //    extractors first (PDF, DOCX, XLSX, PPTX); fall through to
+        //    subprocess-based extractors for legacy formats (DOC via antiword).
+        let extraction = match extract::extract_text(&attachment.data, mime) {
+            Ok(None) => extract::extract_text_subprocess(&attachment.data, mime).await,
+            other => other,
+        };
+        match extraction {
             Ok(Some(raw_text)) => {
                 let format_label = extract::mime_to_format_label(mime);
                 let extracted = extract::build_extracted(raw_text, format_label);

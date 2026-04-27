@@ -13,7 +13,7 @@ RUN cargo build --release && strip target/release/imap-mcp
 FROM debian:bookworm-slim
 LABEL org.opencontainers.image.source="https://github.com/factorial-io/imap-mcp"
 
-RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/* \
+RUN apt-get update && apt-get install -y ca-certificates libssl3 antiword && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home appuser
 
 COPY --from=builder /app/target/release/imap-mcp /usr/local/bin/imap-mcp

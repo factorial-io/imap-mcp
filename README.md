@@ -14,6 +14,23 @@ Users authenticate via their OIDC provider (e.g. GitLab, Keycloak, Auth0), enter
 - An IMAP mail server (TLS, port 993)
 - Traefik reverse proxy (for HTTPS) or equivalent
 
+## System dependencies
+
+Some attachment formats are extracted by shelling out to external binaries.
+Install them on the host where the server runs:
+
+| Format | Binary | Install |
+| --- | --- | --- |
+| Legacy `.doc` (Word 97-2003) | `antiword` | `apt install antiword` (Debian/Ubuntu) |
+
+If `antiword` is not on `PATH`, `.doc` attachments are returned as metadata
+only and the server logs a clear "extractor not installed" error. PDF, DOCX,
+XLSX, PPTX, and modern formats are handled natively and require nothing extra.
+
+LibreOffice (`soffice --headless --convert-to txt`) is a heavier alternative
+that also handles `.doc` and many other legacy formats; it is not wired up
+by default but can be substituted by users who already run it.
+
 ## OIDC Provider Setup
 
 Create an OAuth/OIDC application in your identity provider:

@@ -23,6 +23,14 @@ pub enum ExtractError {
     TooManyZipEntries(usize),
     #[error("no text content found")]
     NoContent,
+    #[error(
+        "required extractor binary `{0}` not found on PATH; install with `apt install {0}` or `brew install {0}`"
+    )]
+    ExtractorNotInstalled(&'static str),
+    #[error("not a Microsoft Compound Document (.doc) file")]
+    InvalidDocMagic,
+    #[error("extractor `{0}` timed out after {1}s")]
+    ExtractorTimeout(&'static str, u64),
     #[error("{0}")]
     Other(String),
 }
@@ -48,6 +56,7 @@ pub fn mime_to_format_label(mime: &str) -> &str {
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "DOCX",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "XLSX",
         "application/vnd.openxmlformats-officedocument.presentationml.presentation" => "PPTX",
+        "application/msword" => "DOC",
         other => other,
     }
 }
@@ -416,6 +425,121 @@ fn extract_pptx(data: &[u8]) -> Result<String, ExtractError> {
     Ok(text)
 }
 
+// ---------------------------------------------------------------------------
+// Subprocess-based extractors (legacy formats)
+// ---------------------------------------------------------------------------
+
+/// OLE Compound File (legacy MS Office) magic bytes.
+const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+/// Hard cap for how long a subprocess extractor may run before being killed.
+const SUBPROCESS_TIMEOUT_SECS: u64 = 30;
+
+fn is_ole_compound_doc(data: &[u8]) -> bool {
+    data.starts_with(&OLE_MAGIC)
+}
+
+/// Async dispatch for formats that require shelling out to an external binary.
+///
+/// Returns `Ok(None)` for any MIME the subprocess path doesn't handle, so the
+/// caller can fall through to its existing "no extraction available" branch.
+/// Today this only covers `application/msword` (legacy `.doc`) via `antiword`.
+/// LibreOffice (`soffice --headless --convert-to txt`) is a heavier alternative
+/// that callers can wire up themselves if antiword is unavailable.
+pub async fn extract_text_subprocess(
+    data: &[u8],
+    mime_type: &str,
+) -> Result<Option<String>, ExtractError> {
+    match mime_type {
+        "application/msword" => extract_doc(data).await.map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Extract text from a legacy `.doc` (Word 97-2003 / OLE Compound Document) by
+/// shelling out to `antiword`. The bytes are written to a temporary file
+/// because antiword takes a file path, not stdin.
+async fn extract_doc(data: &[u8]) -> Result<String, ExtractError> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    if !is_ole_compound_doc(data) {
+        return Err(ExtractError::InvalidDocMagic);
+    }
+
+    let tmp = tempfile::NamedTempFile::new()
+        .map_err(|e| ExtractError::Other(format!("failed to create temp file: {e}")))?;
+    let path = tmp.path().to_owned();
+    {
+        let mut file = tokio::fs::File::from_std(
+            tmp.reopen()
+                .map_err(|e| ExtractError::Other(format!("failed to reopen temp file: {e}")))?,
+        );
+        file.write_all(data)
+            .await
+            .map_err(|e| ExtractError::Other(format!("failed to write temp file: {e}")))?;
+        file.flush()
+            .await
+            .map_err(|e| ExtractError::Other(format!("failed to flush temp file: {e}")))?;
+    }
+
+    let mut cmd = Command::new("antiword");
+    cmd.args(["-m", "UTF-8.txt"])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ExtractError::ExtractorNotInstalled("antiword"));
+        }
+        Err(e) => {
+            return Err(ExtractError::Other(format!(
+                "failed to spawn antiword: {e}"
+            )));
+        }
+    };
+
+    let timeout = std::time::Duration::from_secs(SUBPROCESS_TIMEOUT_SECS);
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            return Err(ExtractError::Other(format!("antiword wait failed: {e}")));
+        }
+        Err(_) => {
+            return Err(ExtractError::ExtractorTimeout(
+                "antiword",
+                SUBPROCESS_TIMEOUT_SECS,
+            ));
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ExtractError::Other(format!(
+            "antiword exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+
+    // antiword usually emits UTF-8 but can fall back to latin1 on older docs.
+    let text = match String::from_utf8(output.stdout) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(&e.into_bytes()).into_owned(),
+    };
+
+    if text.trim().is_empty() {
+        return Err(ExtractError::NoContent);
+    }
+
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +618,66 @@ mod tests {
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_ole_compound_doc_recognises_magic() {
+        let mut buf = OLE_MAGIC.to_vec();
+        buf.extend_from_slice(b"trailing junk");
+        assert!(is_ole_compound_doc(&buf));
+    }
+
+    #[test]
+    fn is_ole_compound_doc_rejects_non_ole() {
+        assert!(!is_ole_compound_doc(b"PK\x03\x04 looks like zip"));
+        assert!(!is_ole_compound_doc(b""));
+        assert!(!is_ole_compound_doc(&OLE_MAGIC[..7]));
+    }
+
+    #[tokio::test]
+    async fn extract_text_subprocess_returns_none_for_unknown_mime() {
+        let result = extract_text_subprocess(b"anything", "application/octet-stream").await;
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn extract_doc_rejects_invalid_magic() {
+        let err = extract_doc(b"definitely not a .doc file")
+            .await
+            .expect_err("expected magic check to fail");
+        assert!(matches!(err, ExtractError::InvalidDocMagic));
+    }
+
+    fn antiword_available() -> bool {
+        std::process::Command::new("antiword")
+            .arg("-h")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn extract_doc_extracts_text_from_fixture() {
+        if !antiword_available() {
+            eprintln!("skipping: antiword not on PATH");
+            return;
+        }
+        let bytes = std::fs::read("tests/fixtures/293_Ausschreibungen_27_Apr_2026.doc")
+            .expect("fixture present");
+        let text = extract_doc(&bytes).await.expect("extraction succeeds");
+        assert!(!text.trim().is_empty(), "extracted text must be non-empty");
+        // The fixture is a German document; verify UTF-8 mapping is active by
+        // looking for an umlaut and the absence of the U+FFFD replacement char.
+        assert!(
+            text.contains('ü') || text.contains('ö') || text.contains('ä'),
+            "expected German umlauts in extracted text; got: {}",
+            &text[..text.len().min(200)]
+        );
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "extracted text contains U+FFFD replacement chars — antiword UTF-8 mapping likely failed"
+        );
     }
 }
