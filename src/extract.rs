@@ -392,12 +392,10 @@ fn extract_pptx(data: &[u8]) -> Result<String, ExtractError> {
                         in_a_t = false;
                     }
                 }
-                Ok(Event::Text(ref e)) => {
-                    if in_a_t {
-                        if let Ok(t) = e.decode() {
-                            text.push_str(&t);
-                            text.push('\n');
-                        }
+                Ok(Event::Text(ref e)) if in_a_t => {
+                    if let Ok(t) = e.decode() {
+                        text.push_str(&t);
+                        text.push('\n');
                     }
                 }
                 Ok(Event::Eof) => break,

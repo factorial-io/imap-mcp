@@ -873,7 +873,12 @@ fn filter_css_properties(style: &str) -> String {
 fn html_to_safe_text(html: &str) -> Result<String, AppError> {
     let stripped = strip_hidden_elements(html, true)?;
     let sanitized = ammonia_reading().clean(&stripped).to_string();
-    Ok(html2text::from_read(sanitized.as_bytes(), 80))
+    Ok(
+        html2text::from_read(sanitized.as_bytes(), 80).unwrap_or_else(|e| {
+            tracing::warn!("Failed to convert HTML to text: {e}");
+            sanitized
+        }),
+    )
 }
 
 /// Maximum attachment size we'll return (25 MB).
