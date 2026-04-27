@@ -103,14 +103,23 @@ pub struct CreateDraftParams {
     pub to: String,
     /// Email subject line
     pub subject: String,
-    /// Plain text email body
+    /// Plain text email body. IMPORTANT: Use newline characters to separate paragraphs and lines — do not put everything on a single line.
     pub body: String,
+    /// Optional HTML body. When provided, the email is sent as multipart/alternative with both plain text and HTML parts. Use a safe subset of HTML (paragraphs, headings, lists, bold/italic, links). The plain text body is always required as fallback for clients that don't render HTML.
+    #[serde(default)]
+    pub html_body: Option<String>,
     /// CC recipient(s), comma-separated (optional)
     #[serde(default)]
     pub cc: Option<String>,
     /// BCC recipient(s), comma-separated (optional)
     #[serde(default)]
     pub bcc: Option<String>,
+    /// Single Message-ID of the email being replied to (sets In-Reply-To header). Get this from the message_id field of get_email. Must be exactly one Message-ID (e.g. "<abc@example.com>"), not multiple.
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    /// Space-separated Message-IDs for the References header (threading chain). Build this by appending the original email's message_id to its references field.
+    #[serde(default)]
+    pub references: Option<String>,
     /// IMAP folder to save the draft in (default: Drafts)
     #[serde(default = "default_drafts")]
     pub folder: String,
@@ -124,14 +133,23 @@ pub struct UpdateDraftParams {
     pub to: String,
     /// Email subject line
     pub subject: String,
-    /// Plain text email body
+    /// Plain text email body. IMPORTANT: Use newline characters to separate paragraphs and lines — do not put everything on a single line.
     pub body: String,
+    /// Optional HTML body. When provided, the email is sent as multipart/alternative with both plain text and HTML parts. Use a safe subset of HTML (paragraphs, headings, lists, bold/italic, links). The plain text body is always required as fallback for clients that don't render HTML.
+    #[serde(default)]
+    pub html_body: Option<String>,
     /// CC recipient(s), comma-separated (optional)
     #[serde(default)]
     pub cc: Option<String>,
     /// BCC recipient(s), comma-separated (optional)
     #[serde(default)]
     pub bcc: Option<String>,
+    /// Single Message-ID of the email being replied to (sets In-Reply-To header). Must be exactly one Message-ID (e.g. "<abc@example.com>"), not multiple.
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    /// Space-separated Message-IDs for the References header (threading chain).
+    #[serde(default)]
+    pub references: Option<String>,
     /// IMAP folder containing the draft (default: Drafts)
     #[serde(default = "default_drafts")]
     pub folder: String,
@@ -183,7 +201,7 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Fetch a full email by UID. Returns headers, plain-text body, and a list of attachments with metadata (filename, mime_type, size, index). Use get_attachment with the index to fetch attachment content."
+        description = "Fetch a full email by UID. Returns headers (including message_id, cc, and references for threading), plain-text body, and a list of attachments with metadata (filename, mime_type, size, index). Use get_attachment with the index to fetch attachment content. To reply to an email, use the message_id and references fields with create_draft."
     )]
     async fn get_email(
         &self,
@@ -345,20 +363,25 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Create a new draft email. The draft is saved to the specified folder (default: Drafts) and can be edited later with update_draft or sent from your email client."
+        description = "Create a new draft email. The body MUST contain newline characters (\\n) to separate paragraphs and lines — never send the entire body as a single line. Optionally provide html_body for formatted emails (the plain text body is always required as fallback). The draft is saved to the specified folder (default: Drafts) and can be edited later with update_draft or sent from your email client. To create a reply, first use get_email to fetch the original email, then pass its message_id as in_reply_to, and set references to the original references value (if any) plus the original message_id appended. If the original email has no references (thread root), use only its message_id as the references value."
     )]
     async fn create_draft(
         &self,
         Parameters(params): Parameters<CreateDraftParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mut conn = self.connect().await?;
+        let body = normalize_body(&params.body);
+        reject_flat_body(&body)?;
         let draft = DraftContent {
             from: &self.email,
             to: &params.to,
             subject: &params.subject,
-            body: &params.body,
+            body: &body,
+            html_body: params.html_body.as_deref(),
             cc: params.cc.as_deref(),
             bcc: params.bcc.as_deref(),
+            in_reply_to: params.in_reply_to.as_deref(),
+            references: params.references.as_deref(),
         };
         let uid = conn
             .create_draft(&params.folder, &draft)
@@ -377,20 +400,25 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Update an existing draft email by UID. Replaces the old draft with the new content in the same folder."
+        description = "Update an existing draft email by UID. Replaces the old draft with the new content in the same folder. The body MUST contain newline characters (\\n) to separate paragraphs and lines. Optionally provide html_body for formatted emails."
     )]
     async fn update_draft(
         &self,
         Parameters(params): Parameters<UpdateDraftParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let mut conn = self.connect().await?;
+        let body = normalize_body(&params.body);
+        reject_flat_body(&body)?;
         let draft = DraftContent {
             from: &self.email,
             to: &params.to,
             subject: &params.subject,
-            body: &params.body,
+            body: &body,
+            html_body: params.html_body.as_deref(),
             cc: params.cc.as_deref(),
             bcc: params.bcc.as_deref(),
+            in_reply_to: params.in_reply_to.as_deref(),
+            references: params.references.as_deref(),
         };
         let new_uid = conn
             .update_draft(&params.folder, params.uid, &draft)
@@ -407,6 +435,46 @@ impl ImapMcpServer {
             params.uid, params.folder
         ))]))
     }
+}
+
+/// Normalize literal escape sequences in the email body.
+///
+/// LLMs sometimes emit literal `\n` (two-character backslash + n) in JSON
+/// string values instead of actual newline characters. This converts those
+/// literal sequences to real newlines so drafts preserve intended line breaks.
+///
+/// Only applies when the body contains no real newlines at all — that pattern
+/// strongly indicates the LLM collapsed everything onto one line. When real
+/// newlines are already present, the body is well-formed and replacing `\n`
+/// would corrupt intentional backslash-n sequences (e.g. in code snippets).
+fn normalize_body(body: &str) -> String {
+    if !body.contains('\n') {
+        body.replace("\\n", "\n")
+    } else {
+        body.to_string()
+    }
+}
+
+/// Maximum length (in Unicode scalar values) for a single-line body before we reject it.
+/// Bodies shorter than this are likely intentionally single-line (e.g. "Thanks!").
+const FLAT_BODY_THRESHOLD: usize = 100;
+
+/// Reject email bodies that appear to be a single long line with no formatting.
+///
+/// When the body exceeds [`FLAT_BODY_THRESHOLD`] characters and contains no
+/// newline characters, it almost certainly means the caller forgot to include
+/// line breaks. Returning an error forces the LLM to retry with proper
+/// paragraph breaks rather than silently saving a badly formatted draft.
+fn reject_flat_body(body: &str) -> Result<(), rmcp::ErrorData> {
+    if !body.contains('\n') && body.chars().count() > FLAT_BODY_THRESHOLD {
+        return Err(rmcp::ErrorData::invalid_params(
+            "The email body is a single long line with no newline characters. \
+             Please reformat the body with \\n characters to separate the greeting, \
+             paragraphs, and sign-off onto separate lines.",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 /// Check if a MIME type is text-based (returned as-is, not extracted).
@@ -436,7 +504,58 @@ impl ServerHandler for ImapMcpServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions(
-            "IMAP email server. Use the tools to list folders, read emails, search, manage read status, fetch attachments, and create or edit drafts. When reading an email with get_email, attachment metadata is included. Use get_attachment with the attachment index to fetch the actual content — for PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. Use create_draft to compose a new draft and update_draft to modify an existing one.".to_string(),
+            "IMAP email server. Use the tools to list folders, read emails, search, manage read status, fetch attachments, and create or edit drafts. When reading an email with get_email, attachment metadata is included. Use get_attachment with the attachment index to fetch the actual content — for PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. Use create_draft to compose a new draft and update_draft to modify an existing one. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_body_converts_literal_backslash_n() {
+        assert_eq!(
+            normalize_body("Hello,\\n\\nParagraph one.\\n\\nBest,\\nAlice"),
+            "Hello,\n\nParagraph one.\n\nBest,\nAlice"
+        );
+    }
+
+    #[test]
+    fn normalize_body_preserves_real_newlines() {
+        assert_eq!(
+            normalize_body("Hello,\n\nAlready has newlines."),
+            "Hello,\n\nAlready has newlines."
+        );
+    }
+
+    #[test]
+    fn normalize_body_skips_when_real_newlines_present() {
+        // When real newlines exist, literal \n is left untouched to avoid
+        // corrupting intentional backslash-n sequences (e.g. code snippets).
+        assert_eq!(
+            normalize_body("Line1\nLine2\\nLine3"),
+            "Line1\nLine2\\nLine3"
+        );
+    }
+
+    #[test]
+    fn reject_flat_body_allows_short_single_line() {
+        // Short bodies like "Thanks!" are fine without newlines.
+        assert!(reject_flat_body("Thanks for the update!").is_ok());
+    }
+
+    #[test]
+    fn reject_flat_body_allows_body_with_newlines() {
+        let body = "Hi Alice,\n\nThis is a properly formatted email body that has paragraphs separated by newlines. It is longer than the threshold.\n\nBest,\nBob";
+        assert!(reject_flat_body(body).is_ok());
+    }
+
+    #[test]
+    fn reject_flat_body_rejects_long_single_line() {
+        let body = "Hi Alice, I wanted to follow up on our conversation from yesterday about the project timeline and make sure we are aligned on the next steps for the deliverables.";
+        assert!(body.len() > FLAT_BODY_THRESHOLD);
+        let err = reject_flat_body(body).unwrap_err();
+        assert!(err.message.contains("single long line"));
     }
 }
