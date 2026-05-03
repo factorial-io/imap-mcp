@@ -389,7 +389,8 @@ async fn mcp_handler(
 
     let config = StreamableHttpServerConfig::default()
         .with_stateful_mode(false)
-        .with_json_response(true);
+        .with_json_response(true)
+        .with_allowed_hosts(allowed_hosts_for_base_url(&state.base_url));
 
     let service = StreamableHttpService::new(
         move || Ok(mcp::ImapMcpServer::new(resolver.clone())),
@@ -399,6 +400,20 @@ async fn mcp_handler(
 
     let resp: http::Response<_> = service.handle(req).await;
     resp.map(axum::body::Body::new)
+}
+
+/// Build the rmcp allowed-hosts list. rmcp 1.6.0 rejects requests whose Host
+/// header is not loopback unless explicitly allowlisted, to prevent DNS
+/// rebinding. We add the public host derived from `base_url` while keeping the
+/// loopback defaults so local dev and health checks continue to work.
+fn allowed_hosts_for_base_url(base_url: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+    if let Ok(uri) = base_url.parse::<http::Uri>() {
+        if let Some(host) = uri.host() {
+            hosts.push(host.to_string());
+        }
+    }
+    hosts
 }
 
 pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -455,5 +470,29 @@ mod tests {
             legacy_migrated_account_id("a", "b"),
             legacy_migrated_account_id("ab", ""),
         );
+    }
+
+    #[test]
+    fn allowed_hosts_includes_public_host_and_loopback() {
+        let hosts = allowed_hosts_for_base_url("https://imap-mcp.factorial.io");
+        assert!(hosts.iter().any(|h| h == "imap-mcp.factorial.io"));
+        assert!(hosts.iter().any(|h| h == "localhost"));
+        assert!(hosts.iter().any(|h| h == "127.0.0.1"));
+        assert!(hosts.iter().any(|h| h == "::1"));
+    }
+
+    #[test]
+    fn allowed_hosts_falls_back_to_loopback_on_unparseable_base_url() {
+        // No scheme/authority => no public host added, but loopback still present.
+        let hosts = allowed_hosts_for_base_url("not a url");
+        assert!(hosts.iter().any(|h| h == "localhost"));
+        assert_eq!(hosts.len(), 3);
+    }
+
+    #[test]
+    fn allowed_hosts_handles_base_url_with_port() {
+        let hosts = allowed_hosts_for_base_url("http://localhost:8080");
+        // host() strips the port; the loopback default already covers "localhost".
+        assert!(hosts.iter().any(|h| h == "localhost"));
     }
 }
