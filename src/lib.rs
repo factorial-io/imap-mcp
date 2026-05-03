@@ -5,6 +5,7 @@ pub mod imap;
 pub mod manage;
 pub mod mcp;
 pub mod providers;
+pub(crate) mod sanitize;
 pub mod session;
 
 use axum::http::{HeaderMap, StatusCode};
