@@ -81,6 +81,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/manage/accounts/{account_id}/revalidate",
             post(manage::revalidate_account),
         )
+        .route(
+            "/manage/accounts/{account_id}/set_default",
+            post(manage::set_default_account),
+        )
         .route("/manage/logout", post(manage::logout))
         .route("/mcp", axum::routing::any(mcp_handler))
         .route("/mcp/{path}", axum::routing::any(mcp_handler))
@@ -179,7 +183,27 @@ impl AccountResolver {
                         ResolveError::Internal("account list shrank between checks".into())
                     })?
                 } else {
-                    return Err(ResolveError::AccountRequired);
+                    // 2+ accounts and no selector: fall back to the user's
+                    // designated default. The first account a user creates
+                    // (or migrates) is auto-set as default; they can change
+                    // it from /manage. This keeps existing single-account
+                    // workflows intact when the user adds a second mailbox —
+                    // tool calls that omit `account` continue to target the
+                    // account they were already using.
+                    let default_id = self
+                        .store
+                        .get_default_account_id(&self.oidc_sub)
+                        .await
+                        .map_err(|e| ResolveError::Internal(e.to_string()))?;
+                    match default_id
+                        .as_deref()
+                        .and_then(|id| accounts.iter().find(|a| a.account_id == id))
+                    {
+                        Some(a) => a.clone(),
+                        // No default set, or default points at an account
+                        // that no longer exists. Force an explicit selector.
+                        None => return Err(ResolveError::AccountRequired),
+                    }
                 }
             }
             Some(selector) => {
@@ -290,6 +314,13 @@ impl AccountResolver {
 
         self.store
             .put_account(&self.oidc_sub, &migrated)
+            .await
+            .map_err(|e| ResolveError::Internal(e.to_string()))?;
+        // The migrated account is the user's only account, so it is the
+        // default. `_if_unset` so we don't clobber a default a parallel
+        // request might have just set.
+        self.store
+            .set_default_account_id_if_unset(&self.oidc_sub, &migrated.account_id)
             .await
             .map_err(|e| ResolveError::Internal(e.to_string()))?;
         self.store

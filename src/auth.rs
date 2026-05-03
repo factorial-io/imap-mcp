@@ -448,6 +448,12 @@ pub async fn setup(
         .sessions
         .put_account(&pending.oidc_sub, &account)
         .await?;
+    // First account becomes the default. `_if_unset` keeps a later explicit
+    // user choice (set via /manage) intact across re-onboarding flows.
+    state
+        .sessions
+        .set_default_account_id_if_unset(&pending.oidc_sub, &account.account_id)
+        .await?;
 
     // Generate authorization code (no IMAP password — Account holds it).
     let code = uuid::Uuid::new_v4().to_string();

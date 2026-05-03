@@ -321,10 +321,16 @@ fn default_limit() -> u32 {
 #[tool_router]
 impl ImapMcpServer {
     #[tool(
-        description = "List the mailboxes (IMAP accounts) connected to this MCP server for the current user. Returns each account's id, label, IMAP login email, host, last-used time, and disabled flag, plus a short-lived signed manage_url the user can open in their browser to add or remove accounts. If only one account is connected, IMAP tools default to it; if more than one, pass `account` (account_id or label) on every IMAP tool call."
+        description = "List the mailboxes (IMAP accounts) connected to this MCP server for the current user. Returns each account's id, label, IMAP login email, host, last-used time, disabled flag, and is_default flag, plus a short-lived signed manage_url the user can open in their browser to add, remove, or change the default. Tool calls that omit `account` resolve to the account marked is_default; pass `account` (account_id or label) to target a specific one."
     )]
     async fn list_accounts(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let accounts = self.resolver.list().await.map_err(resolve_to_rmcp)?;
+        let default_id = self
+            .resolver
+            .store
+            .get_default_account_id(&self.resolver.oidc_sub)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("default lookup: {e}"), None))?;
         let manage_url = crate::manage::issue_manage_url(
             &self.resolver.store,
             &self.resolver.base_url,
@@ -334,8 +340,12 @@ impl ImapMcpServer {
         .await
         .map_err(|e| rmcp::ErrorData::internal_error(format!("manage_url: {e}"), None))?;
 
+        let summaries: Vec<AccountSummary> = accounts
+            .iter()
+            .map(|a| AccountSummary::from_account(a, default_id.as_deref()))
+            .collect();
         let result = ListAccountsResult {
-            accounts: accounts.iter().map(AccountSummary::from).collect(),
+            accounts: summaries,
             manage_url,
         };
         let json = Content::json(&result)

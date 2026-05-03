@@ -348,13 +348,33 @@ impl SessionStore {
     }
 
     // --- Accounts (per oidc_sub) ---
+    //
+    // Storage layout:
+    //   mcp:accounts:{oidc_sub}        Redis hash, field=account_id → JSON
+    //   mcp:account_fails:{sub}:{id}   Redis int (atomic INCR/DEL counter)
+    //   mcp:default_account:{sub}      Redis string → account_id
+    //
+    // The auth-failure counter lives in its own key (not embedded in the
+    // JSON) so two concurrent IMAP failures can `INCR` it atomically — no
+    // GET → modify → HSET race window. The JSON's `auth_failure_count` is
+    // derived: populated from the counter on read, ignored on write.
 
     fn accounts_key(oidc_sub: &str) -> String {
         format!("mcp:accounts:{oidc_sub}")
     }
 
+    fn fails_key(oidc_sub: &str, account_id: &str) -> String {
+        format!("mcp:account_fails:{oidc_sub}:{account_id}")
+    }
+
+    fn default_account_key(oidc_sub: &str) -> String {
+        format!("mcp:default_account:{oidc_sub}")
+    }
+
     /// Persist an `Account` under the given `oidc_sub`. Stored as a Redis
     /// hash where the field is `account_id` and the value is the JSON record.
+    /// `auth_failure_count` in the JSON is informational only; the live
+    /// counter is the side key written by `record_account_auth_failure`.
     pub async fn put_account(&self, oidc_sub: &str, account: &Account) -> Result<(), AppError> {
         let key = Self::accounts_key(oidc_sub);
         let value = serde_json::to_string(account)?;
@@ -373,19 +393,26 @@ impl SessionStore {
         let key = Self::accounts_key(oidc_sub);
         let mut conn = self.conn().await?;
         let value: Option<String> = conn.hget(&key, account_id).await?;
-        match value {
-            Some(v) => Ok(Some(serde_json::from_str(&v)?)),
-            None => Ok(None),
-        }
+        let Some(v) = value else { return Ok(None) };
+        let mut acc: Account = serde_json::from_str(&v)?;
+        let fails: Option<u32> = conn.get(Self::fails_key(oidc_sub, account_id)).await?;
+        acc.auth_failure_count = fails.unwrap_or(0);
+        Ok(Some(acc))
     }
 
     pub async fn list_accounts(&self, oidc_sub: &str) -> Result<Vec<Account>, AppError> {
         let key = Self::accounts_key(oidc_sub);
         let mut conn = self.conn().await?;
         let map: std::collections::HashMap<String, String> = conn.hgetall(&key).await?;
-        let mut out = Vec::with_capacity(map.len());
+        let mut out: Vec<Account> = Vec::with_capacity(map.len());
         for (_, v) in map {
             out.push(serde_json::from_str::<Account>(&v)?);
+        }
+        // Overlay the live failure counter from each account's side key.
+        // One round-trip per account; N is small in practice (a handful per user).
+        for acc in &mut out {
+            let fails: Option<u32> = conn.get(Self::fails_key(oidc_sub, &acc.account_id)).await?;
+            acc.auth_failure_count = fails.unwrap_or(0);
         }
         out.sort_by_key(|a| a.created_at);
         Ok(out)
@@ -395,10 +422,21 @@ impl SessionStore {
         let key = Self::accounts_key(oidc_sub);
         let mut conn = self.conn().await?;
         let removed: i64 = conn.hdel(&key, account_id).await?;
+        // Best-effort cleanup of side state. Stale leftovers are harmless
+        // (TTLs would clear them eventually) but keeping Redis tidy is cheap.
+        let _: () = conn.del(Self::fails_key(oidc_sub, account_id)).await?;
+        // If this was the default, clear the pointer so the next resolution
+        // can pick a new default (or so the user gets the "select an account"
+        // prompt and chooses).
+        let current_default: Option<String> = conn.get(Self::default_account_key(oidc_sub)).await?;
+        if current_default.as_deref() == Some(account_id) {
+            let _: () = conn.del(Self::default_account_key(oidc_sub)).await?;
+        }
         Ok(removed > 0)
     }
 
     /// Update an account's password (used by `/manage` re-validate flow).
+    /// Resets the failure counter atomically and clears `disabled_at`.
     pub async fn update_account_password(
         &self,
         oidc_sub: &str,
@@ -412,49 +450,136 @@ impl SessionStore {
             .ok_or_else(|| AppError::Auth("account not found".into()))?;
         acc.password_enc = password_enc;
         acc.password_iv = password_iv;
-        acc.auth_failure_count = 0;
         acc.disabled_at = None;
-        self.put_account(oidc_sub, &acc).await
+        // The serialized counter is informational; the side key is the truth.
+        // Reset both so /manage UI shows zero failures.
+        acc.auth_failure_count = 0;
+        self.put_account(oidc_sub, &acc).await?;
+        let mut conn = self.conn().await?;
+        let _: () = conn.del(Self::fails_key(oidc_sub, account_id)).await?;
+        Ok(())
     }
 
-    /// Mark a successful login: clear failure counter, bump `last_used_at`.
+    /// Mark a successful login: reset the failure counter (atomic via DEL on
+    /// the side key), bump `last_used_at`, clear any prior `disabled_at`.
     pub async fn record_account_success(
         &self,
         oidc_sub: &str,
         account_id: &str,
     ) -> Result<(), AppError> {
-        let Some(mut acc) = self.get_account(oidc_sub, account_id).await? else {
+        let mut conn = self.conn().await?;
+        let _: () = conn.del(Self::fails_key(oidc_sub, account_id)).await?;
+
+        // last_used_at + disabled_at clearing live in the JSON. Last-write-
+        // wins is fine for these — both fields are monotonic in their
+        // meaning ("most recent success") so concurrent successes converge.
+        let key = Self::accounts_key(oidc_sub);
+        let Some(v) = conn.hget::<_, _, Option<String>>(&key, account_id).await? else {
             return Ok(());
         };
+        let mut acc: Account = serde_json::from_str(&v)?;
         acc.last_used_at = Some(chrono::Utc::now().timestamp());
         acc.auth_failure_count = 0;
-        self.put_account(oidc_sub, &acc).await
+        if acc.disabled_at.is_some() {
+            acc.disabled_at = None;
+        }
+        let new_value = serde_json::to_string(&acc)?;
+        conn.hset::<_, _, _, ()>(&key, account_id, &new_value)
+            .await?;
+        Ok(())
     }
 
     /// Mark an auth failure. After [`AUTH_FAILURE_LIMIT`] consecutive failures,
     /// the account is auto-disabled.
+    ///
+    /// The counter increment is atomic via Redis `INCR` on the side key, so
+    /// concurrent failures cannot under-count. The disable transition itself
+    /// (HGET + HSET on the JSON) is read-modify-write, but it only fires on
+    /// the *first* concurrent caller that observes `count >= LIMIT` and
+    /// `disabled_at == None`; subsequent callers see `disabled_at` already
+    /// set and leave it alone. Worst case: two writers both set
+    /// `disabled_at` to ~the same timestamp and one wins — benign.
     pub async fn record_account_auth_failure(
         &self,
         oidc_sub: &str,
         account_id: &str,
     ) -> Result<bool, AppError> {
-        let Some(mut acc) = self.get_account(oidc_sub, account_id).await? else {
+        let mut conn = self.conn().await?;
+        // Atomic increment.
+        let count: u32 = conn
+            .incr(Self::fails_key(oidc_sub, account_id), 1u32)
+            .await?;
+        // Refresh TTL on every call so the counter doesn't accrue forever
+        // and so a crash between INCR and EXPIRE on the first hit can't
+        // leave the key immortal.
+        conn.expire::<_, ()>(Self::fails_key(oidc_sub, account_id), ACCOUNT_TTL as i64)
+            .await?;
+
+        if count < AUTH_FAILURE_LIMIT {
+            return Ok(false);
+        }
+
+        // Crossed the threshold — set `disabled_at` if not already set.
+        let key = Self::accounts_key(oidc_sub);
+        let Some(v) = conn.hget::<_, _, Option<String>>(&key, account_id).await? else {
             return Ok(false);
         };
-        acc.auth_failure_count = acc.auth_failure_count.saturating_add(1);
-        let just_disabled =
-            if acc.auth_failure_count >= AUTH_FAILURE_LIMIT && acc.disabled_at.is_none() {
-                acc.disabled_at = Some(chrono::Utc::now().timestamp());
-                true
-            } else {
-                false
-            };
-        self.put_account(oidc_sub, &acc).await?;
-        Ok(just_disabled)
+        let mut acc: Account = serde_json::from_str(&v)?;
+        if acc.disabled_at.is_some() {
+            return Ok(false);
+        }
+        acc.disabled_at = Some(chrono::Utc::now().timestamp());
+        let new_value = serde_json::to_string(&acc)?;
+        conn.hset::<_, _, _, ()>(&key, account_id, &new_value)
+            .await?;
+        Ok(true)
     }
 
     pub fn decrypt_account_password(&self, account: &Account) -> Result<String, AppError> {
         self.decrypt(&account.password_enc, &account.password_iv)
+    }
+
+    // --- Default account (per oidc_sub) ---
+    //
+    // A user with multiple accounts has one designated as the default.
+    // Tool calls that omit the `account` parameter resolve to it. The first
+    // account a user creates (or migrates) becomes the default automatically;
+    // they can change it from `/manage`.
+
+    pub async fn get_default_account_id(&self, oidc_sub: &str) -> Result<Option<String>, AppError> {
+        let mut conn = self.conn().await?;
+        Ok(conn.get(Self::default_account_key(oidc_sub)).await?)
+    }
+
+    pub async fn set_default_account_id(
+        &self,
+        oidc_sub: &str,
+        account_id: &str,
+    ) -> Result<(), AppError> {
+        let mut conn = self.conn().await?;
+        conn.set_ex::<_, _, ()>(Self::default_account_key(oidc_sub), account_id, ACCOUNT_TTL)
+            .await?;
+        Ok(())
+    }
+
+    /// Set the default only if no default exists yet. Used when a new
+    /// account is created so the *first* account a user has becomes the
+    /// default automatically without overriding a later explicit choice.
+    /// Returns `true` if the write actually set the key.
+    pub async fn set_default_account_id_if_unset(
+        &self,
+        oidc_sub: &str,
+        account_id: &str,
+    ) -> Result<bool, AppError> {
+        let mut conn = self.conn().await?;
+        // SET key value NX EX seconds — atomic "set-if-not-exists with TTL".
+        let opts = redis::SetOptions::default()
+            .conditional_set(redis::ExistenceCheck::NX)
+            .with_expiration(redis::SetExpiry::EX(ACCOUNT_TTL));
+        let result: Option<String> = conn
+            .set_options(Self::default_account_key(oidc_sub), account_id, opts)
+            .await?;
+        Ok(result.is_some())
     }
 
     // --- Manage tickets (15-minute pre-auth links) ---
@@ -549,17 +674,18 @@ impl SessionStore {
     ///
     /// Implementation: a Redis INCR + EXPIRE on `ratelimit:imap_validate:{sub}`
     /// — fixed-window, not sliding, but cheap and good enough for a low-volume
-    /// auth-adjacent operation. The first call in a window sets the TTL; the
-    /// counter resets when the key expires.
+    /// auth-adjacent operation. The TTL is refreshed on every call (cheap and
+    /// idempotent) so a process crash between INCR and EXPIRE on the very
+    /// first hit can never leave the counter immortal.
     pub async fn check_imap_validate_rate_limit(&self, oidc_sub: &str) -> Result<(), AppError> {
         let key = format!("ratelimit:imap_validate:{oidc_sub}");
         let mut conn = self.conn().await?;
         let count: u32 = conn.incr(&key, 1u32).await?;
-        if count == 1 {
-            // First hit in this window — set the TTL so the counter expires.
-            conn.expire::<_, ()>(&key, IMAP_VALIDATE_WINDOW_SECS as i64)
-                .await?;
-        }
+        // Refresh TTL on every call. Sliding the window slightly is a fair
+        // price for not having a "stuck rate limit" failure mode if the
+        // process dies between INCR and EXPIRE on the first hit.
+        conn.expire::<_, ()>(&key, IMAP_VALIDATE_WINDOW_SECS as i64)
+            .await?;
         if count > IMAP_VALIDATE_LIMIT {
             // Surface a useful message with the remaining TTL. If the TTL
             // lookup itself fails (Redis hiccup), log it and fall back to

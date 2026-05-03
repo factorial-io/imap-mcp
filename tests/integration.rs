@@ -372,3 +372,15 @@ async fn manage_delete_account_without_cookie_returns_401() {
     let resp = send_request(req).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn manage_set_default_without_cookie_returns_401() {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/manage/accounts/some-id/set_default")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from("csrf_token=x"))
+        .unwrap();
+    let resp = send_request(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}

@@ -83,13 +83,30 @@ The verified `oidc_sub` is the trust anchor; tokens are references to it. Revoki
 
 ### MCP tool changes
 
-- New tool: `list_accounts` → `[{ account_id, label, imap_email, imap_host, last_used_at, disabled }, …]`, plus a short-lived signed `manage_url` for adding/removing accounts.
+- New tool: `list_accounts` → `[{ account_id, label, imap_email, imap_host, last_used_at, disabled, is_default }, …]`, plus a short-lived signed `manage_url` for adding, removing, and changing the default account.
 - New tool: `add_account_url` → `{ url, expires_at }`. Returns a fresh 15-minute signed `/manage` link. For when the agent's intent is "add a new mailbox" without first enumerating existing ones.
 - Every existing tool gains an optional `account` parameter (`account_id` or `label`). Resolution rules:
   - 0 accounts → error with the `manage_url` ("No mailboxes connected — open … to add one").
   - 1 account → `account` optional, defaults to that one.
-  - 2+ accounts → `account` required; on omission the error tells the agent to call `list_accounts` first.
+  - 2+ accounts → `account` optional; **defaults to the user's designated default account** (see "Default account" below). If no default is set or the default points at a deleted account, the error tells the agent to call `list_accounts` and pass `account` explicitly.
 - `label` is accepted as a convenience for agent ergonomics; ambiguous labels error.
+
+### Default account
+
+A user with multiple mailboxes has one designated as the default — the
+account that tool calls without an `account` parameter resolve to.
+
+- The first account a user creates (or migrates from a legacy session) is
+  set as the default automatically. Set-if-not-exists semantics
+  (`SET NX EX`) so two concurrent first-creates converge.
+- The user changes the default from `/manage` (a "Set as default" button
+  on each non-default row, CSRF-protected). Stored at
+  `mcp:default_account:{oidc_sub}` → `account_id` with the same TTL as
+  the account records themselves.
+- Deleting an account that was the default clears the pointer; the next
+  tool call without `account` then forces an explicit selector until the
+  user picks a new default in `/manage`.
+- Exposed as `is_default: bool` on every entry in `list_accounts`.
 
 ### `manage_url` ticket scheme
 
@@ -121,24 +138,23 @@ to add or remove accounts.
 
 ### Behavior at the 1→2 account transition
 
-Adding a second account changes the tool API contract for that user:
-the optional `account` parameter becomes effectively required on every
-IMAP-touching tool call. We treat this as a deliberate sharp edge
-rather than a bug:
+Adding a second account does **not** silently break existing tool
+calls. The new account joins the user's list, and the first-existing
+account remains the default — so tool calls that omit the `account`
+parameter continue to target the same mailbox they were already using.
 
-- The `account_required` error message is explicit ("Multiple mailboxes
-  are connected — pass `account` (account_id or label). Call
-  list_accounts to see them.") so the agent can recover by calling
-  `list_accounts` and re-issuing the call.
-- We do **not** introduce a sticky default. A sticky default would have
-  to be read+written on every call, would need a UI to change, and
-  would mask the multi-account state from the agent in ways that
-  surface worse later (e.g. when the sticky account becomes disabled).
-- The `/manage` page should later grow a one-line note above the "Add"
-  form when the user already has one account ("Adding a second mailbox
-  means future tool calls must specify `account` — pass an account_id
-  or label"). This is a UX polish item, not a correctness item, so it
-  ships as a follow-up.
+To switch which account is the default the user goes to `/manage` and
+clicks "Set as default" on the row they want. Tool calls can also
+target either account explicitly via the optional `account` parameter
+(account_id or label).
+
+If the default points at an account the user later deletes, the
+pointer is cleared, and the next tool call without `account` returns
+the explicit `account_required` error ("Multiple mailboxes are
+connected — pass `account` (account_id or label). Call
+list_accounts to see them."). The agent recovers by calling
+`list_accounts` and either re-issuing with an explicit `account` or
+nudging the user to set a new default in `/manage`.
 
 ### IMAP provider allowlist
 

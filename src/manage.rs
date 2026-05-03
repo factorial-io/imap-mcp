@@ -26,19 +26,20 @@ const COOKIE_NAME: &str = "mgmt_session";
 
 /// Build the `Set-Cookie` value for the management session cookie.
 ///
-/// HttpOnly + SameSite=Lax + Path=/manage. Marked `Secure` because the
-/// service is served over HTTPS in real deployments; tests over HTTP still
-/// work because axum doesn't reject Set-Cookie based on scheme.
+/// `Path=/manage` so the cookie is only sent on management routes — it has
+/// no business riding along with `/mcp` tool calls or `/auth/*` flows. The
+/// other handlers ignore unknown cookies anyway, but tighter scope is the
+/// right default.
 fn build_cookie(value: &str) -> String {
     format!(
-        "{COOKIE_NAME}={value}; HttpOnly; Secure; SameSite=Lax; Path=/; \
+        "{COOKIE_NAME}={value}; HttpOnly; Secure; SameSite=Lax; Path=/manage; \
          Max-Age={ttl}",
         ttl = crate::session::MANAGE_SESSION_TTL,
     )
 }
 
 fn clear_cookie() -> String {
-    format!("{COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0")
+    format!("{COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/manage; Max-Age=0")
 }
 
 fn read_cookie(headers: &HeaderMap) -> Option<String> {
@@ -108,7 +109,17 @@ pub async fn manage_page(
 
     // 3. Render the page.
     let accounts = state.sessions.list_accounts(&session.oidc_sub).await?;
-    let html = render_manage_page(&state, &session, &accounts, q.msg.as_deref());
+    let default_id = state
+        .sessions
+        .get_default_account_id(&session.oidc_sub)
+        .await?;
+    let html = render_manage_page(
+        &state,
+        &session,
+        &accounts,
+        default_id.as_deref(),
+        q.msg.as_deref(),
+    );
     Ok((
         StatusCode::OK,
         [("Content-Type", "text/html; charset=utf-8")],
@@ -199,6 +210,11 @@ pub async fn add_account(
         .sessions
         .put_account(&session.oidc_sub, &account)
         .await?;
+    // First account becomes the default automatically.
+    state
+        .sessions
+        .set_default_account_id_if_unset(&session.oidc_sub, &account.account_id)
+        .await?;
 
     tracing::info!(
         oidc_sub = %session.oidc_sub,
@@ -242,6 +258,42 @@ pub async fn delete_account(
         "Account delete via /manage"
     );
     Ok(Redirect::to(&format!("{}/manage?msg=removed", state.base_url)).into_response())
+}
+
+/// POST /manage/accounts/{id}/set_default — designate which account tool
+/// calls without an explicit `account` parameter resolve to.
+pub async fn set_default_account(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(account_id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Result<Response, AppError> {
+    let session = require_session(&state, &headers).await?;
+    if !constant_time_eq(&form.csrf_token, &session.csrf_token) {
+        return Err(AppError::Auth("invalid CSRF token".into()));
+    }
+
+    // Confirm the account actually belongs to this user before pointing the
+    // default at it. Without this check, anyone with a session cookie could
+    // try to set the default to an account_id under another oidc_sub. The
+    // resolver would reject it later anyway, but failing loud here is better.
+    let account = state
+        .sessions
+        .get_account(&session.oidc_sub, &account_id)
+        .await?
+        .ok_or_else(|| AppError::Auth("account not found".into()))?;
+
+    state
+        .sessions
+        .set_default_account_id(&session.oidc_sub, &account.account_id)
+        .await?;
+
+    tracing::info!(
+        oidc_sub = %session.oidc_sub,
+        account_id = %account.account_id,
+        "Default account changed via /manage"
+    );
+    Ok(Redirect::to(&format!("{}/manage?msg=default_changed", state.base_url)).into_response())
 }
 
 /// POST /manage/accounts/{id}/revalidate — re-enter the IMAP password for an
@@ -372,6 +424,7 @@ fn render_manage_page(
     state: &AppState,
     session: &ManageSession,
     accounts: &[Account],
+    default_id: Option<&str>,
     msg: Option<&str>,
 ) -> String {
     let csrf = html_escape(&session.csrf_token);
@@ -382,8 +435,15 @@ fn render_manage_page(
         Some("added") => r#"<div class="banner ok">Account added.</div>"#.to_string(),
         Some("removed") => r#"<div class="banner ok">Account removed.</div>"#.to_string(),
         Some("revalidated") => r#"<div class="banner ok">Account re-validated.</div>"#.to_string(),
+        Some("default_changed") => {
+            r#"<div class="banner ok">Default account updated.</div>"#.to_string()
+        }
         _ => String::new(),
     };
+
+    // The "Set as default" button only matters when there's a choice to make
+    // (2+ accounts). Hidden in the single-account case.
+    let multi = accounts.len() >= 2;
 
     let rows = if accounts.is_empty() {
         r#"<p class="empty">No mailboxes connected yet. Add one below.</p>"#.to_string()
@@ -395,6 +455,12 @@ fn render_manage_page(
         </tr></thead><tbody>"#,
         );
         for a in accounts {
+            let is_default = default_id == Some(a.account_id.as_str());
+            let default_badge = if is_default {
+                r#" <span class="default-badge">default</span>"#
+            } else {
+                ""
+            };
             let status = if a.is_disabled() {
                 r#"<span class="bad">disabled</span>"#.to_string()
             } else if a.auth_failure_count > 0 {
@@ -427,15 +493,31 @@ fn render_manage_page(
             } else {
                 String::new()
             };
+            // "Set as default" only shown when the user has 2+ accounts and
+            // this row isn't already the default. Hidden in the single-
+            // account case where there's no choice to make.
+            let set_default_cell = if multi && !is_default {
+                format!(
+                    r#"<form method="POST" action="/manage/accounts/{id}/set_default" style="display:inline-block;margin-right:8px;">
+                            <input type="hidden" name="csrf_token" value="{csrf}">
+                            <button type="submit">Set as default</button>
+                        </form>"#,
+                    id = html_escape(&a.account_id),
+                    csrf = csrf,
+                )
+            } else {
+                String::new()
+            };
             rows.push_str(&format!(
                 r#"<tr>
-                    <td>{label}</td>
+                    <td>{label}{default_badge}</td>
                     <td>{email}</td>
                     <td>{host}</td>
                     <td>{last_used}</td>
                     <td>{status}</td>
                     <td>
                         {revalidate_cell}
+                        {set_default_cell}
                         <form method="POST" action="/manage/accounts/{id}/delete" data-confirm-label="{label}" onsubmit="return confirm('Remove ' + this.dataset.confirmLabel + '?');" style="display:inline-block;">
                             <input type="hidden" name="csrf_token" value="{csrf}">
                             <button type="submit" class="danger">Remove</button>
@@ -485,6 +567,7 @@ fn render_manage_page(
         .empty {{ color: #6b7280; }}
         .hint {{ color: #6b7280; font-size: 0.85em; margin-top: 4px; }}
         .logout {{ float: right; }}
+        .default-badge {{ display: inline-block; margin-left: 6px; padding: 1px 6px; background: #dbeafe; color: #1e40af; font-size: 0.75em; border-radius: 3px; font-weight: 600; vertical-align: middle; }}
     </style>
 </head>
 <body>
@@ -528,10 +611,13 @@ pub struct AccountSummary {
     pub imap_host: String,
     pub last_used_at: Option<i64>,
     pub disabled: bool,
+    /// True for the user's default account — the one tool calls without an
+    /// `account` parameter resolve to.
+    pub is_default: bool,
 }
 
-impl From<&Account> for AccountSummary {
-    fn from(a: &Account) -> Self {
+impl AccountSummary {
+    pub fn from_account(a: &Account, default_id: Option<&str>) -> Self {
         AccountSummary {
             account_id: a.account_id.clone(),
             label: a.label.clone(),
@@ -539,6 +625,7 @@ impl From<&Account> for AccountSummary {
             imap_host: a.imap_host.clone(),
             last_used_at: a.last_used_at,
             disabled: a.is_disabled(),
+            is_default: default_id == Some(a.account_id.as_str()),
         }
     }
 }
@@ -606,5 +693,43 @@ mod tests {
         assert!(!constant_time_eq("abc", "abcd"));
         assert!(!constant_time_eq("", "x"));
         assert!(constant_time_eq("", ""));
+    }
+
+    fn make_account(id: &str) -> Account {
+        Account {
+            account_id: id.to_string(),
+            label: format!("Label {id}"),
+            imap_email: format!("{id}@example.com"),
+            imap_host: "mail.factorial.io".to_string(),
+            imap_port: 993,
+            password_enc: String::new(),
+            password_iv: String::new(),
+            created_at: 0,
+            last_used_at: None,
+            auth_failure_count: 0,
+            disabled_at: None,
+        }
+    }
+
+    #[test]
+    fn account_summary_marks_default_account() {
+        let a = make_account("a");
+        let s = AccountSummary::from_account(&a, Some("a"));
+        assert!(s.is_default);
+        assert_eq!(s.account_id, "a");
+    }
+
+    #[test]
+    fn account_summary_marks_non_default_account() {
+        let a = make_account("a");
+        let s = AccountSummary::from_account(&a, Some("other-id"));
+        assert!(!s.is_default);
+    }
+
+    #[test]
+    fn account_summary_handles_no_default() {
+        let a = make_account("a");
+        let s = AccountSummary::from_account(&a, None);
+        assert!(!s.is_default);
     }
 }
