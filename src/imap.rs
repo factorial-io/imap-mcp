@@ -5,7 +5,8 @@ use serde::Serialize;
 
 use crate::error::AppError;
 
-pub use crate::sanitize::{DraftContent, sanitize_html_for_draft, html_to_safe_text};
+use crate::sanitize::html_to_safe_text;
+pub use crate::sanitize::{sanitize_html_for_draft, DraftContent};
 
 /// Maximum attachment size we'll return (25 MB).
 const MAX_ATTACHMENT_SIZE: usize = 25 * 1024 * 1024;

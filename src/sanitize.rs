@@ -866,7 +866,7 @@ fn filter_css_properties(style: &str) -> String {
 ///
 /// Removes hidden elements (prompt-injection vector), sanitizes through ammonia,
 /// then converts to plain text via `html2text`.
-pub fn html_to_safe_text(html: &str) -> Result<String, AppError> {
+pub(crate) fn html_to_safe_text(html: &str) -> Result<String, AppError> {
     let stripped = strip_hidden_elements(html, true)?;
     let sanitized = ammonia_reading().clean(&stripped).to_string();
     Ok(
