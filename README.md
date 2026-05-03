@@ -5,7 +5,7 @@
 
 A self-hosted Rust service that acts as a multi-tenant IMAP MCP server for claude.ai, using any OpenID Connect provider for authentication.
 
-Users authenticate via their OIDC provider (e.g. GitLab, Keycloak, Auth0), enter their IMAP password once, and then claude.ai accesses their email through the MCP protocol using a Bearer token.
+Users authenticate via their OIDC provider (e.g. GitLab, Keycloak, Auth0), connect one or more IMAP mailboxes (personal, shared team boxes, or — when the operator enables them — private accounts on Gmail, Fastmail, etc.), and then claude.ai accesses email across those mailboxes through the MCP protocol using a Bearer token. Each Claude install corresponds to one OIDC identity and may hold multiple connected mailboxes.
 
 ## Prerequisites
 
@@ -90,12 +90,60 @@ The service will be available at `https://<YOUR_DOMAIN>`.
 
 | Tool | Description |
 |------|-------------|
+| `list_accounts` | List the user's connected mailboxes (account_id, label, IMAP login, host, last-used time, disabled flag) and return a 15-minute signed `manage_url` for adding/removing accounts |
+| `add_account_url` | Return a fresh 15-minute signed link the user opens in a browser to connect another mailbox |
 | `list_folders` | List all IMAP mailbox folders |
 | `list_emails` | List emails in a folder (uid, date, from, subject, seen flag) |
 | `get_email` | Fetch full email by UID (headers + plain text body, S/MIME signed supported) |
 | `search_emails` | Search emails using IMAP SEARCH criteria |
 | `mark_read` | Set \Seen flag on an email by UID |
 | `mark_unread` | Unset \Seen flag on an email by UID |
+| `get_attachment` | Fetch an attachment (text, image, or extracted text from PDF/Office docs) |
+| `create_draft` / `update_draft` | Compose or modify a draft email |
+
+Every IMAP-touching tool accepts an optional `account` parameter (the
+`account_id` from `list_accounts`, or the user's chosen `label`). When the
+user has only one mailbox connected the parameter is optional and defaults
+to it; when they have more than one it is required.
+
+## Multi-Account Support
+
+Each OIDC-authenticated user can connect multiple IMAP mailboxes behind a
+single Claude connector install (Team plans don't let end users add more
+connectors themselves, so all of a user's mailboxes live under one bearer
+token).
+
+- The first account is connected during initial OIDC login.
+- Subsequent accounts are added at `https://<YOUR_DOMAIN>/manage`. The URL
+  is also returned, fresh and signed with a 15-minute lifetime, by the
+  `list_accounts` and `add_account_url` MCP tools.
+- The `/manage` page lets the user list, add, and remove mailboxes. v1
+  doesn't support renaming — delete and re-add to change a label.
+- An account is auto-disabled after 3 consecutive IMAP login failures and
+  must be re-validated in `/manage`.
+
+## IMAP Provider Allowlist
+
+The server only logs into IMAP hosts on a server-side allowlist. The default
+ships with exactly one entry pointing at `IMAP_HOST` / `IMAP_PORT`
+(intended for `mail.factorial.io`). External providers (Gmail with an app
+password, Fastmail, mailbox.org, …) are opt-in by the operator at deploy
+time:
+
+- `IMAP_PROVIDERS` env var: a JSON list (or path to a JSON file).
+- `--imap-providers <path-or-json>` CLI flag: same JSON shape, wins over
+  the env var.
+
+```json
+[
+  { "id": "factorial",  "label": "Factorial",  "host": "mail.factorial.io", "port": 993 },
+  { "id": "gmail",      "label": "Gmail",      "host": "imap.gmail.com",    "port": 993, "note": "Use an app password" },
+  { "id": "fastmail",   "label": "Fastmail",   "host": "imap.fastmail.com", "port": 993 }
+]
+```
+
+Custom hosts are not user-enterable; broadening the list is an operator
+action. Users without an entry on the allowlist cannot connect that mailbox.
 
 ## Architecture
 
@@ -103,21 +151,29 @@ The service will be available at `https://<YOUR_DOMAIN>`.
 claude.ai → POST /register (dynamic client registration)
          → GET  /auth/login (OAuth authorize → redirects to OIDC provider)
                     → OIDC provider login
-                    → GET /auth/callback (show IMAP password form)
-                    → POST /auth/setup (validate IMAP, generate auth code)
+                    → GET /auth/callback (IMAP setup form: provider + login + password + nickname)
+                    → POST /auth/setup (validate IMAP, create first Account, generate auth code)
                     → redirect to claude.ai with authorization code
          → POST /auth/token (exchange code for access token, PKCE verified)
          → POST /mcp (Bearer token → MCP JSON-RPC)
                     ↓
            Validate token (Redis)
                     ↓
+           Resolve Account from oidc_sub + optional `account` selector
+                    ↓
            Decrypt IMAP password (AES-256-GCM)
                     ↓
-           Connect to IMAP server (TLS)
+           Connect to IMAP server (TLS); record last_used_at on success,
+           bump auth_failure_count on auth failure (auto-disable at 3)
                     ↓
            Execute MCP tool
                     ↓
            Return results to claude.ai
+
+User → GET  /manage?t=<ticket>  (15-min single-use link from MCP tools)
+     → cookie session set, page renders the user's accounts
+     → POST /manage/accounts          (add a mailbox; CSRF-protected)
+     → POST /manage/accounts/{id}/delete (remove a mailbox; CSRF-protected)
 ```
 
 ## Environment Variables
@@ -127,8 +183,9 @@ claude.ai → POST /register (dynamic client registration)
 | `OIDC_ISSUER_URL` | Yes | OIDC provider URL (e.g. `https://gitlab.example.com`) |
 | `OIDC_CLIENT_ID` | Yes | OIDC application client ID |
 | `OIDC_CLIENT_SECRET` | Yes | OIDC application client secret |
-| `IMAP_HOST` | Yes | IMAP server hostname |
-| `IMAP_PORT` | No | IMAP port (default: 993) |
+| `IMAP_HOST` | Yes | Default IMAP host. Used as the sole entry of the provider allowlist when `IMAP_PROVIDERS` is unset, and as the migration target for legacy single-account sessions. |
+| `IMAP_PORT` | No | Default IMAP port (default: 993) |
+| `IMAP_PROVIDERS` | No | JSON list (or path to JSON file) of allowed IMAP providers. Replaces the default single-entry allowlist. See "IMAP Provider Allowlist" above. May also be supplied via the `--imap-providers` CLI flag, which takes precedence. |
 | `BASE_URL` | Yes | Public URL of this service, no trailing slash |
 | `REDIS_URL` | Yes | Redis connection URL |
 | `ENCRYPTION_KEY` | Yes | 32-byte AES-256 key, base64-encoded |

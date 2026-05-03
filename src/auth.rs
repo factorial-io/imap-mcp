@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use crate::error::AppError;
 use crate::imap::ImapConnection;
-use crate::session::{AuthCode, AuthFlowState, OAuthClient, PendingSetup};
+use crate::manage::set_manage_cookie_response;
+use crate::session::{Account, AuthCode, AuthFlowIntent, AuthFlowState, OAuthClient, PendingSetup};
 use crate::AppState;
 
 /// Build the OIDC client using auto-discovery.
@@ -173,6 +174,7 @@ pub async fn login(
         oauth_code_challenge_method: params.code_challenge_method,
         pkce_verifier: pkce_verifier.secret().clone(),
         nonce: nonce.secret().clone(),
+        intent: AuthFlowIntent::Connector,
     };
     state
         .sessions
@@ -180,6 +182,42 @@ pub async fn login(
         .await?;
 
     tracing::info!("OAuth login started, redirecting to OIDC provider");
+    Ok(Redirect::temporary(auth_url.as_str()).into_response())
+}
+
+/// GET /auth/manage_login — Start an OIDC flow whose callback drops the user
+/// onto `/manage` instead of the IMAP setup form. Used by direct visits to
+/// `/manage` without a ticket and without a valid management cookie.
+pub async fn manage_login(State(state): State<Arc<AppState>>) -> Result<Response, AppError> {
+    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+    let (auth_url, csrf_token, nonce) = state
+        .oidc_client
+        .authorize_url(
+            AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
+            CsrfToken::new_random,
+            Nonce::new_random,
+        )
+        .add_scope(Scope::new("openid".to_string()))
+        .add_scope(Scope::new("profile".to_string()))
+        .add_scope(Scope::new("email".to_string()))
+        .set_pkce_challenge(pkce_challenge)
+        .url();
+
+    let flow = AuthFlowState {
+        oauth_client_id: String::new(),
+        oauth_redirect_uri: String::new(),
+        oauth_state: String::new(),
+        oauth_code_challenge: String::new(),
+        oauth_code_challenge_method: "S256".to_string(),
+        pkce_verifier: pkce_verifier.secret().clone(),
+        nonce: nonce.secret().clone(),
+        intent: AuthFlowIntent::ManageEntry,
+    };
+    state
+        .sessions
+        .store_auth_flow(csrf_token.secret(), &flow)
+        .await?;
+
     Ok(Redirect::temporary(auth_url.as_str()).into_response())
 }
 
@@ -191,7 +229,11 @@ pub struct CallbackParams {
     state: String,
 }
 
-/// GET /auth/callback — Handle OIDC provider redirect, show IMAP password form.
+/// GET /auth/callback — Handle OIDC provider redirect.
+///
+/// Branches on the stored `AuthFlowState.intent`:
+/// - `Connector` (default, claude.ai-driven): show IMAP setup form.
+/// - `ManageEntry`: set the management cookie and redirect to `/manage`.
 pub async fn callback(
     State(state): State<Arc<AppState>>,
     Query(params): Query<CallbackParams>,
@@ -232,10 +274,18 @@ pub async fn callback(
         .map(|n| n.to_string())
         .unwrap_or_else(|| email.clone());
 
+    // Branch on intent.
+    if flow.intent == AuthFlowIntent::ManageEntry {
+        tracing::info!(oidc_sub = %sub, "OIDC re-auth for /manage successful");
+        let (session_id, _csrf) = state.sessions.create_manage_session(&sub, &email).await?;
+        let dest = format!("{}/manage", state.base_url);
+        return Ok(set_manage_cookie_response(&session_id, &dest));
+    }
+
     tracing::info!("OIDC auth successful, showing IMAP setup form");
 
     // HTML-escape user-controlled values to prevent XSS
-    let name = html_escape(&name);
+    let name_escaped = html_escape(&name);
     let email_display = html_escape(&email);
 
     // Store pending setup in Redis
@@ -255,7 +305,8 @@ pub async fn callback(
         .store_pending_setup(&setup_id, &pending)
         .await?;
 
-    // Render IMAP password form
+    // Render IMAP password form with provider dropdown + editable IMAP email + label.
+    let provider_options = render_provider_options(&state, None);
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -267,19 +318,29 @@ pub async fn callback(
         body {{ font-family: system-ui, sans-serif; max-width: 480px; margin: 60px auto; padding: 0 20px; }}
         h1 {{ font-size: 1.4em; }}
         label {{ display: block; margin-top: 16px; font-weight: 600; }}
-        input {{ width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; }}
+        input, select {{ width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; }}
         button {{ margin-top: 20px; padding: 10px 24px; background: #2563eb; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 1em; }}
         button:hover {{ background: #1d4ed8; }}
-        .error {{ color: #dc2626; margin-top: 12px; }}
+        .hint {{ color: #6b7280; font-size: 0.9em; margin-top: 4px; }}
     </style>
 </head>
 <body>
-    <h1>Hello {name}!</h1>
-    <p>Enter your IMAP password to connect your email to the MCP server.</p>
+    <h1>Hello {name_escaped}!</h1>
+    <p>Connect a mailbox to the MCP server. You'll be able to add more later.</p>
     <form method="POST" action="/auth/setup">
         <input type="hidden" name="setup_id" value="{setup_id}">
-        <label>Email: <strong>{email_display}</strong></label>
-        <label for="imap_password">IMAP Password</label>
+        <p>Signed in as <strong>{email_display}</strong></p>
+        <label for="provider_id">Mail provider</label>
+        <select id="provider_id" name="provider_id" required>
+            {provider_options}
+        </select>
+        <label for="label">Nickname</label>
+        <input type="text" id="label" name="label" required maxlength="64" value="{email_display}">
+        <p class="hint">A short name to distinguish this mailbox if you connect more than one.</p>
+        <label for="imap_email">IMAP login email</label>
+        <input type="email" id="imap_email" name="imap_email" required value="{email_display}">
+        <p class="hint">May differ from your sign-in email (e.g. shared mailboxes).</p>
+        <label for="imap_password">IMAP password</label>
         <input type="password" id="imap_password" name="imap_password" required autocomplete="off">
         <button type="submit">Connect</button>
     </form>
@@ -290,37 +351,105 @@ pub async fn callback(
     Ok(Html(html).into_response())
 }
 
+/// Render `<option>` tags for the provider dropdown.
+pub(crate) fn render_provider_options(state: &AppState, selected_id: Option<&str>) -> String {
+    state
+        .providers
+        .iter()
+        .map(|p| {
+            let selected = if Some(p.id.as_str()) == selected_id {
+                " selected"
+            } else {
+                ""
+            };
+            let label = html_escape(&p.label);
+            let host = html_escape(&p.host);
+            let id = html_escape(&p.id);
+            format!(
+                r#"<option value="{id}"{selected}>{label} ({host}:{port})</option>"#,
+                port = p.port
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n            ")
+}
+
 // --- IMAP Setup + Authorization Code Generation ---
 
 #[derive(Deserialize)]
 pub struct SetupForm {
     setup_id: String,
+    provider_id: String,
+    label: String,
+    imap_email: String,
     imap_password: String,
 }
 
-/// POST /auth/setup — Validate IMAP credentials, generate auth code, redirect to claude.ai.
+/// POST /auth/setup — Validate IMAP credentials, create the user's first
+/// `Account`, generate auth code, redirect to claude.ai.
 pub async fn setup(
     State(state): State<Arc<AppState>>,
     Form(form): Form<SetupForm>,
 ) -> Result<Response, AppError> {
     let pending = state.sessions.get_pending_setup(&form.setup_id).await?;
 
-    // Validate IMAP credentials
-    tracing::info!(email = %pending.email, "Validating IMAP credentials");
+    let provider = state
+        .providers
+        .get(&form.provider_id)
+        .ok_or_else(|| AppError::Auth("unknown provider".into()))?;
+
+    if form.label.trim().is_empty() {
+        return Err(AppError::Auth("label is required".into()));
+    }
+    if form.imap_email.trim().is_empty() {
+        return Err(AppError::Auth("IMAP email is required".into()));
+    }
+
+    // Rate-limit credential validations per oidc_sub so the server can't be
+    // used as a brute-force oracle against the allowlisted IMAP host.
+    state
+        .sessions
+        .check_imap_validate_rate_limit(&pending.oidc_sub)
+        .await?;
+
+    // Validate IMAP credentials against the chosen provider.
+    tracing::info!(
+        oidc_sub = %pending.oidc_sub,
+        provider = %provider.id,
+        imap_email = %form.imap_email,
+        "Validating IMAP credentials for first account"
+    );
     let conn = ImapConnection::connect(
-        &state.imap_host,
-        state.imap_port,
-        &pending.email,
+        &provider.host,
+        provider.port,
+        &form.imap_email,
         &form.imap_password,
     )
     .await
     .map_err(|_| AppError::InvalidCredentials)?;
     conn.logout().await.ok();
 
-    // Encrypt the IMAP password for storage in the auth code
+    // Create the user's first Account record.
     let (enc, iv) = state.sessions.encrypt(&form.imap_password)?;
+    let account = Account {
+        account_id: uuid::Uuid::new_v4().to_string(),
+        label: form.label.trim().to_string(),
+        imap_email: form.imap_email.trim().to_string(),
+        imap_host: provider.host.clone(),
+        imap_port: provider.port,
+        password_enc: enc,
+        password_iv: iv,
+        created_at: chrono::Utc::now().timestamp(),
+        last_used_at: None,
+        auth_failure_count: 0,
+        disabled_at: None,
+    };
+    state
+        .sessions
+        .put_account(&pending.oidc_sub, &account)
+        .await?;
 
-    // Generate authorization code
+    // Generate authorization code (no IMAP password — Account holds it).
     let code = uuid::Uuid::new_v4().to_string();
     let auth_code = AuthCode {
         client_id: pending.oauth_client_id,
@@ -328,13 +457,15 @@ pub async fn setup(
         code_challenge: pending.oauth_code_challenge,
         code_challenge_method: pending.oauth_code_challenge_method,
         email: pending.email.clone(),
-        oidc_sub: pending.oidc_sub,
-        imap_password_enc: enc,
-        imap_password_iv: iv,
+        oidc_sub: pending.oidc_sub.clone(),
     };
     state.sessions.store_auth_code(&code, &auth_code).await?;
 
-    tracing::info!(email = %pending.email, "IMAP validated, redirecting with authorization code");
+    tracing::info!(
+        oidc_sub = %pending.oidc_sub,
+        account_id = %account.account_id,
+        "First account created, redirecting with authorization code"
+    );
 
     // Redirect back to claude.ai's redirect_uri with the authorization code
     let redirect_url = format!(
@@ -386,17 +517,18 @@ pub async fn token(
         return Err(AppError::Auth("PKCE verification failed".into()));
     }
 
-    // Decrypt IMAP password from auth code and create MCP session
-    let imap_password = state
-        .sessions
-        .decrypt(&auth_code.imap_password_enc, &auth_code.imap_password_iv)?;
-
+    // Issue a session bound to the OIDC identity. Account credentials are
+    // already stored under `oidc_sub`.
     let access_token = state
         .sessions
-        .create_session(&auth_code.email, &auth_code.oidc_sub, &imap_password)
+        .create_session(&auth_code.email, &auth_code.oidc_sub)
         .await?;
 
-    tracing::info!(email = %auth_code.email, "Token exchange successful, MCP session created");
+    tracing::info!(
+        oidc_sub = %auth_code.oidc_sub,
+        oidc_email = %auth_code.email,
+        "Token exchange successful, MCP session created"
+    );
 
     let resp = TokenResponse2 {
         access_token,
@@ -448,7 +580,7 @@ pub async fn oauth_authorization_server(State(state): State<Arc<AppState>>) -> i
 }
 
 /// Escape HTML special characters to prevent XSS.
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

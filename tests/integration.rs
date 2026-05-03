@@ -3,6 +3,7 @@ use axum::http::{Request, StatusCode};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use http_body_util::BodyExt;
+use imap_mcp::providers::ProviderList;
 use imap_mcp::{build_router, session::SessionStore, AppState};
 use openidconnect::core::{
     CoreClient, CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreResponseType,
@@ -45,11 +46,11 @@ fn fake_oidc_client() -> CoreClient {
 fn test_state() -> Arc<AppState> {
     let encryption_key = B64.encode([0xABu8; 32]);
     let sessions = SessionStore::new("redis://localhost:6379", &encryption_key).unwrap();
+    let providers = ProviderList::factorial_default("imap.example.com", 993).unwrap();
     Arc::new(AppState::new(
         sessions,
         fake_oidc_client(),
-        "imap.example.com".to_string(),
-        993,
+        providers,
         "https://imap-mcp.example.com".to_string(),
     ))
 }
@@ -312,4 +313,62 @@ fn mark_params_custom_folder() {
     let params: imap_mcp::mcp::MarkParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.uid, 1);
     assert_eq!(params.folder, "Archive");
+}
+
+#[test]
+fn list_emails_params_accepts_account() {
+    let json = r#"{"account": "billing"}"#;
+    let params: imap_mcp::mcp::ListEmailsParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.account.as_deref(), Some("billing"));
+    assert_eq!(params.folder, "INBOX");
+}
+
+// --- /manage route tests ---
+
+#[tokio::test]
+async fn manage_without_ticket_or_cookie_redirects_to_oidc() {
+    let req = Request::builder()
+        .uri("/manage")
+        .body(Body::empty())
+        .unwrap();
+    let resp = send_request(req).await;
+    // Temporary redirect to /auth/manage_login (no cookie, no ticket).
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = resp
+        .headers()
+        .get("location")
+        .expect("redirect should have location")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.ends_with("/auth/manage_login"),
+        "expected /auth/manage_login, got {location}"
+    );
+}
+
+#[tokio::test]
+async fn manage_add_account_without_cookie_returns_401() {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/manage/accounts")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(
+            "csrf_token=x&provider_id=factorial&label=L&imap_email=a@b&imap_password=p",
+        ))
+        .unwrap();
+    let resp = send_request(req).await;
+    // AppError::Auth(...) maps to 401 in error.rs.
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn manage_delete_account_without_cookie_returns_401() {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/manage/accounts/some-id/delete")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from("csrf_token=x"))
+        .unwrap();
+    let resp = send_request(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

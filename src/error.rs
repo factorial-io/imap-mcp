@@ -10,6 +10,9 @@ pub enum AppError {
     #[error("IMAP error: {0}")]
     Imap(String),
 
+    #[error("IMAP authentication failed")]
+    ImapAuth,
+
     #[error("Authentication error: {0}")]
     Auth(String),
 
@@ -18,6 +21,9 @@ pub enum AppError {
 
     #[error("Invalid credentials")]
     InvalidCredentials,
+
+    #[error("Too many credential-validation attempts; retry in {retry_after_secs}s")]
+    RateLimited { retry_after_secs: u64 },
 
     #[error("OIDC error: {0}")]
     Oidc(String),
@@ -43,6 +49,8 @@ impl IntoResponse for AppError {
                 tracing::error!("IMAP error: {self}");
                 (StatusCode::BAD_GATEWAY, "IMAP error".to_string())
             }
+            AppError::ImapAuth => (StatusCode::UNAUTHORIZED, self.to_string()),
+            AppError::RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             AppError::Redis(_) => {
                 tracing::error!("Redis error: {self}");
                 (

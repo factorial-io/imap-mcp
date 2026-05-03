@@ -1,12 +1,49 @@
-use imap_mcp::{auth, build_router, session::SessionStore, AppState};
+use clap::Parser;
+use imap_mcp::{auth, build_router, providers::ProviderList, session::SessionStore, AppState};
 use std::sync::Arc;
 
-fn env_var(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| panic!("{name} environment variable is required"))
-}
+/// Server configuration. Most fields are sourced from environment variables;
+/// `--imap-providers` is a CLI override that wins over the `IMAP_PROVIDERS`
+/// env var.
+#[derive(Parser, Debug)]
+#[command(version, about = "IMAP MCP server", long_about = None)]
+struct Cli {
+    #[arg(long, env = "OIDC_ISSUER_URL")]
+    oidc_issuer_url: String,
 
-fn env_var_or(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_string())
+    #[arg(long, env = "OIDC_CLIENT_ID")]
+    oidc_client_id: String,
+
+    #[arg(long, env = "OIDC_CLIENT_SECRET")]
+    oidc_client_secret: String,
+
+    /// Default IMAP host. Used as the sole entry of the provider allowlist
+    /// when neither --imap-providers nor IMAP_PROVIDERS is set, and as the
+    /// migration target for legacy single-account sessions.
+    #[arg(long, env = "IMAP_HOST")]
+    imap_host: String,
+
+    #[arg(long, env = "IMAP_PORT", default_value_t = 993)]
+    imap_port: u16,
+
+    #[arg(long, env = "BASE_URL")]
+    base_url: String,
+
+    #[arg(long, env = "REDIS_URL")]
+    redis_url: String,
+
+    #[arg(long, env = "ENCRYPTION_KEY")]
+    encryption_key: String,
+
+    #[arg(long, env = "BIND_ADDR", default_value = "0.0.0.0:8080")]
+    bind_addr: String,
+
+    /// IMAP provider allowlist. Either inline JSON (starting with `[`) or a
+    /// path to a JSON file. Wins over the `IMAP_PROVIDERS` env var.
+    /// When neither is set, the allowlist contains exactly one entry pointing
+    /// at `--imap-host` / `--imap-port`.
+    #[arg(long)]
+    imap_providers: Option<String>,
 }
 
 #[tokio::main]
@@ -17,39 +54,49 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let oidc_issuer_url = env_var("OIDC_ISSUER_URL");
-    let oidc_client_id = env_var("OIDC_CLIENT_ID");
-    let oidc_client_secret = env_var("OIDC_CLIENT_SECRET");
-    let imap_host = env_var("IMAP_HOST");
-    let imap_port: u16 = env_var_or("IMAP_PORT", "993").parse()?;
-    let base_url = env_var("BASE_URL");
-    let redis_url = env_var("REDIS_URL");
-    let encryption_key = env_var("ENCRYPTION_KEY");
+    let cli = Cli::parse();
 
-    let sessions = SessionStore::new(&redis_url, &encryption_key)?;
+    // Provider allowlist: --imap-providers (CLI) wins over IMAP_PROVIDERS (env);
+    // either may be inline JSON or a path. If neither is set, the default
+    // ships with a single entry pointing at IMAP_HOST/IMAP_PORT.
+    let providers = if let Some(raw) = cli.imap_providers.as_deref() {
+        ProviderList::parse_inline_or_path(raw)?
+    } else if let Ok(raw) = std::env::var("IMAP_PROVIDERS") {
+        ProviderList::parse_inline_or_path(&raw)?
+    } else {
+        ProviderList::factorial_default(&cli.imap_host, cli.imap_port)?
+    };
 
-    tracing::info!("Discovering OIDC configuration from {oidc_issuer_url}");
+    tracing::info!(
+        providers = ?providers.iter().map(|p| &p.id).collect::<Vec<_>>(),
+        "IMAP provider allowlist loaded"
+    );
+
+    let sessions = SessionStore::new(&cli.redis_url, &cli.encryption_key)?;
+
+    tracing::info!(
+        "Discovering OIDC configuration from {}",
+        cli.oidc_issuer_url
+    );
     let oidc_client = auth::build_oidc_client(
-        &oidc_issuer_url,
-        &oidc_client_id,
-        &oidc_client_secret,
-        &base_url,
+        &cli.oidc_issuer_url,
+        &cli.oidc_client_id,
+        &cli.oidc_client_secret,
+        &cli.base_url,
     )
     .await?;
 
     let state = Arc::new(AppState::new(
         sessions,
         oidc_client,
-        imap_host,
-        imap_port,
-        base_url,
+        providers,
+        cli.base_url,
     ));
 
     let app = build_router(state);
 
-    let bind_addr = env_var_or("BIND_ADDR", "0.0.0.0:8080");
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    tracing::info!("Server listening on {bind_addr}");
+    let listener = tokio::net::TcpListener::bind(&cli.bind_addr).await?;
+    tracing::info!("Server listening on {}", cli.bind_addr);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
