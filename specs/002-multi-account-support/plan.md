@@ -17,12 +17,18 @@ We use a **Claude Team plan**. End users on the desktop app cannot add or config
 
 Consequence: a single connector install must surface multiple mailboxes per user, behind one bearer token, with tool calls able to pick which mailbox they target.
 
-## Non-Goals (for v1)
+## Non-Goals
 
 - Cross-account search or a unified inbox tool.
 - OAuth/XOAUTH2 against external providers (still password / app-password based).
-- Operator-managed shared-mailbox provisioning (admin pre-loads shared credentials and grants by OIDC group). Powerful and probably the right v2; intentionally deferred.
+- **Operator-managed shared-mailbox credential distribution** (admin pre-loads shared credentials, OIDC groups grant access). Confirmed off the roadmap — every team member who wants a shared mailbox supplies its IMAP password themselves. The credential-sharing problem stays out-of-band, not in this server.
 - A polished UI for managing accounts. v1 ships a minimal HTML page; richer UX is later work.
+
+## Decisions (locked in)
+
+- **OIDC identity and IMAP login may differ.** Users can connect a mailbox whose address doesn't match their OIDC email. Both `oidc_sub` / `oidc_email` and `account_id` / `imap_email` are written to every audit log line.
+- **Token blast radius is accepted.** A bearer token reaches every account that user has connected. Audit logging per `account_id` and per-account revocation in `/manage` are sufficient; we don't add per-account sub-tokens, step-up auth, or a forced shorter session TTL on top of the existing 30 days in v1.
+- **External providers are off by default.** The provider allowlist ships with `mail.factorial.io` only; any non-Factorial provider is opt-in by the operator (see "IMAP provider allowlist" below).
 
 ## Current State (concise)
 
@@ -82,7 +88,12 @@ The verified `oidc_sub` is the trust anchor; tokens are references to it. Revoki
 
 ### IMAP provider allowlist
 
-Same as v1: env-configured list of `{ id, label, host, port }`, default ships with `mail.factorial.io`. The `/manage` form's dropdown uses it. Custom hosts are intentionally not offered in v1 — providers added centrally by the operator.
+Env-configured list of `{ id, label, host, port }`. Default ships with **only** `mail.factorial.io`; external providers (Gmail, Fastmail, mailbox.org, …) are opt-in by the operator at deploy time. Two equivalent ways to enable them, mirroring how `main.rs` reads config today:
+
+- `IMAP_PROVIDERS` env var: JSON list of provider entries that **replaces** the default. The deployment that wants Gmail + Fastmail in addition to Factorial sets the full list explicitly.
+- `--imap-providers <path-or-json>` CLI flag (added together with a small `clap`-based arg layer in `main.rs`): same JSON format, points at a file or accepts inline JSON. CLI wins over env if both are set.
+
+The `/manage` form's provider dropdown is built from this list at startup. Custom hosts are not user-enterable; broadening the list is an operator action only.
 
 ### Audit trail
 
@@ -93,7 +104,7 @@ Every IMAP operation logs `{ oidc_sub, account_id, imap_email, imap_host, tool }
 1. **One bearer token = one mailbox, user installs the connector N times** (v1 of this plan). Rejected: not possible on Team plans where users can't add connectors.
 2. **Single admin-managed global account list, no per-user accounts.** Simplest for the operator, but doesn't cover the "private email account" goal and forces every team member to share credentials for the same accounts. Rejected.
 3. **Free-form host/port input** instead of an allowlist. Same trade-off as v1: rejected, allowlist instead.
-4. **Operator-curated shared mailboxes with OIDC-group ACLs** (admin pre-loads `billing@factorial.io` once, OIDC group `team-billing` gets read/write). Powerful and probably the right v2 — but it's a sizeable separate feature. Deferred.
+4. **Operator-curated shared mailboxes with OIDC-group ACLs** (admin pre-loads `billing@factorial.io` once, OIDC group `team-billing` gets read/write). Rejected per product direction: shared-mailbox credential distribution stays out-of-band; users supply the password themselves.
 
 ## Implementation Phases
 
@@ -114,21 +125,19 @@ Estimated size: ~600–900 LOC. A step up from the v1 estimate because of the da
 - **`account` parameter is not free-form server input.** The resolver only loads accounts already attached to the authenticated `oidc_sub`. Cross-user account access is structurally impossible.
 - **Per-`oidc_sub` rate-limit on failed credential validations** (e.g. 5 / 10 min) to neuter brute-force misuse.
 - **Encryption at rest** unchanged: AES-256-GCM with a server-held key, one nonce per account record.
-- **Token compromise has wider blast radius than v1**: a stolen bearer token now reaches every account that user has connected, not just one mailbox. Mitigations: revoke-from-`/manage` per account; revisit the 30-day session TTL (perhaps shorter); audit-log every tool call with `account_id`.
+- **Token compromise reaches every connected account.** Accepted trade-off (see Decisions). Mitigations are limited to per-account revoke from `/manage` and per-`account_id` audit logs; existing 30-day session TTL is unchanged.
 - **No new secret types**; still username + password against IMAP.
 
 ## Open Questions
 
 1. **Account-add UX from inside Claude.** Is surfacing `manage_url` in `list_accounts` (and in zero-account errors) enough, or do we want a dedicated `add_account_url` tool? Lean default: just `list_accounts` + zero-account error.
 2. **Auto-disable on persistent auth failure.** Should an account be marked unusable after N failed IMAP logins (password changed, account locked) and require re-validation in `/manage`? Probably yes; pin down N and the user-visible message.
-3. **Session TTL.** The current 30-day TTL was sized for the old single-account model. Worth shortening now that a token unlocks more mailboxes?
-4. **`manage_url` lifetime.** 5 min? 15? Pick a default and document.
-5. **Should the server retain a per-account "last used" timestamp** to support a future "stale account cleanup" pass? Cheap to add now.
-6. **Renaming accounts.** Required in v1, or is delete-and-re-add fine? Delete-and-re-add is fine if labels are easy to set; revisit if we hear pain.
+3. **`manage_url` lifetime.** 5 min? 15? Pick a default and document.
+4. **Per-account "last used" timestamp** to support a future stale-account cleanup pass? Cheap to add now.
+5. **Renaming accounts.** Required in v1, or is delete-and-re-add fine? Delete-and-re-add is fine if labels are easy to set; revisit if we hear pain.
 
 ## Out of Scope / Future Work
 
-- Operator-managed shared mailboxes with OIDC-group ACLs (the v2 shape that admins will probably want).
 - OAuth2 / XOAUTH2 against Gmail / Microsoft 365.
 - Cross-account search or a unified inbox tool.
 - A self-service way for non-admins to broaden the IMAP provider allowlist.
