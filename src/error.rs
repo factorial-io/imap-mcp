@@ -10,6 +10,9 @@ pub enum AppError {
     #[error("IMAP error: {0}")]
     Imap(String),
 
+    #[error("IMAP authentication failed")]
+    ImapAuth,
+
     #[error("Authentication error: {0}")]
     Auth(String),
 
@@ -43,6 +46,7 @@ impl IntoResponse for AppError {
                 tracing::error!("IMAP error: {self}");
                 (StatusCode::BAD_GATEWAY, "IMAP error".to_string())
             }
+            AppError::ImapAuth => (StatusCode::UNAUTHORIZED, self.to_string()),
             AppError::Redis(_) => {
                 tracing::error!("Redis error: {self}");
                 (

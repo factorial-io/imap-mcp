@@ -966,10 +966,10 @@ impl ImapConnection {
             .await
             .map_err(|e| AppError::Imap(format!("TLS handshake failed: {e}")))?;
         let client = async_imap::Client::new(tls_stream);
-        let session = client
-            .login(email, password)
-            .await
-            .map_err(|e| AppError::Imap(format!("IMAP login failed: {}", e.0)))?;
+        let session = client.login(email, password).await.map_err(|e| {
+            tracing::warn!("IMAP login failed: {}", e.0);
+            AppError::ImapAuth
+        })?;
         Ok(Self { session })
     }
 

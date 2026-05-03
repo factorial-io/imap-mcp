@@ -2,43 +2,147 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
-use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
+use crate::error::AppError;
 use crate::extract;
 use crate::imap::{self, DraftContent, ImapConnection, MAX_LLM_CONTENT_SIZE};
+use crate::manage::{AccountSummary, ListAccountsResult};
+use crate::session::Account;
+use crate::{AccountResolver, ResolveError};
 
 /// MCP server instance — one per request, holds session context.
 pub struct ImapMcpServer {
-    pub email: String,
-    imap_password: SecretString,
-    pub imap_host: String,
-    pub imap_port: u16,
+    resolver: AccountResolver,
     tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
 impl ImapMcpServer {
-    pub fn new(email: String, imap_password: String, imap_host: String, imap_port: u16) -> Self {
+    pub fn new(resolver: AccountResolver) -> Self {
         Self {
-            email,
-            imap_password: SecretString::from(imap_password),
-            imap_host,
-            imap_port,
+            resolver,
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Open a fresh IMAP connection using this server's credentials.
-    async fn connect(&self) -> Result<ImapConnection, rmcp::ErrorData> {
-        ImapConnection::connect(
-            &self.imap_host,
-            self.imap_port,
-            &self.email,
-            self.imap_password.expose_secret(),
+    /// Resolve an account, connect, record success on login. The returned
+    /// connection has already passed IMAP login.
+    async fn connect_with(
+        &self,
+        selector: Option<&str>,
+    ) -> Result<(Account, ImapConnection), rmcp::ErrorData> {
+        let account = self
+            .resolver
+            .resolve(selector)
+            .await
+            .map_err(resolve_to_rmcp)?;
+        let password = self
+            .resolver
+            .store
+            .decrypt_account_password(&account)
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("decrypt failed: {e}"), None))?;
+
+        match ImapConnection::connect(
+            &account.imap_host,
+            account.imap_port,
+            &account.imap_email,
+            &password,
         )
         .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("IMAP connection failed: {e}"), None))
+        {
+            Ok(conn) => {
+                // Login succeeded — clear the failure counter and bump last_used_at.
+                if let Err(e) = self
+                    .resolver
+                    .store
+                    .record_account_success(&self.resolver.oidc_sub, &account.account_id)
+                    .await
+                {
+                    tracing::warn!("failed to record account success: {e}");
+                }
+                tracing::info!(
+                    oidc_sub = %self.resolver.oidc_sub,
+                    account_id = %account.account_id,
+                    imap_email = %account.imap_email,
+                    imap_host = %account.imap_host,
+                    "IMAP login ok"
+                );
+                Ok((account, conn))
+            }
+            Err(AppError::ImapAuth) => {
+                let just_disabled = self
+                    .resolver
+                    .store
+                    .record_account_auth_failure(&self.resolver.oidc_sub, &account.account_id)
+                    .await
+                    .unwrap_or(false);
+                let manage_url = self
+                    .resolver
+                    .fresh_manage_url()
+                    .await
+                    .map_err(resolve_to_rmcp)?;
+                let msg = if just_disabled {
+                    format!(
+                        "IMAP login failed; account '{}' is now disabled after repeated failures. Re-validate at {manage_url}",
+                        account.label
+                    )
+                } else {
+                    format!(
+                        "IMAP login failed for account '{}'. If the password changed, re-validate at {manage_url}",
+                        account.label
+                    )
+                };
+                Err(rmcp::ErrorData::invalid_request(msg, None))
+            }
+            Err(e) => Err(rmcp::ErrorData::internal_error(
+                format!("IMAP connection failed: {e}"),
+                None,
+            )),
+        }
     }
+}
+
+fn resolve_to_rmcp(err: ResolveError) -> rmcp::ErrorData {
+    match err {
+        ResolveError::NoAccounts { manage_url } => rmcp::ErrorData::invalid_request(
+            format!(
+                "No mailboxes connected. Open {manage_url} in your browser to add one."
+            ),
+            None,
+        ),
+        ResolveError::AccountRequired => rmcp::ErrorData::invalid_params(
+            "Multiple mailboxes are connected — pass `account` (account_id or label). Call list_accounts to see them.",
+            None,
+        ),
+        ResolveError::NotFound(s) => {
+            rmcp::ErrorData::invalid_params(format!("Account '{s}' not found."), None)
+        }
+        ResolveError::Ambiguous(s) => rmcp::ErrorData::invalid_params(
+            format!("Label '{s}' matches multiple accounts — pass account_id instead."),
+            None,
+        ),
+        ResolveError::Disabled { manage_url } => rmcp::ErrorData::invalid_request(
+            format!(
+                "Account is disabled (too many failed logins). Re-validate at {manage_url}"
+            ),
+            None,
+        ),
+        ResolveError::Internal(s) => rmcp::ErrorData::internal_error(s, None),
+    }
+}
+
+// --- Shared `account` parameter ---
+
+/// Optional `account` selector applied to every IMAP-touching tool. Accepts
+/// either an `account_id` (preferred, unambiguous) or a `label`. Required
+/// when the user has more than one connected mailbox.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct AccountSelector {
+    /// Account id or label. If you have only one mailbox, leave this off.
+    /// If you have more than one, call list_accounts to see them and pass
+    /// the account_id of the one you want.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 // --- Tool parameter types ---
@@ -54,6 +158,10 @@ pub struct ListEmailsParams {
     /// Number of emails to skip from newest (default: 0)
     #[serde(default)]
     pub offset: u32,
+    /// Optional account selector (account_id or label). Required if you have
+    /// more than one mailbox connected.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -63,6 +171,9 @@ pub struct GetEmailParams {
     /// IMAP folder name (default: INBOX)
     #[serde(default = "default_inbox")]
     pub folder: String,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -75,6 +186,9 @@ pub struct SearchEmailsParams {
     /// Maximum number of results (default: 20)
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -86,6 +200,9 @@ pub struct GetAttachmentParams {
     /// IMAP folder name (default: INBOX)
     #[serde(default = "default_inbox")]
     pub folder: String,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -95,6 +212,9 @@ pub struct MarkParams {
     /// IMAP folder name (default: INBOX)
     #[serde(default = "default_inbox")]
     pub folder: String,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -123,6 +243,9 @@ pub struct CreateDraftParams {
     /// IMAP folder to save the draft in (default: Drafts)
     #[serde(default = "default_drafts")]
     pub folder: String,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -153,6 +276,9 @@ pub struct UpdateDraftParams {
     /// IMAP folder containing the draft (default: Drafts)
     #[serde(default = "default_drafts")]
     pub folder: String,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 fn default_inbox() -> String {
@@ -169,9 +295,52 @@ fn default_limit() -> u32 {
 
 #[tool_router]
 impl ImapMcpServer {
-    #[tool(description = "List all IMAP mailbox folders")]
-    async fn list_folders(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let mut conn = self.connect().await?;
+    #[tool(
+        description = "List the mailboxes (IMAP accounts) connected to this MCP server for the current user. Returns each account's id, label, IMAP login email, host, last-used time, and disabled flag, plus a short-lived signed manage_url the user can open in their browser to add or remove accounts. If only one account is connected, IMAP tools default to it; if more than one, pass `account` (account_id or label) on every IMAP tool call."
+    )]
+    async fn list_accounts(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let accounts = self.resolver.list().await.map_err(resolve_to_rmcp)?;
+        let manage_url = crate::manage::issue_manage_url(
+            &self.resolver.store,
+            &self.resolver.base_url,
+            &self.resolver.oidc_sub,
+            &self.resolver.oidc_email,
+        )
+        .await
+        .map_err(|e| rmcp::ErrorData::internal_error(format!("manage_url: {e}"), None))?;
+
+        let result = ListAccountsResult {
+            accounts: accounts.iter().map(AccountSummary::from).collect(),
+            manage_url,
+        };
+        let json = Content::json(&result)
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
+        Ok(CallToolResult::success(vec![json]))
+    }
+
+    #[tool(
+        description = "Return a fresh, short-lived (15 minute) signed URL the user can open in their browser to add a new mailbox to this MCP server. Use this when the user says something like 'connect my Gmail' or 'add my work email' — surface the URL to them. After they finish in the browser, call list_accounts to confirm."
+    )]
+    async fn add_account_url(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let manage_url = crate::manage::issue_manage_url(
+            &self.resolver.store,
+            &self.resolver.base_url,
+            &self.resolver.oidc_sub,
+            &self.resolver.oidc_email,
+        )
+        .await
+        .map_err(|e| rmcp::ErrorData::internal_error(format!("manage_url: {e}"), None))?;
+        let json = Content::json(&manage_url)
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
+        Ok(CallToolResult::success(vec![json]))
+    }
+
+    #[tool(description = "List all IMAP mailbox folders for the selected account.")]
+    async fn list_folders(
+        &self,
+        Parameters(params): Parameters<AccountSelector>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
         let folders = conn
             .list_folders()
             .await
@@ -189,7 +358,7 @@ impl ImapMcpServer {
         &self,
         Parameters(params): Parameters<ListEmailsParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let mut conn = self.connect().await?;
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
         let emails = conn
             .list_emails(&params.folder, params.limit, params.offset)
             .await
@@ -207,7 +376,7 @@ impl ImapMcpServer {
         &self,
         Parameters(params): Parameters<GetEmailParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let mut conn = self.connect().await?;
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
         let email = conn
             .get_email(&params.folder, params.uid)
             .await
@@ -225,7 +394,7 @@ impl ImapMcpServer {
         &self,
         Parameters(params): Parameters<GetAttachmentParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let mut conn = self.connect().await?;
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
         let attachment = conn
             .get_attachment(&params.folder, params.uid, params.attachment_index)
             .await
@@ -325,7 +494,7 @@ impl ImapMcpServer {
         &self,
         Parameters(params): Parameters<SearchEmailsParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let mut conn = self.connect().await?;
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
         let emails = conn
             .search_emails(&params.folder, &params.query, params.limit)
             .await
@@ -341,7 +510,7 @@ impl ImapMcpServer {
         &self,
         Parameters(params): Parameters<MarkParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let mut conn = self.connect().await?;
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
         conn.mark_read(&params.folder, params.uid)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
@@ -357,7 +526,7 @@ impl ImapMcpServer {
         &self,
         Parameters(params): Parameters<MarkParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let mut conn = self.connect().await?;
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
         conn.mark_unread(&params.folder, params.uid)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
@@ -375,11 +544,11 @@ impl ImapMcpServer {
         &self,
         Parameters(params): Parameters<CreateDraftParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let mut conn = self.connect().await?;
+        let (account, mut conn) = self.connect_with(params.account.as_deref()).await?;
         let body = normalize_body(&params.body);
         reject_flat_body(&body)?;
         let draft = DraftContent {
-            from: &self.email,
+            from: &account.imap_email,
             to: &params.to,
             subject: &params.subject,
             body: &body,
@@ -412,11 +581,11 @@ impl ImapMcpServer {
         &self,
         Parameters(params): Parameters<UpdateDraftParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let mut conn = self.connect().await?;
+        let (account, mut conn) = self.connect_with(params.account.as_deref()).await?;
         let body = normalize_body(&params.body);
         reject_flat_body(&body)?;
         let draft = DraftContent {
-            from: &self.email,
+            from: &account.imap_email,
             to: &params.to,
             subject: &params.subject,
             body: &body,
@@ -466,11 +635,6 @@ fn normalize_body(body: &str) -> String {
 const FLAT_BODY_THRESHOLD: usize = 100;
 
 /// Reject email bodies that appear to be a single long line with no formatting.
-///
-/// When the body exceeds [`FLAT_BODY_THRESHOLD`] characters and contains no
-/// newline characters, it almost certainly means the caller forgot to include
-/// line breaks. Returning an error forces the LLM to retry with proper
-/// paragraph breaks rather than silently saving a badly formatted draft.
 fn reject_flat_body(body: &str) -> Result<(), rmcp::ErrorData> {
     if !body.contains('\n') && body.chars().count() > FLAT_BODY_THRESHOLD {
         return Err(rmcp::ErrorData::invalid_params(
@@ -510,7 +674,7 @@ impl ServerHandler for ImapMcpServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions(
-            "IMAP email server. Use the tools to list folders, read emails, search, manage read status, fetch attachments, and create or edit drafts. When reading an email with get_email, attachment metadata is included. Use get_attachment with the attachment index to fetch the actual content — for PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. Use create_draft to compose a new draft and update_draft to modify an existing one. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
+            "IMAP email server with multi-account support. One MCP install can hold multiple mailboxes per user (personal, shared team boxes, etc.). Use list_accounts to see what's connected and to get a manage_url the user can open to add or remove mailboxes; use add_account_url for an 'add a new mailbox' link without first listing. If only one account is connected, IMAP tools default to it; if more than one, pass `account` (account_id from list_accounts, or label) on every IMAP call. The remaining tools — list_folders, list_emails, get_email, search_emails, mark_read, mark_unread, get_attachment, create_draft, update_draft — work as before. When reading an email with get_email, attachment metadata is included; use get_attachment with the attachment index to fetch the actual content. For PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
         )
     }
 }
@@ -537,8 +701,6 @@ mod tests {
 
     #[test]
     fn normalize_body_skips_when_real_newlines_present() {
-        // When real newlines exist, literal \n is left untouched to avoid
-        // corrupting intentional backslash-n sequences (e.g. code snippets).
         assert_eq!(
             normalize_body("Line1\nLine2\\nLine3"),
             "Line1\nLine2\\nLine3"
@@ -547,7 +709,6 @@ mod tests {
 
     #[test]
     fn reject_flat_body_allows_short_single_line() {
-        // Short bodies like "Thanks!" are fine without newlines.
         assert!(reject_flat_body("Thanks for the update!").is_ok());
     }
 
