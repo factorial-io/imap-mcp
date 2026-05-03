@@ -56,30 +56,35 @@ Two Redis records per user:
 
 ```rust
 pub struct Account {
-    pub account_id:   String,  // server-issued stable slug
-    pub label:        String,  // user-supplied nickname, e.g. "Billing"
-    pub imap_email:   String,
-    pub imap_host:    String,  // must be in the provider allowlist
-    pub imap_port:    u16,
-    pub password_enc: String,  // AES-256-GCM, unchanged scheme
-    pub password_iv:  String,
-    pub created_at:   i64,
+    pub account_id:        String,  // server-issued stable slug
+    pub label:             String,  // user-supplied nickname, e.g. "Billing"
+    pub imap_email:        String,
+    pub imap_host:         String,  // must be in the provider allowlist
+    pub imap_port:         u16,
+    pub password_enc:      String,  // AES-256-GCM, unchanged scheme
+    pub password_iv:       String,
+    pub created_at:        i64,
+    pub last_used_at:      Option<i64>,  // updated on each successful tool call
+    pub auth_failure_count: u32,    // consecutive failures since last success
+    pub disabled_at:       Option<i64>, // set when auto-disabled
 }
 ```
 
-The verified `oidc_sub` is the trust anchor; tokens are references to it. Revoking a token doesn't lose accounts. Migration shim: legacy single-account sessions are read once and rewritten as one auto-generated `Account` keyed under their `oidc_sub`.
+The verified `oidc_sub` is the trust anchor; tokens are references to it. Revoking a token doesn't lose accounts. Migration shim: legacy single-account sessions are read once and rewritten as one auto-generated `Account` keyed under their `oidc_sub`, with `label = imap_email` (unambiguous and distinct if the user later adds another account).
 
 ### Onboarding flow
 
 - **Initial connect** (existing OAuth flow, lightly extended). OIDC → setup form → user picks provider from the allowlist, supplies IMAP email + password + nickname → first `Account` created and attached to `oidc_sub` → bearer token issued.
-- **Adding another mailbox.** The MCP server exposes a small `/manage` page (server-side rendered HTML, OIDC-protected, no JS framework). The page lists the user's accounts and lets them add or remove one. Users reach it via:
-  - The `manage_url` returned by the new `list_accounts` MCP tool (short-lived, signed, OIDC required when opened).
+- **Adding another mailbox.** The MCP server exposes a small `/manage` page (server-side rendered HTML, OIDC-protected, no JS framework). The page lists the user's accounts and lets them add or remove one. The page does **not** support renaming in v1 — to change a label, delete the account and re-add it. Users reach `/manage` via:
+  - The `manage_url` returned by the new `list_accounts` MCP tool (15-minute signed link; OIDC re-auth still required at `/manage` itself).
+  - A new `add_account_url` MCP tool that returns the same kind of signed link without first listing accounts (for "add my Gmail" intents).
   - A direct bookmark to `https://<mcp-host>/manage`.
 - **Removing an account** deletes the record from Redis. Other accounts and the bearer token are unaffected.
 
 ### MCP tool changes
 
-- New tool: `list_accounts` → `[{ account_id, label, imap_email, imap_host }, …]`, plus a short-lived signed `manage_url` for adding/removing accounts.
+- New tool: `list_accounts` → `[{ account_id, label, imap_email, imap_host, last_used_at, disabled }, …]`, plus a short-lived signed `manage_url` for adding/removing accounts.
+- New tool: `add_account_url` → `{ url, expires_at }`. Returns a fresh 15-minute signed `/manage` link. For when the agent's intent is "add a new mailbox" without first enumerating existing ones.
 - Every existing tool gains an optional `account` parameter (`account_id` or `label`). Resolution rules:
   - 0 accounts → error with the `manage_url` ("No mailboxes connected — open … to add one").
   - 1 account → `account` optional, defaults to that one.
@@ -95,9 +100,13 @@ Env-configured list of `{ id, label, host, port }`. Default ships with **only** 
 
 The `/manage` form's provider dropdown is built from this list at startup. Custom hosts are not user-enterable; broadening the list is an operator action only.
 
+### Account auto-disable on auth failure
+
+After **3 consecutive** failed IMAP logins for the same account, the resolver marks the account `disabled` (sets `disabled_at`) and stops attempting it. Subsequent tool calls return a clear "credentials no longer valid — re-validate at `<manage_url>`" error that includes a fresh signed `manage_url`. Re-validating the password successfully in `/manage` clears `disabled_at` and resets `auth_failure_count`. Any successful login also resets the counter, so transient blips don't accumulate over days.
+
 ### Audit trail
 
-Every IMAP operation logs `{ oidc_sub, account_id, imap_email, imap_host, tool }`. `oidc_sub` is the human; `account_id` is which mailbox they used.
+Every IMAP operation logs `{ oidc_sub, account_id, imap_email, imap_host, tool, outcome }`. `oidc_sub` is the human; `account_id` is which mailbox they used. `last_used_at` on the account is updated on success.
 
 ## Alternatives Considered
 
@@ -112,8 +121,8 @@ Every IMAP operation logs `{ oidc_sub, account_id, imap_email, imap_host, tool }
 2. **Allowlist plumbing.** `IMAP_PROVIDERS` env (JSON) loaded into `AppState`. Default to a single entry pointing at the existing `IMAP_HOST/PORT`.
 3. **`/manage` page.** OIDC-protected HTML route to list / add / remove accounts. Reuses the existing setup-form HTML and credential-validation path. CSRF-token-protected POSTs.
 4. **Account resolver.** Single helper `(oidc_sub, requested_account) -> Account` used by every tool, with the 0/1/N rules above.
-5. **MCP tool updates.** Add `list_accounts` tool. Add optional `account` parameter to every existing tool. Pass the resolved `Account` into `ImapMcpServer::new`.
-6. **Tests.** Unit: account-record serialization; resolver rules (0/1/N); legacy-session migration. Integration: add two accounts, target each independently, remove one and verify the other still works, verify legacy single-account sessions still work post-migration.
+5. **MCP tool updates.** Add `list_accounts` and `add_account_url` tools. Add optional `account` parameter to every existing tool. Pass the resolved `Account` into `ImapMcpServer::new`. Update `last_used_at` on success; bump `auth_failure_count` and auto-disable on the third consecutive failure.
+6. **Tests.** Unit: account-record serialization; resolver rules (0/1/N); legacy-session migration with `label = imap_email`; auto-disable trigger at 3 failures; counter reset on success. Integration: add two accounts, target each independently, remove one and verify the other still works, verify legacy single-account sessions still work post-migration, verify a disabled account returns the manage-url error.
 7. **Docs.** README, `/manage` page copy, env example.
 
 Estimated size: ~600–900 LOC. A step up from the v1 estimate because of the data-model split, the account parameter on every tool, and the management page — still mostly additive.
@@ -128,13 +137,13 @@ Estimated size: ~600–900 LOC. A step up from the v1 estimate because of the da
 - **Token compromise reaches every connected account.** Accepted trade-off (see Decisions). Mitigations are limited to per-account revoke from `/manage` and per-`account_id` audit logs; existing 30-day session TTL is unchanged.
 - **No new secret types**; still username + password against IMAP.
 
-## Open Questions
+## Resolved Open Questions
 
-1. **Account-add UX from inside Claude.** Is surfacing `manage_url` in `list_accounts` (and in zero-account errors) enough, or do we want a dedicated `add_account_url` tool? Lean default: just `list_accounts` + zero-account error.
-2. **Auto-disable on persistent auth failure.** Should an account be marked unusable after N failed IMAP logins (password changed, account locked) and require re-validation in `/manage`? Probably yes; pin down N and the user-visible message.
-3. **`manage_url` lifetime.** 5 min? 15? Pick a default and document.
-4. **Per-account "last used" timestamp** to support a future stale-account cleanup pass? Cheap to add now.
-5. **Renaming accounts.** Required in v1, or is delete-and-re-add fine? Delete-and-re-add is fine if labels are easy to set; revisit if we hear pain.
+1. **Account-add UX:** dedicated `add_account_url` MCP tool **in addition** to the `manage_url` returned by `list_accounts` and zero-account errors.
+2. **Auto-disable on auth failure:** mark the account disabled after **3 consecutive** failed IMAP logins; surface a re-validate error with a fresh `manage_url`. Counter resets on any successful login.
+3. **`manage_url` lifetime:** **15 minutes**. OIDC re-auth still required at `/manage` itself.
+4. **Per-account `last_used_at` timestamp:** **track it.** Updated on every successful tool call; surfaced in `list_accounts`.
+5. **Renaming accounts:** **not in v1** — delete-and-re-add only. Legacy single-account migrations get `label = imap_email` so they are immediately distinguishable.
 
 ## Out of Scope / Future Work
 
