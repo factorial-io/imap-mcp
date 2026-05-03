@@ -14,7 +14,6 @@ pub struct ImapMcpServer {
     imap_password: SecretString,
     pub imap_host: String,
     pub imap_port: u16,
-    tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
 impl ImapMcpServer {
@@ -24,7 +23,6 @@ impl ImapMcpServer {
             imap_password: SecretString::from(imap_password),
             imap_host,
             imap_port,
-            tool_router: Self::tool_router(),
         }
     }
 
