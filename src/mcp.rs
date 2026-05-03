@@ -70,12 +70,27 @@ impl ImapMcpServer {
                 Ok((account, conn))
             }
             Err(AppError::ImapAuth) => {
-                let just_disabled = self
+                // Don't suppress Redis errors silently: log and proceed with
+                // `false` (we'll still surface a "login failed" error to the
+                // caller, just won't be able to mark the account auto-disabled
+                // until Redis recovers).
+                let just_disabled = match self
                     .resolver
                     .store
                     .record_account_auth_failure(&self.resolver.oidc_sub, &account.account_id)
                     .await
-                    .unwrap_or(false);
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            oidc_sub = %self.resolver.oidc_sub,
+                            account_id = %account.account_id,
+                            error = %e,
+                            "failed to record auth failure"
+                        );
+                        false
+                    }
+                };
                 let manage_url = self
                     .resolver
                     .fresh_manage_url()
@@ -124,6 +139,16 @@ fn resolve_to_rmcp(err: ResolveError) -> rmcp::ErrorData {
         ResolveError::Disabled { manage_url } => rmcp::ErrorData::invalid_request(
             format!(
                 "Account is disabled (too many failed logins). Re-validate at {manage_url}"
+            ),
+            None,
+        ),
+        ResolveError::ProviderRemoved {
+            host,
+            port,
+            manage_url,
+        } => rmcp::ErrorData::invalid_request(
+            format!(
+                "This mailbox uses provider {host}:{port} which is no longer in the operator's allowlist. Remove the account and reconnect at {manage_url}"
             ),
             None,
         ),

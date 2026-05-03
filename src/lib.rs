@@ -136,6 +136,14 @@ pub enum ResolveError {
     Ambiguous(String),
     #[error("account is disabled — re-validate at {manage_url}")]
     Disabled { manage_url: String },
+    #[error(
+        "account uses provider {host}:{port} which is no longer in the allowlist; remove and re-add at {manage_url}"
+    )]
+    ProviderRemoved {
+        host: String,
+        port: u16,
+        manage_url: String,
+    },
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -159,7 +167,13 @@ impl AccountResolver {
         let account = match selector {
             None => {
                 if accounts.len() == 1 {
-                    accounts.into_iter().next().unwrap()
+                    // The `len == 1` guard makes `next()` non-empty in
+                    // practice; `ok_or_else` keeps the no-`unwrap` rule
+                    // intact in case an upstream change ever invalidates
+                    // the invariant.
+                    accounts.into_iter().next().ok_or_else(|| {
+                        ResolveError::Internal("account list shrank between checks".into())
+                    })?
                 } else {
                     return Err(ResolveError::AccountRequired);
                 }
@@ -183,6 +197,24 @@ impl AccountResolver {
         if account.is_disabled() {
             let url = self.fresh_manage_url().await?;
             return Err(ResolveError::Disabled { manage_url: url });
+        }
+
+        // Allowlist enforcement on use: reject accounts whose provider has
+        // since been removed from the allowlist. The check is an in-memory
+        // lookup; the operator can revoke a provider by editing config and
+        // restarting, and existing accounts on that host stop working
+        // immediately. Users see a clear error pointing at /manage.
+        if self
+            .providers
+            .get_by_host(&account.imap_host, account.imap_port)
+            .is_none()
+        {
+            let url = self.fresh_manage_url().await?;
+            return Err(ResolveError::ProviderRemoved {
+                host: account.imap_host.clone(),
+                port: account.imap_port,
+                manage_url: url,
+            });
         }
 
         Ok(account)
@@ -231,8 +263,13 @@ impl AccountResolver {
 
         let provider = self.providers.first();
         let now = chrono::Utc::now().timestamp();
+        // Deterministic account_id derived from oidc_sub + imap_email so that
+        // concurrent migrations for the same legacy session converge on the
+        // same record (HSET overwrites in-place) rather than producing
+        // duplicate accounts under different UUIDs.
+        let account_id = legacy_migrated_account_id(&self.oidc_sub, &session.oidc_email);
         let migrated = Account {
-            account_id: uuid::Uuid::new_v4().to_string(),
+            account_id,
             // Lock-in decision: legacy migration uses imap_email as the label
             // so it's immediately distinguishable if the user later adds another.
             label: session.oidc_email.clone(),
@@ -331,4 +368,55 @@ pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     let auth = headers.get("authorization")?.to_str().ok()?;
     let token = auth.strip_prefix("Bearer ")?;
     Some(token.to_string())
+}
+
+/// Stable account_id used by the legacy single-account migration shim.
+/// Deterministic over `(oidc_sub, imap_email)` so concurrent migrations for
+/// the same legacy session converge on the same record. The `mig-` prefix
+/// keeps these visually distinct from UUIDs minted for newly-added accounts.
+fn legacy_migrated_account_id(oidc_sub: &str, imap_email: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(oidc_sub.as_bytes());
+    h.update(b"\x00");
+    h.update(imap_email.as_bytes());
+    let digest = h.finalize();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("mig-{}", &hex[..32])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_migrated_account_id_is_deterministic() {
+        let a = legacy_migrated_account_id("sub-1", "alice@x");
+        let b = legacy_migrated_account_id("sub-1", "alice@x");
+        assert_eq!(a, b);
+        assert!(a.starts_with("mig-"));
+        assert_eq!(a.len(), "mig-".len() + 32);
+    }
+
+    #[test]
+    fn legacy_migrated_account_id_differs_per_user() {
+        assert_ne!(
+            legacy_migrated_account_id("sub-1", "alice@x"),
+            legacy_migrated_account_id("sub-2", "alice@x"),
+        );
+        assert_ne!(
+            legacy_migrated_account_id("sub-1", "alice@x"),
+            legacy_migrated_account_id("sub-1", "bob@x"),
+        );
+    }
+
+    #[test]
+    fn legacy_migrated_account_id_distinguishes_separator_collisions() {
+        // Without a separator, ("a", "b") and ("ab", "") would collide.
+        // The NUL byte separator prevents that.
+        assert_ne!(
+            legacy_migrated_account_id("a", "b"),
+            legacy_migrated_account_id("ab", ""),
+        );
+    }
 }

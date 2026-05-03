@@ -261,18 +261,13 @@ async fn require_session(
         .ok_or_else(|| AppError::Auth("no management session".into()))
 }
 
-/// Constant-time string equality.
+/// Constant-time string equality, including over unequal-length inputs.
+///
+/// Wraps `subtle::ConstantTimeEq` so length mismatch doesn't leak via early
+/// return — both branches do the same work.
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 fn render_manage_page(
@@ -325,12 +320,16 @@ fn render_manage_page(
                     <td>{last_used}</td>
                     <td>{status}</td>
                     <td>
-                        <form method="POST" action="/manage/accounts/{id}/delete" onsubmit="return confirm('Remove {label}?');">
+                        <form method="POST" action="/manage/accounts/{id}/delete" data-confirm-label="{label}" onsubmit="return confirm('Remove ' + this.dataset.confirmLabel + '?');">
                             <input type="hidden" name="csrf_token" value="{csrf}">
                             <button type="submit" class="danger">Remove</button>
                         </form>
                     </td>
                 </tr>"#,
+                // `label` lands in a `data-` attribute (HTML-escaped); the
+                // inline JS reads it via `this.dataset.confirmLabel`, so user
+                // input never enters a JS string literal — quote-injection
+                // (`O'Brien`) and HTML-decoding tricks both fail safely.
                 label = html_escape(&a.label),
                 email = html_escape(&a.imap_email),
                 host = html_escape(&a.imap_host),

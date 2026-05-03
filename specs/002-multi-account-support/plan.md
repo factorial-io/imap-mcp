@@ -76,8 +76,8 @@ The verified `oidc_sub` is the trust anchor; tokens are references to it. Revoki
 
 - **Initial connect** (existing OAuth flow, lightly extended). OIDC → setup form → user picks provider from the allowlist, supplies IMAP email + password + nickname → first `Account` created and attached to `oidc_sub` → bearer token issued.
 - **Adding another mailbox.** The MCP server exposes a small `/manage` page (server-side rendered HTML, OIDC-protected, no JS framework). The page lists the user's accounts and lets them add or remove one. The page does **not** support renaming in v1 — to change a label, delete the account and re-add it. Users reach `/manage` via:
-  - The `manage_url` returned by the new `list_accounts` MCP tool (15-minute signed link; OIDC re-auth still required at `/manage` itself).
-  - A new `add_account_url` MCP tool that returns the same kind of signed link without first listing accounts (for "add my Gmail" intents).
+  - The `manage_url` returned by the new `list_accounts` MCP tool (a 15-minute single-use ticket — see "manage_url ticket scheme" below).
+  - A new `add_account_url` MCP tool that returns the same kind of ticket-link without first listing accounts (for "add my Gmail" intents).
   - A direct bookmark to `https://<mcp-host>/manage`.
 - **Removing an account** deletes the record from Redis. Other accounts and the bearer token are unaffected.
 
@@ -90,6 +90,55 @@ The verified `oidc_sub` is the trust anchor; tokens are references to it. Revoki
   - 1 account → `account` optional, defaults to that one.
   - 2+ accounts → `account` required; on omission the error tells the agent to call `list_accounts` first.
 - `label` is accepted as a convenience for agent ergonomics; ambiguous labels error.
+
+### `manage_url` ticket scheme
+
+`manage_url` is **not** a cryptographically signed token. It carries an
+opaque random UUID stored as a server-side Redis record:
+
+- `mgmt:ticket:{uuid}` → `{ oidc_sub, oidc_email, created_at }` with a
+  900-second TTL.
+- The first GET to `/manage?t=<uuid>` redeems the ticket: it is read,
+  validated against the live Redis record, and **deleted** (single-use).
+  A separate `mgmt_session` cookie is set that persists for the rest of
+  the management session.
+- An attacker who steals a `manage_url` from a transcript or browser
+  history can use it once, within 15 minutes, after which it's
+  unusable. They cannot forge new ones — minting requires either a valid
+  bearer token (via the `list_accounts` / `add_account_url` MCP tools)
+  or an interactive OIDC flow at `/auth/manage_login`.
+
+We deliberately don't use HMAC- or JWT-style signed URLs here: a
+random-UUID-with-Redis-lookup avoids signing-key management, has no
+forgery surface even if a server-side leak happens, and gets revocation
+(via Redis flush) for free. The trade-off is one Redis round-trip per
+redemption, which is fine.
+
+The cookie session itself is an opaque UUID stored under
+`mgmt:session:{uuid}` with a 30-minute TTL; CSRF tokens for mutations
+live alongside it in the same record. No bearer-token-only path exists
+to add or remove accounts.
+
+### Behavior at the 1→2 account transition
+
+Adding a second account changes the tool API contract for that user:
+the optional `account` parameter becomes effectively required on every
+IMAP-touching tool call. We treat this as a deliberate sharp edge
+rather than a bug:
+
+- The `account_required` error message is explicit ("Multiple mailboxes
+  are connected — pass `account` (account_id or label). Call
+  list_accounts to see them.") so the agent can recover by calling
+  `list_accounts` and re-issuing the call.
+- We do **not** introduce a sticky default. A sticky default would have
+  to be read+written on every call, would need a UI to change, and
+  would mask the multi-account state from the agent in ways that
+  surface worse later (e.g. when the sticky account becomes disabled).
+- The `/manage` page should later grow a one-line note above the "Add"
+  form when the user already has one account ("Adding a second mailbox
+  means future tool calls must specify `account` — pass an account_id
+  or label"). This is a UX polish item, not a correctness item, so it
+  ships as a follow-up.
 
 ### IMAP provider allowlist
 
@@ -129,7 +178,7 @@ Estimated size: ~600–900 LOC. A step up from the v1 estimate because of the da
 
 ## Security Considerations
 
-- **Allowlist enforcement** is the only gate on which IMAP hosts the server logs into. Centralised at account-create time.
+- **Allowlist enforcement** is the only gate on which IMAP hosts the server logs into. Enforced at **both** account-create time (in the `/auth/setup` and `/manage/accounts` POST handlers) **and** at account-resolve time (in `AccountResolver::resolve`, before every tool call). If an operator removes a provider from the allowlist after users have connected mailboxes there, those accounts immediately stop working with a clear error pointing the user at `/manage` to remove and reconnect; no manual Redis surgery is required.
 - **`/manage` is OIDC-protected.** Bearer tokens (issued to MCP clients) cannot add or remove accounts on their own — only an interactive OIDC re-auth in a browser can. This keeps token theft from upgrading into mailbox-add capability.
 - **`account` parameter is not free-form server input.** The resolver only loads accounts already attached to the authenticated `oidc_sub`. Cross-user account access is structurally impossible.
 - **Per-`oidc_sub` rate-limit on failed credential validations** (e.g. 5 / 10 min) to neuter brute-force misuse.

@@ -136,18 +136,6 @@ pub struct ManageSession {
     pub created_at: i64,
 }
 
-/// Pending account-add form values held while we bounce the user through
-/// OIDC re-auth. Indexed by a one-shot UUID echoed back via OIDC `state`.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PendingAccountAdd {
-    pub oidc_sub: String,
-    pub provider_id: String,
-    pub label: String,
-    pub imap_email: String,
-    pub password_enc: String,
-    pub password_iv: String,
-}
-
 /// Manages sessions, accounts, and auth state in Redis with AES-256-GCM
 /// encryption.
 #[derive(Clone)]
@@ -527,36 +515,6 @@ impl SessionStore {
         let mut conn = self.conn().await?;
         let _: () = conn.del(&key).await?;
         Ok(())
-    }
-
-    // --- Pending account-add (held across OIDC re-auth) ---
-
-    pub async fn store_pending_account_add(
-        &self,
-        nonce: &str,
-        pending: &PendingAccountAdd,
-    ) -> Result<(), AppError> {
-        let key = format!("mgmt:pending_add:{nonce}");
-        let value = serde_json::to_string(pending)?;
-        let mut conn = self.conn().await?;
-        conn.set_ex::<_, _, ()>(&key, &value, AUTH_FLOW_TTL).await?;
-        Ok(())
-    }
-
-    pub async fn get_pending_account_add(
-        &self,
-        nonce: &str,
-    ) -> Result<Option<PendingAccountAdd>, AppError> {
-        let key = format!("mgmt:pending_add:{nonce}");
-        let mut conn = self.conn().await?;
-        let value: Option<String> = conn.get(&key).await?;
-        match value {
-            Some(v) => {
-                let _: () = conn.del(&key).await?;
-                Ok(Some(serde_json::from_str(&v)?))
-            }
-            None => Ok(None),
-        }
     }
 
     // --- Encryption helpers ---

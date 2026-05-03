@@ -71,6 +71,7 @@ imap-proto = { version = "0.16.4" }
 lol_html = "2.7.2"
 tempfile = { version = "3" }
 clap = { version = "4.5", features = ["derive", "env"] }
+subtle = { version = "2.5" }
 
 [dev-dependencies]
 http-body-util = { version = "0.1.3" }
