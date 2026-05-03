@@ -1,6 +1,6 @@
 # Multi-Account Support — Plan
 
-Status: Draft proposal
+Status: Draft proposal (revision 2)
 Branch: `claude/multi-account-support-plan-Yr2F7`
 
 ## Goals
@@ -11,13 +11,18 @@ Branch: `claude/multi-account-support-plan-Yr2F7`
 4. **Lean** — minimal new surface area; reuse the existing OIDC, encryption, and session machinery.
 5. **Safe** — no broader trust model than today; no new secret types; no path to abuse the server as a generic credential prober.
 
+## Platform Constraint (drives this revision)
+
+We use a **Claude Team plan**. End users on the desktop app cannot add or configure MCP connectors themselves — connectors are installed centrally by a workspace admin and appear once, identically, for every team member. That rules out the v1 design (one bearer token = one mailbox; "to add another, reconnect"): there is no per-user UI to install the same connector a second time with different parameters.
+
+Consequence: a single connector install must surface multiple mailboxes per user, behind one bearer token, with tool calls able to pick which mailbox they target.
+
 ## Non-Goals (for v1)
 
-- Switching between accounts inside a single MCP session / single tool call.
-- Cross-account search or unified inbox.
+- Cross-account search or a unified inbox tool.
 - OAuth/XOAUTH2 against external providers (still password / app-password based).
-- A management UI to list, rename, or revoke connected accounts (Redis TTL + re-auth covers this for now).
-- Provisioning shared-mailbox passwords centrally — sharing is still out-of-band.
+- Operator-managed shared-mailbox provisioning (admin pre-loads shared credentials and grants by OIDC group). Powerful and probably the right v2; intentionally deferred.
+- A polished UI for managing accounts. v1 ships a minimal HTML page; richer UX is later work.
 
 ## Current State (concise)
 
@@ -30,116 +35,101 @@ Branch: `claude/multi-account-support-plan-Yr2F7`
 | MCP tools | No `account` parameter; implicit single mailbox | `src/mcp.rs:14-28` |
 | Per-tool host/port | Hardcoded from `AppState` | `src/lib.rs:134-135`, `src/mcp.rs:32-38` |
 
-Everything except `IMAP_HOST/PORT` and the OIDC-email-equals-IMAP-email assumption is already flexible enough.
-
 ## Recommended Design
 
-**One bearer token = one mailbox.** To connect a second mailbox, the user re-runs the OAuth flow and obtains a second token. Claude.ai treats each connector install as independent, so each mailbox shows up as its own connector.
+**One bearer token → one OIDC identity → N IMAP accounts.**
 
-This is the leanest model that gives us all three goals:
+A bearer token resolves to a verified `oidc_sub`. Accounts attach to that `sub`, so any token for the same human sees the same account list. Every IMAP-touching tool gains an optional `account` parameter; the server defaults to the user's only account when there's exactly one, and requires explicit selection when there's more than one.
 
-- No tool signature changes — `list_emails`, `get_email`, etc. stay as-is.
-- No multi-tenant routing inside one session.
-- Each session is still a clean `OIDC sub → 1 IMAP login` mapping, which keeps the audit story simple.
-- Trade-off: connecting N mailboxes means N connector installs in claude.ai. Acceptable; the per-account installs also keep claude.ai's UI labels distinct.
+### Data model
 
-### Data model changes
+Two Redis records per user:
 
-`Session`, `AuthCode`, and `PendingSetup` each gain three fields:
+- `mcp:session:{token}` → `{ oidc_sub, oidc_email, created_at }` (no IMAP credentials).
+- `mcp:accounts:{oidc_sub}` → list of `Account` records:
 
 ```rust
-pub imap_email: String,    // user-supplied, may differ from oidc email
-pub imap_host: String,     // chosen from a server-side allowlist
-pub imap_port: u16,
+pub struct Account {
+    pub account_id:   String,  // server-issued stable slug
+    pub label:        String,  // user-supplied nickname, e.g. "Billing"
+    pub imap_email:   String,
+    pub imap_host:    String,  // must be in the provider allowlist
+    pub imap_port:    u16,
+    pub password_enc: String,  // AES-256-GCM, unchanged scheme
+    pub password_iv:  String,
+    pub created_at:   i64,
+}
 ```
 
-`oidc_sub` and `email` (the OIDC identity claim) stay — this preserves the audit trail of "which human used which mailbox". `email` is renamed to `oidc_email` for clarity; `imap_email` is new.
+The verified `oidc_sub` is the trust anchor; tokens are references to it. Revoking a token doesn't lose accounts. Migration shim: legacy single-account sessions are read once and rewritten as one auto-generated `Account` keyed under their `oidc_sub`.
 
-Backwards compatibility: deserialize legacy sessions by treating missing `imap_*` fields as the old global `IMAP_HOST`/`IMAP_PORT` and `imap_email = oidc_email`. Old tokens keep working until their TTL expires.
+### Onboarding flow
 
-### IMAP server allowlist
+- **Initial connect** (existing OAuth flow, lightly extended). OIDC → setup form → user picks provider from the allowlist, supplies IMAP email + password + nickname → first `Account` created and attached to `oidc_sub` → bearer token issued.
+- **Adding another mailbox.** The MCP server exposes a small `/manage` page (server-side rendered HTML, OIDC-protected, no JS framework). The page lists the user's accounts and lets them add or remove one. Users reach it via:
+  - The `manage_url` returned by the new `list_accounts` MCP tool (short-lived, signed, OIDC required when opened).
+  - A direct bookmark to `https://<mcp-host>/manage`.
+- **Removing an account** deletes the record from Redis. Other accounts and the bearer token are unaffected.
 
-Introduce a server-side configured list of IMAP providers. Default config ships with one entry (`mail.factorial.io`) and is extended via env or a small JSON file:
+### MCP tool changes
 
-```json
-[
-  { "id": "factorial",  "label": "Factorial",  "host": "mail.factorial.io", "port": 993 },
-  { "id": "gmail",      "label": "Gmail",      "host": "imap.gmail.com",    "port": 993, "note": "Use an app password" },
-  { "id": "fastmail",   "label": "Fastmail",   "host": "imap.fastmail.com", "port": 993 },
-  { "id": "mailbox-org","label": "mailbox.org","host": "imap.mailbox.org",  "port": 993 }
-]
-```
+- New tool: `list_accounts` → `[{ account_id, label, imap_email, imap_host }, …]`, plus a short-lived signed `manage_url` for adding/removing accounts.
+- Every existing tool gains an optional `account` parameter (`account_id` or `label`). Resolution rules:
+  - 0 accounts → error with the `manage_url` ("No mailboxes connected — open … to add one").
+  - 1 account → `account` optional, defaults to that one.
+  - 2+ accounts → `account` required; on omission the error tells the agent to call `list_accounts` first.
+- `label` is accepted as a convenience for agent ergonomics; ambiguous labels error.
 
-Why an allowlist:
-- Keeps the server from being usable as an open IMAP credential prober against arbitrary hosts.
-- Avoids accidental SSRF-adjacent surprises (pointing the IMAP client at internal RFC1918 addresses).
-- The list is short and rarely changes; a custom-host option is intentionally **not** offered in v1.
-- Users who need a non-listed provider ask the operator to add it — explicit, auditable, low effort.
+### IMAP provider allowlist
 
-### Auth flow changes
+Same as v1: env-configured list of `{ id, label, host, port }`, default ships with `mail.factorial.io`. The `/manage` form's dropdown uses it. Custom hosts are intentionally not offered in v1 — providers added centrally by the operator.
 
-`/auth/callback` (after successful OIDC) renders an updated setup form:
+### Audit trail
 
-```
-Hi {name}!  ({oidc_email})
-
-Provider:    [ Factorial ▼ ]   ← dropdown from allowlist
-IMAP email:  [ alice@factorial.io ]   ← prefilled with oidc_email, editable
-Password:    [ … ]
-[ Connect ]
-```
-
-`POST /auth/setup`:
-
-1. Look up the chosen provider in the allowlist; reject unknown ids.
-2. Validate IMAP login against `provider.host:provider.port` with the supplied `imap_email` + password (same code path as today).
-3. Persist the chosen `imap_host`, `imap_port`, `imap_email` into the `AuthCode` and ultimately the `Session`.
-
-`mcp_handler` (`src/lib.rs:88-158`) stops reading `state.imap_host/port` and instead reads them from the resolved `Session`. The `AppState` global IMAP host/port becomes a fallback used only for legacy sessions.
-
-### MCP tool layer
-
-No change. `ImapMcpServer::new` already takes host/port as parameters (`src/mcp.rs:21`); we just pass session-derived values into it.
+Every IMAP operation logs `{ oidc_sub, account_id, imap_email, imap_host, tool }`. `oidc_sub` is the human; `account_id` is which mailbox they used.
 
 ## Alternatives Considered
 
-1. **Multiple accounts per session, with an `account` parameter on every tool.** Richer (cross-account in one conversation), but: changes every tool signature, complicates the MCP schema, requires an "active account" UX, and forces session-storage migration for users who have only one mailbox. Defer to a future iteration if/when there's demand.
-2. **Free-form host/port input in the setup form.** Most flexible, but turns the server into a generic IMAP login proxy. Rejected; allowlist instead.
-3. **Per-account subdomains / paths** (e.g. `/connect/billing`). Not needed — claude.ai treats each OAuth install as independent already; bearer tokens are unique. Skip.
-4. **Server-side mapping of OIDC group → preset shared mailboxes.** Nice future enhancement (auto-suggesting "you can also connect billing@…"), but overlaps with operator-managed allowlists and adds policy code. Out of v1.
+1. **One bearer token = one mailbox, user installs the connector N times** (v1 of this plan). Rejected: not possible on Team plans where users can't add connectors.
+2. **Single admin-managed global account list, no per-user accounts.** Simplest for the operator, but doesn't cover the "private email account" goal and forces every team member to share credentials for the same accounts. Rejected.
+3. **Free-form host/port input** instead of an allowlist. Same trade-off as v1: rejected, allowlist instead.
+4. **Operator-curated shared mailboxes with OIDC-group ACLs** (admin pre-loads `billing@factorial.io` once, OIDC group `team-billing` gets read/write). Powerful and probably the right v2 — but it's a sizeable separate feature. Deferred.
 
 ## Implementation Phases
 
-1. **Allowlist plumbing.** Add `ImapProvider` struct, load list from env (`IMAP_PROVIDERS` JSON or path to file). Default to a single-entry list pointing at `IMAP_HOST/IMAP_PORT` so existing deployments keep working.
-2. **Schema migration.** Extend `Session`/`AuthCode`/`PendingSetup` with `imap_email/host/port`. Add `serde(default)`-based fallbacks for legacy records. Update `SessionStore::create_session` to take the new fields.
-3. **Setup form.** Update the HTML in `src/auth.rs:259-288` to render the provider dropdown and the editable IMAP-email field. Add minimal client-side default-fill (no JS framework — plain `<select>`).
-4. **`/auth/setup` handler.** Look up provider, validate, store new fields.
-5. **`mcp_handler`.** Source IMAP host/port/email from the session.
-6. **Tests.** Unit: session/auth-code serialization roundtrip with new fields; legacy decode path. Integration: connecting two different mailboxes from the same OIDC user yields two distinct working tokens; provider-id outside the allowlist is rejected.
-7. **Docs.** Update `README` / quickstart with the new env var and a short note on connecting a second mailbox.
+1. **Schema split.** Move IMAP credentials out of `Session` into a per-`oidc_sub` `Account` record. Add `account_id`. Migration shim: legacy sessions get one auto-generated account on first read.
+2. **Allowlist plumbing.** `IMAP_PROVIDERS` env (JSON) loaded into `AppState`. Default to a single entry pointing at the existing `IMAP_HOST/PORT`.
+3. **`/manage` page.** OIDC-protected HTML route to list / add / remove accounts. Reuses the existing setup-form HTML and credential-validation path. CSRF-token-protected POSTs.
+4. **Account resolver.** Single helper `(oidc_sub, requested_account) -> Account` used by every tool, with the 0/1/N rules above.
+5. **MCP tool updates.** Add `list_accounts` tool. Add optional `account` parameter to every existing tool. Pass the resolved `Account` into `ImapMcpServer::new`.
+6. **Tests.** Unit: account-record serialization; resolver rules (0/1/N); legacy-session migration. Integration: add two accounts, target each independently, remove one and verify the other still works, verify legacy single-account sessions still work post-migration.
+7. **Docs.** README, `/manage` page copy, env example.
 
-Estimated size: ~300–500 LOC delta, almost entirely additive.
+Estimated size: ~600–900 LOC. A step up from the v1 estimate because of the data-model split, the account parameter on every tool, and the management page — still mostly additive.
 
 ## Security Considerations
 
-- **Allowlist enforcement** is the main new control; centralised in one place (`AuthCode` creation) so it can't be bypassed.
-- **Rate-limit `/auth/setup` failures** per OIDC `sub` (e.g. 5 failed validations / 10 min) to keep the server from being usable to brute-force passwords against allowlisted providers. Small addition — a Redis counter.
-- **Encryption at rest** unchanged: AES-256-GCM with a server-held key. New fields are non-sensitive (host/port/email).
-- **Audit trail** improves: each session pairs the verified `oidc_sub` with the mailbox actually used. Log on session create: `oidc_sub=… imap_email=… imap_host=…`.
-- **No new secret types**: still username + password. We do not introduce OAuth-against-the-mail-provider flows in v1.
-- **Token isolation**: each bearer token still carries exactly one mailbox's credentials. Compromise of a token compromises one account, not a portfolio.
-- **Phishing surface**: the setup form lets the user type any IMAP login email. That's already true today (the OIDC email field is just display-only). Not a regression.
+- **Allowlist enforcement** is the only gate on which IMAP hosts the server logs into. Centralised at account-create time.
+- **`/manage` is OIDC-protected.** Bearer tokens (issued to MCP clients) cannot add or remove accounts on their own — only an interactive OIDC re-auth in a browser can. This keeps token theft from upgrading into mailbox-add capability.
+- **`account` parameter is not free-form server input.** The resolver only loads accounts already attached to the authenticated `oidc_sub`. Cross-user account access is structurally impossible.
+- **Per-`oidc_sub` rate-limit on failed credential validations** (e.g. 5 / 10 min) to neuter brute-force misuse.
+- **Encryption at rest** unchanged: AES-256-GCM with a server-held key, one nonce per account record.
+- **Token compromise has wider blast radius than v1**: a stolen bearer token now reaches every account that user has connected, not just one mailbox. Mitigations: revoke-from-`/manage` per account; revisit the 30-day session TTL (perhaps shorter); audit-log every tool call with `account_id`.
+- **No new secret types**; still username + password against IMAP.
 
 ## Open Questions
 
-1. Should we offer a "label / nickname" field at setup so the operator (and the user) can distinguish two installs in logs and UI? Probably yes, free-form, length-capped, HTML-escaped on render. Cheap addition.
-2. Should the allowlist live in env (`IMAP_PROVIDERS` JSON) or a config file path (`IMAP_PROVIDERS_PATH`)? File is friendlier for ops; env is simpler for the current 12-factor-style setup. Default: env JSON, with a documented escape hatch for ops who want a file.
-3. Do we need to gate which providers a given OIDC user/group can pick? Current answer: no — possessing the IMAP password is the access control. Revisit if/when we add OIDC group claims.
-4. TTL on connections / sessions when an IMAP login starts failing (password changed, account locked). Today the session sticks around for 30 days even if the password is dead. Worth a cheap follow-up: invalidate session on persistent auth-failed errors.
+1. **Account-add UX from inside Claude.** Is surfacing `manage_url` in `list_accounts` (and in zero-account errors) enough, or do we want a dedicated `add_account_url` tool? Lean default: just `list_accounts` + zero-account error.
+2. **Auto-disable on persistent auth failure.** Should an account be marked unusable after N failed IMAP logins (password changed, account locked) and require re-validation in `/manage`? Probably yes; pin down N and the user-visible message.
+3. **Session TTL.** The current 30-day TTL was sized for the old single-account model. Worth shortening now that a token unlocks more mailboxes?
+4. **`manage_url` lifetime.** 5 min? 15? Pick a default and document.
+5. **Should the server retain a per-account "last used" timestamp** to support a future "stale account cleanup" pass? Cheap to add now.
+6. **Renaming accounts.** Required in v1, or is delete-and-re-add fine? Delete-and-re-add is fine if labels are easy to set; revisit if we hear pain.
 
 ## Out of Scope / Future Work
 
-- Single-session multi-account with an `account` param on tools.
-- OAuth2 / XOAUTH2 against Gmail, Microsoft 365, etc.
-- Operator-managed shared-mailbox presets keyed by OIDC group.
-- A `/accounts` listing / revocation UI.
+- Operator-managed shared mailboxes with OIDC-group ACLs (the v2 shape that admins will probably want).
+- OAuth2 / XOAUTH2 against Gmail / Microsoft 365.
+- Cross-account search or a unified inbox tool.
+- A self-service way for non-admins to broaden the IMAP provider allowlist.
+- Audit-log export / SIEM integration.
