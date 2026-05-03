@@ -1550,6 +1550,17 @@ impl ImapConnection {
             .map_err(|e| AppError::Imap(format!("logout failed: {e}")))?;
         Ok(())
     }
+
+    /// Best-effort logout: warns on failure rather than silently swallowing
+    /// it. Used after every successful tool call where the work has already
+    /// been committed and a logout error is informational only — but
+    /// CLAUDE.md forbids silent error suppression, so we log instead of
+    /// `.ok()`-discarding the result.
+    pub async fn logout_or_warn(self) {
+        if let Err(e) = self.logout().await {
+            tracing::warn!("IMAP logout failed: {e}");
+        }
+    }
 }
 
 /// Check if a string is a valid RFC 5322 Message-ID token: `<local@domain>`.

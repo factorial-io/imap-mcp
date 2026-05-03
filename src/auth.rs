@@ -427,7 +427,7 @@ pub async fn setup(
     )
     .await
     .map_err(|_| AppError::InvalidCredentials)?;
-    conn.logout().await.ok();
+    conn.logout_or_warn().await;
 
     // Create the user's first Account record.
     let (enc, iv) = state.sessions.encrypt(&form.imap_password)?;

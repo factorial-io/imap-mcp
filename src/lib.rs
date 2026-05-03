@@ -158,14 +158,11 @@ pub enum ResolveError {
 
 impl AccountResolver {
     pub async fn resolve(&self, selector: Option<&str>) -> Result<Account, ResolveError> {
-        // 1. Migrate legacy single-account session if needed.
-        self.maybe_migrate_legacy().await?;
-
-        let accounts = self
-            .store
-            .list_accounts(&self.oidc_sub)
-            .await
-            .map_err(|e| ResolveError::Internal(e.to_string()))?;
+        // Single round-trip: list current accounts, doing the legacy
+        // migration if needed. Previously this was two separate calls
+        // (`maybe_migrate_legacy` + `list_accounts`), which doubled Redis
+        // traffic on every MCP tool call once a user had any accounts.
+        let accounts = self.accounts_with_migration().await?;
 
         if accounts.is_empty() {
             let url = self.fresh_manage_url().await?;
@@ -249,11 +246,7 @@ impl AccountResolver {
     }
 
     pub async fn list(&self) -> Result<Vec<Account>, ResolveError> {
-        self.maybe_migrate_legacy().await?;
-        self.store
-            .list_accounts(&self.oidc_sub)
-            .await
-            .map_err(|e| ResolveError::Internal(e.to_string()))
+        self.accounts_with_migration().await
     }
 
     pub async fn fresh_manage_url(&self) -> Result<String, ResolveError> {
@@ -265,15 +258,22 @@ impl AccountResolver {
         Ok(format!("{}/manage?t={}", self.base_url, ticket))
     }
 
-    async fn maybe_migrate_legacy(&self) -> Result<(), ResolveError> {
-        // Cheap check first: do we already have at least one account?
+    /// List current accounts for this user, performing the legacy
+    /// single-account migration on the way if the session still carries
+    /// pre-multi-account encrypted credentials.
+    ///
+    /// On the hot path (user already has accounts), this is a single
+    /// `list_accounts` round-trip — no extra calls. On the cold path
+    /// (legacy session, no Account records yet), it migrates and returns
+    /// the resulting one-element list directly.
+    async fn accounts_with_migration(&self) -> Result<Vec<Account>, ResolveError> {
         let existing = self
             .store
             .list_accounts(&self.oidc_sub)
             .await
             .map_err(|e| ResolveError::Internal(e.to_string()))?;
         if !existing.is_empty() {
-            return Ok(());
+            return Ok(existing);
         }
 
         // No accounts yet — see if the session still carries legacy creds.
@@ -286,7 +286,9 @@ impl AccountResolver {
             session.legacy_imap_password_enc.as_deref(),
             session.legacy_imap_password_iv.as_deref(),
         ) else {
-            return Ok(());
+            // Genuinely empty (e.g. brand-new session with no first account
+            // yet). Return the empty list; resolve() will surface NoAccounts.
+            return Ok(existing);
         };
 
         let provider = self.providers.first();
@@ -332,7 +334,9 @@ impl AccountResolver {
             account_id = %migrated.account_id,
             "Migrated legacy single-account session to Account record"
         );
-        Ok(())
+        // Return the freshly-migrated single-account list directly. Saves a
+        // second `list_accounts` round-trip on the migration path too.
+        Ok(vec![migrated])
     }
 }
 

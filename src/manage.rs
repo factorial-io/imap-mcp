@@ -190,7 +190,7 @@ pub async fn add_account(
     )
     .await
     .map_err(|_| AppError::InvalidCredentials)?;
-    conn.logout().await.ok();
+    conn.logout_or_warn().await;
 
     let (enc, iv) = state.sessions.encrypt(&form.imap_password)?;
     let account = Account {
@@ -352,7 +352,7 @@ pub async fn revalidate_account(
     )
     .await
     .map_err(|_| AppError::InvalidCredentials)?;
-    conn.logout().await.ok();
+    conn.logout_or_warn().await;
 
     let (enc, iv) = state.sessions.encrypt(&form.imap_password)?;
     state

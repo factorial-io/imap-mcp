@@ -425,13 +425,22 @@ impl SessionStore {
         // Best-effort cleanup of side state. Stale leftovers are harmless
         // (TTLs would clear them eventually) but keeping Redis tidy is cheap.
         let _: () = conn.del(Self::fails_key(oidc_sub, account_id)).await?;
-        // If this was the default, clear the pointer so the next resolution
-        // can pick a new default (or so the user gets the "select an account"
-        // prompt and chooses).
-        let current_default: Option<String> = conn.get(Self::default_account_key(oidc_sub)).await?;
-        if current_default.as_deref() == Some(account_id) {
-            let _: () = conn.del(Self::default_account_key(oidc_sub)).await?;
-        }
+        // If this was the default, clear the pointer. The check-and-delete
+        // is done in a single Lua script so it's atomic w.r.t. concurrent
+        // /manage/.../set_default writes — without that, a parallel set
+        // could land between our GET and DEL and we'd silently delete the
+        // user's freshly-chosen default.
+        let script = redis::Script::new(
+            r#"if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("DEL", KEYS[1])
+            end
+            return 0"#,
+        );
+        let _: i64 = script
+            .key(Self::default_account_key(oidc_sub))
+            .arg(account_id)
+            .invoke_async(&mut conn)
+            .await?;
         Ok(removed > 0)
     }
 
@@ -672,18 +681,21 @@ impl SessionStore {
     /// `Ok(())` if the user is still under the limit, or
     /// `Err(AppError::RateLimited { ... })` if they've exceeded it.
     ///
-    /// Implementation: a Redis INCR + EXPIRE on `ratelimit:imap_validate:{sub}`
-    /// — fixed-window, not sliding, but cheap and good enough for a low-volume
-    /// auth-adjacent operation. The TTL is refreshed on every call (cheap and
-    /// idempotent) so a process crash between INCR and EXPIRE on the very
-    /// first hit can never leave the counter immortal.
+    /// Implementation: Redis `INCR` + `EXPIRE` on `ratelimit:imap_validate:{sub}`,
+    /// where the TTL is refreshed on every call. That makes this a
+    /// **sliding window**: 10 minutes from the most recent attempt, not
+    /// from the first. A user pacing their attempts under the limit can
+    /// keep going indefinitely without tripping it; a user who hits the
+    /// limit waits ~10 minutes after their last try for a fresh budget.
+    /// We accept this looseness in exchange for not having a "stuck rate
+    /// limit" failure mode if the process dies between INCR and EXPIRE on
+    /// the first hit (true fixed-window risks an immortal counter there).
     pub async fn check_imap_validate_rate_limit(&self, oidc_sub: &str) -> Result<(), AppError> {
         let key = format!("ratelimit:imap_validate:{oidc_sub}");
         let mut conn = self.conn().await?;
         let count: u32 = conn.incr(&key, 1u32).await?;
-        // Refresh TTL on every call. Sliding the window slightly is a fair
-        // price for not having a "stuck rate limit" failure mode if the
-        // process dies between INCR and EXPIRE on the first hit.
+        // Sliding window: TTL refreshed on every call. See the docstring
+        // for the trade-off rationale.
         conn.expire::<_, ()>(&key, IMAP_VALIDATE_WINDOW_SECS as i64)
             .await?;
         if count > IMAP_VALIDATE_LIMIT {

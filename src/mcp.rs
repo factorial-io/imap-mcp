@@ -380,7 +380,7 @@ impl ImapMcpServer {
             .list_folders()
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
-        conn.logout().await.ok();
+        conn.logout_or_warn().await;
         let json = Content::json(&folders)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
@@ -398,7 +398,7 @@ impl ImapMcpServer {
             .list_emails(&params.folder, params.limit, params.offset)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
-        conn.logout().await.ok();
+        conn.logout_or_warn().await;
         let json = Content::json(&emails)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
@@ -416,7 +416,7 @@ impl ImapMcpServer {
             .get_email(&params.folder, params.uid)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
-        conn.logout().await.ok();
+        conn.logout_or_warn().await;
         let json = Content::json(&email)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
@@ -434,7 +434,7 @@ impl ImapMcpServer {
             .get_attachment(&params.folder, params.uid, params.attachment_index)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
-        conn.logout().await.ok();
+        conn.logout_or_warn().await;
 
         let mime = &attachment.info.mime_type;
         let size = attachment.info.size;
@@ -534,7 +534,7 @@ impl ImapMcpServer {
             .search_emails(&params.folder, &params.query, params.limit)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
-        conn.logout().await.ok();
+        conn.logout_or_warn().await;
         let json = Content::json(&emails)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
@@ -549,7 +549,7 @@ impl ImapMcpServer {
         conn.mark_read(&params.folder, params.uid)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
-        conn.logout().await.ok();
+        conn.logout_or_warn().await;
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Email UID {} marked as read",
             params.uid
@@ -565,7 +565,7 @@ impl ImapMcpServer {
         conn.mark_unread(&params.folder, params.uid)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
-        conn.logout().await.ok();
+        conn.logout_or_warn().await;
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Email UID {} marked as unread",
             params.uid
@@ -597,7 +597,7 @@ impl ImapMcpServer {
             .create_draft(&params.folder, &draft)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
-        conn.logout().await.ok();
+        conn.logout_or_warn().await;
 
         let uid_info = match uid {
             Some(uid) => format!(" (UID: {uid})"),
@@ -634,7 +634,7 @@ impl ImapMcpServer {
             .update_draft(&params.folder, params.uid, &draft)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
-        conn.logout().await.ok();
+        conn.logout_or_warn().await;
 
         let new_uid_info = match new_uid {
             Some(uid) => format!(" New UID: {uid}"),
