@@ -98,6 +98,8 @@ The service will be available at `https://<YOUR_DOMAIN>`.
 | `search_emails` | Search emails using IMAP SEARCH criteria |
 | `mark_read` | Set \Seen flag on an email by UID |
 | `mark_unread` | Unset \Seen flag on an email by UID |
+| `move_email` | Move an email to another folder by UID |
+| `delete_email` | Delete an email by UID (soft-delete to Trash, or permanent) |
 | `get_attachment` | Fetch an attachment (text, image, or extracted text from PDF/Office docs) |
 | `create_draft` / `update_draft` | Compose or modify a draft email |
 
