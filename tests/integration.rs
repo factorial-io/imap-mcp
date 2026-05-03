@@ -47,12 +47,15 @@ fn test_state() -> Arc<AppState> {
     let encryption_key = B64.encode([0xABu8; 32]);
     let sessions = SessionStore::new("redis://localhost:6379", &encryption_key).unwrap();
     let providers = ProviderList::factorial_default("imap.example.com", 993).unwrap();
-    Arc::new(AppState::new(
-        sessions,
-        fake_oidc_client(),
-        providers,
-        "https://imap-mcp.example.com".to_string(),
-    ))
+    Arc::new(
+        AppState::new(
+            sessions,
+            fake_oidc_client(),
+            providers,
+            "https://imap-mcp.example.com".to_string(),
+        )
+        .unwrap(),
+    )
 }
 
 /// Helper: send a request to the test router and get response.
