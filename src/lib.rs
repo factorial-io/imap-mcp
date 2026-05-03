@@ -387,11 +387,9 @@ async fn mcp_handler(
         mcp_token: token.clone(),
     };
 
-    let config = StreamableHttpServerConfig {
-        stateful_mode: false,
-        json_response: true,
-        ..Default::default()
-    };
+    let config = StreamableHttpServerConfig::default()
+        .with_stateful_mode(false)
+        .with_json_response(true);
 
     let service = StreamableHttpService::new(
         move || Ok(mcp::ImapMcpServer::new(resolver.clone())),

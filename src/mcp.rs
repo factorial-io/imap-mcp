@@ -14,15 +14,11 @@ use crate::{AccountResolver, ResolveError};
 /// MCP server instance — one per request, holds session context.
 pub struct ImapMcpServer {
     resolver: AccountResolver,
-    tool_router: rmcp::handler::server::tool::ToolRouter<Self>,
 }
 
 impl ImapMcpServer {
     pub fn new(resolver: AccountResolver) -> Self {
-        Self {
-            resolver,
-            tool_router: Self::tool_router(),
-        }
+        Self { resolver }
     }
 
     /// Resolve an account, connect, record success on login. The returned

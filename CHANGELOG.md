@@ -2,6 +2,101 @@
 
 All notable changes to this project will be documented in this file.
 
+## [imap-mcp-v0.1.3] - 2026-05-03
+
+### Features
+
+- Extract text from legacy .doc attachments via antiword ([65251e8](https://github.com/factorial-io/imap-mcp/commit/65251e89329a7a85bc8971fe3f29c12ab5f6d3b5))
+- Add HTML email support for drafts and reading ([1e5cd1d](https://github.com/factorial-io/imap-mcp/commit/1e5cd1de569592eeafae6405ef2a71c8ee3ec5af))
+
+### Bug Fixes
+
+- Adapt to rmcp 1.6.0 API changes ([5806362](https://github.com/factorial-io/imap-mcp/commit/5806362e4c01a5e8ef8539c36351cb578dfc5dbf))
+- *(docker)* Pin builder to rust:bookworm to match runtime glibc ([fc60a0c](https://github.com/factorial-io/imap-mcp/commit/fc60a0c09d5aaa5cd78ab2db0f025ac3fa058975))
+- ID selector hiding bypass, named whitespace entity bypass ([324da2d](https://github.com/factorial-io/imap-mcp/commit/324da2d00b788c2fb723f56af88202b0f73fade9))
+- Brace-less at-rules absorbing adjacent class selectors ([7e5885b](https://github.com/factorial-io/imap-mcp/commit/7e5885b41ba2f7935c5776fb7a91d9ec35ec34f7))
+- Restore full hiding detection in is_style_hidden, bump em/rem threshold ([29ecd9a](https://github.com/factorial-io/imap-mcp/commit/29ecd9add35d0dff3d452af0ae3bf6353902b66e))
+- Accurate docstring, tag names in class set from compound selectors ([3890a04](https://github.com/factorial-io/imap-mcp/commit/3890a04396c351cbedbf300f41475745f10f663b))
+- Preserve non-hidden styles in draft path, make filter_css_properties reachable ([de05503](https://github.com/factorial-io/imap-mcp/commit/de0550334c6a384025b7c4912a31f16238351ecd))
+- Propagate extract_hidden_classes error, unify hiding detection ([54a02ff](https://github.com/factorial-io/imap-mcp/commit/54a02ff5ac28b36e154472ced82bc7ed6fcf502b))
+- Precise transform checks, lol_html style extraction, matrix/scale false positives ([a721e45](https://github.com/factorial-io/imap-mcp/commit/a721e4517e1ff9f104c3fc3482e4a8d5b9bed8b6))
+- @media brace nesting, relative unit thresholds ([6c4b7e6](https://github.com/factorial-io/imap-mcp/commit/6c4b7e6e243454a61bd4e56c2611e0665b7f95f8))
+- Decode CSS escapes and strip comments in style block class detection ([6035e76](https://github.com/factorial-io/imap-mcp/commit/6035e76f8d27139f8d7c17afde9a3a3fc2fb7cab))
+- Unicode byte-offset mismatch in extract_hidden_classes ([6db08ee](https://github.com/factorial-io/imap-mcp/commit/6db08ee9d6cac4880434953a111b3642b61fb5e6))
+- Remove dead CSS parser loop, fix descendant selector false positives ([83da627](https://github.com/factorial-io/imap-mcp/commit/83da6274aefa39bb911065de9d580ba19a242c52))
+- Detect and strip class-based CSS hiding in incoming emails ([983148f](https://github.com/factorial-io/imap-mcp/commit/983148f3a290204160c66ce8239e540505e3a7f6))
+- Near-transparent alpha threshold, transform:matrix translation bypass ([b601905](https://github.com/factorial-io/imap-mcp/commit/b60190533a3ec104551da5660608dde10e4a0575))
+- Duplicate doc comment, CSS-aware declaration splitting ([b3eeeec](https://github.com/factorial-io/imap-mcp/commit/b3eeeec51b2f10b8bd49b223acab13a44b159b38))
+- Scale/matrix transforms, near-zero opacity, duplicate doc comment ([ac316b9](https://github.com/factorial-io/imap-mcp/commit/ac316b94155f252d1701c5bec11638645b3a9923))
+- Get_email degrades gracefully on HTML sanitization failure ([cdda075](https://github.com/factorial-io/imap-mcp/commit/cdda075e5641c0fc45c76739adce51d557fd59cd))
+- Propagate errors from html_to_safe_text and extract_body_from_parsed ([2bc792e](https://github.com/factorial-io/imap-mcp/commit/2bc792ebdccd0e12582bc5593966de46aebec676))
+- CSS comment bypass in filter_css_properties, fractional px threshold bypass ([ea2e9ad](https://github.com/factorial-io/imap-mcp/commit/ea2e9ad35a76eabc3be5e698bc5244215a2c8e2a))
+- Boundary-aware color check, clip-path last-wins, hex color detection ([c9ee13b](https://github.com/factorial-io/imap-mcp/commit/c9ee13b8b05b5ba8756e1d708cbf36c15788f245))
+- Detect transform:translate and transparent color in reading path ([33c1cf2](https://github.com/factorial-io/imap-mcp/commit/33c1cf2f9a6b8abdc95aa04a321416ce6c11248d))
+- Clip-path dual-declaration bypass, margin-left/top backstop ([03c28e2](https://github.com/factorial-io/imap-mcp/commit/03c28e256facad3045ee26b0e178c454b9b66c7e))
+- Clip-path:none false positive, drop background-color from allowlist ([d175f2a](https://github.com/factorial-io/imap-mcp/commit/d175f2ae396da0eafebc445b91be98db710e0789))
+- CSS escape in filter values, parse_px_digits edge cases, clip-path boundaries ([bb8e713](https://github.com/factorial-io/imap-mcp/commit/bb8e713c9e96adbecf3520c10b9092a853f15157))
+- Return u32::MAX on overflow in parse_px_digits ([c1ca56d](https://github.com/factorial-io/imap-mcp/commit/c1ca56dea8b7a8917ffee8781dfc15d9453325bb))
+- Require overflow:hidden for height stripping, decode CSS backslash escapes ([bc31aae](https://github.com/factorial-io/imap-mcp/commit/bc31aae3a99071ae9e5130bebf53763210b08368))
+- Width:0 hiding, clip-path bypass, percentage alpha notation ([e5a2540](https://github.com/factorial-io/imap-mcp/commit/e5a2540bae1839fce1a72b71610b60e5ae3cce60))
+- CSS comment bypass, unit-aware thresholds for non-px values ([9c62e57](https://github.com/factorial-io/imap-mcp/commit/9c62e57f33be3433a70c9ebfe36c9e74fd02249b))
+- Inclusive threshold comparisons, font-size guard in filter_css_properties ([d7ef839](https://github.com/factorial-io/imap-mcp/commit/d7ef8398514ffc6c46edb4adf8c99bb58e2cd9b5))
+- Remove color from CSS allowlist, update transparent checks ([a45cd13](https://github.com/factorial-io/imap-mcp/commit/a45cd13713e82c39984862c882c742632197666a))
+- Hex alpha colors, sub-pixel height threshold ([b563ea6](https://github.com/factorial-io/imap-mcp/commit/b563ea67813db5b726da270522059b6d0abfa050))
+- Parse alpha numerically, guard zero-height, placeholder on failure ([5d0c054](https://github.com/factorial-io/imap-mcp/commit/5d0c05477774b83a6d13322845f7035dbc6508e7))
+- Transparent color whitespace variants, near-zero font-size threshold ([25d178a](https://github.com/factorial-io/imap-mcp/commit/25d178a2879c948a009625ee38bf70e9642d0454))
+- CSS property allowlist for drafts, return empty on parse failure ([de19c34](https://github.com/factorial-io/imap-mcp/commit/de19c34f8b54af0c8325d9a111a076c75571baaf))
+- Strip class attrs to block CSS hiding, split draft/reading sanitizers ([74b3dcd](https://github.com/factorial-io/imap-mcp/commit/74b3dcd1f89d3632dacf4a70b828ffad1099af40))
+- Propagate lol_html errors, entity overflow drain, position boundary checks ([25da441](https://github.com/factorial-io/imap-mcp/commit/25da441435680882bedaa7032a19c01888ec0d79))
+- Strip style blocks, decode CSS escapes, parse zero values with f64 ([4a9b163](https://github.com/factorial-io/imap-mcp/commit/4a9b16338ed813f0a40988f8f325bb4f8a96d00c))
+- Self-closing non-void tags must increment depth in skip_to_closing_tag ([4961771](https://github.com/factorial-io/imap-mcp/commit/496177142cc23a45a5d8943b91112e99ad413bd4))
+- Boundary checks in has_large_negative_value, UTF-8 safe css comment stripping ([8ec7a45](https://github.com/factorial-io/imap-mcp/commit/8ec7a451ae9cdadd217ba8b29995f0b51338eec4))
+- CSS comment bypass, missing right/bottom offsets, property boundaries ([18b640d](https://github.com/factorial-io/imap-mcp/commit/18b640df6c5f760c5be8a4f1238f8d1cd3ebaa9e))
+- Exclude fractional values from zero-property detection ([7693422](https://github.com/factorial-io/imap-mcp/commit/769342264d7803f245fb0428815723d117bc3108))
+- Decode_html_entities control flow for long zero-padded entities ([312041d](https://github.com/factorial-io/imap-mcp/commit/312041dd4e9b44561da954a9814692c6899956e3))
+- Decode HTML entities in style values, handle empty tag names ([c7027a6](https://github.com/factorial-io/imap-mcp/commit/c7027a6c268f3f79116def91cf218f977f153894))
+- Zero-value CSS matching with units, fix doc comment ([7097bc2](https://github.com/factorial-io/imap-mcp/commit/7097bc261879d37fda03624e078072258f931492))
+- Unclosed hidden elements strip to end, remove double sanitization ([33d87ea](https://github.com/factorial-io/imap-mcp/commit/33d87ea6085c84ae21961fb3defe999079097bb4))
+- Property boundary matching, offset thresholds, and defense-in-depth ([31b7c83](https://github.com/factorial-io/imap-mcp/commit/31b7c83c01aae07bf097c8689d8a8baaddb92e12))
+- Add url_schemes to ammonia builders so href values are preserved ([5659ce7](https://github.com/factorial-io/imap-mcp/commit/5659ce743d55202a67a57e013f7fc09bf4b6c8e6))
+- Opacity:0.0 bypass, unquoted style, unclosed elements, img tracking ([b8e6730](https://github.com/factorial-io/imap-mcp/commit/b8e6730fcf6a98cdb4a1c71e93c4c202b337c4ae))
+- Use ASCII case-insensitive matching in extract_style_value ([a70efb6](https://github.com/factorial-io/imap-mcp/commit/a70efb6284a149a169870d36ef54f0ceda292b62))
+- Run strip_hidden_elements before ammonia in draft sanitization ([ac89dde](https://github.com/factorial-io/imap-mcp/commit/ac89dde9c7a90358447a0395db72792749b97d75))
+- Targeted CSS hiding patterns instead of stripping all styled elements ([54a467b](https://github.com/factorial-io/imap-mcp/commit/54a467b27dd804aadc0c324372e308f069c81de8))
+- Strip all styled elements and gate raw_html behind cfg(test) ([4ad4b18](https://github.com/factorial-io/imap-mcp/commit/4ad4b18a03ae78f69cdb27799dd9f034a38ef5ce))
+- Closing tag word-boundary check and whitespace normalization bypass ([9a0cfb7](https://github.com/factorial-io/imap-mcp/commit/9a0cfb7955fe1b4a8c92f7d8ecf58b43e01fc37e))
+- Precise style attribute matching and void element handling ([c1d1380](https://github.com/factorial-io/imap-mcp/commit/c1d138005f45cf6c3baced74c7cfb4bc0bd3d3a9))
+- Strip hidden HTML elements before text conversion to block prompt injection ([fd3c2b3](https://github.com/factorial-io/imap-mcp/commit/fd3c2b3c442a01b99119000665c033486479109c))
+- Remove html_body from get_email response, sanitize before html2text ([af7ecd6](https://github.com/factorial-io/imap-mcp/commit/af7ecd69e112c2fdd586ae7a73794caaab9c8557))
+- Sanitize HTML with ammonia to prevent prompt injection and XSS ([528154a](https://github.com/factorial-io/imap-mcp/commit/528154af228ff3505d2facbece172980a301437b))
+- *(deps)* Update rust crate sha2 to 0.11.0 ([4e18725](https://github.com/factorial-io/imap-mcp/commit/4e187259f6fb4e39c31ec1057078c78fca23fffb))
+
+### Refactor
+
+- Strip all style attributes instead of parsing CSS values ([e5a7a55](https://github.com/factorial-io/imap-mcp/commit/e5a7a550b73fc7097193845c90aad86fd3a8c49f))
+- Replace hand-rolled HTML parser with lol_html ([051f153](https://github.com/factorial-io/imap-mcp/commit/051f1539da1687f4dc041832be3e05cdd6672e8b))
+
+### Dependencies
+
+- *(deps)* Update rust crate rmcp to v1.6.0 ([53ade11](https://github.com/factorial-io/imap-mcp/commit/53ade116d78f041f4a26bd7134dfb96fae80b086))
+- *(deps)* Update googleapis/release-please-action action to v5 ([7cd82a0](https://github.com/factorial-io/imap-mcp/commit/7cd82a06c9fa40629dbdeaa7f1c7eee7ca6c3307))
+- *(deps)* Update rust crate lol_html to v2.8.1 ([4e84ba5](https://github.com/factorial-io/imap-mcp/commit/4e84ba5e5355f0b3ff8cea291346abcbceac4163))
+- *(deps)* Update rust crate tokio to v1.52.1 ([3c0518f](https://github.com/factorial-io/imap-mcp/commit/3c0518fd77b0c8decd324f49c10224a81853c384))
+- *(deps)* Update rust crate redis to v1.2.1 (#55) ([3a58fd2](https://github.com/factorial-io/imap-mcp/commit/3a58fd2cde8c8d10a662b0073ef89ad1a2da8c40))
+- *(deps)* Update rust crate imap-proto to v0.16.7 (#50) ([8234b20](https://github.com/factorial-io/imap-mcp/commit/8234b209b1b8b64b7c5ea313393b36bad4865f3b))
+- *(deps)* Update rust crate redis to v1.2.0 ([9722aa8](https://github.com/factorial-io/imap-mcp/commit/9722aa869ad218b5ad7f589fb5acba4e51299e9c))
+- *(deps)* Update rust crate uuid to v1.23.1 (#49) ([0df6ef1](https://github.com/factorial-io/imap-mcp/commit/0df6ef1daa9adf784bb8f4b037eb0da682075e06))
+- *(deps)* Update rust crate axum to v0.8.9 (#48) ([4c4d545](https://github.com/factorial-io/imap-mcp/commit/4c4d545b4b0403380f264598bbdedf064c919cee))
+- *(deps)* Update rust crate uuid to v1.23.0 ([3088d10](https://github.com/factorial-io/imap-mcp/commit/3088d10fc08f1a1ba9cba37a322e71be4d0d9a0c))
+- *(deps)* Update amannn/action-semantic-pull-request action to v6 ([9e85555](https://github.com/factorial-io/imap-mcp/commit/9e855552452e396406eadef2188d11f3e9f9346c))
+
+### Miscellaneous
+
+- *(main)* Release imap-mcp 0.1.3 ([60ad3c6](https://github.com/factorial-io/imap-mcp/commit/60ad3c679989d4d07948d2b57615f8c5b55d0ad0))
+
+### Styling
+
+- Fix rustfmt ([7f7bbe3](https://github.com/factorial-io/imap-mcp/commit/7f7bbe3bc3fdb554558cbac4f230b7a380d759dd))
 ## [imap-mcp-v0.1.2] - 2026-03-25
 
 ### Dependencies
@@ -31,6 +126,9 @@ All notable changes to this project will be documented in this file.
 - *(deps)* Update rust crate mail-builder to 0.4 ([2319b3a](https://github.com/factorial-io/imap-mcp/commit/2319b3a2fe798167199c02ab4a04fc5f3d1b894a))
 - *(deps)* Update rust crate redis to 0.32.0 ([f8bc669](https://github.com/factorial-io/imap-mcp/commit/f8bc6699796a5efd6e19b39e2efb28c675937291))
 - *(deps)* Update rust crate async-native-tls to 0.6.0 ([6889378](https://github.com/factorial-io/imap-mcp/commit/68893789a5b91eac4d87061dd722aa52f6013ff9))
+- Use decoded HTML body as fallback on html2text conversion failure ([0c5e601](https://github.com/factorial-io/imap-mcp/commit/0c5e601879a276e7818cfa3e6bddd576b5349db1))
+- Log html2text conversion errors instead of silently suppressing them ([fedc18e](https://github.com/factorial-io/imap-mcp/commit/fedc18e6c154af93ddb379f0441415130efd4a4d))
+- *(deps)* Update rust crate html2text to 0.16.0 ([caaf65e](https://github.com/factorial-io/imap-mcp/commit/caaf65e8315811470af7b96e21d34963c97135e4))
 - Propagate CAPABILITY error and add PPTX aggregate decompression limit ([51c33bc](https://github.com/factorial-io/imap-mcp/commit/51c33bc3c676bdc7830786982429d29476a79b89))
 - Address remaining review issues on PR 18 ([1e873a9](https://github.com/factorial-io/imap-mcp/commit/1e873a9ea5ef0ff00000348019c23f354a7403f3))
 - *(deps)* Update rust crate mailparse to 0.16.0 ([6f602fc](https://github.com/factorial-io/imap-mcp/commit/6f602fccba00df56573a6fd60f34b39f0ee266af))
