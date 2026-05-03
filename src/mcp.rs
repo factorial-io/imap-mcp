@@ -604,7 +604,7 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Move an email to another folder by UID. Uses the IMAP MOVE extension when the server advertises it; falls back to COPY + STORE +FLAGS (\\Deleted) + EXPUNGE for older servers. The target folder must exist. This action is undoable — the user can move the message back to the original folder later."
+        description = "Move an email to another folder by UID. Uses the IMAP MOVE extension when the server advertises it; falls back to COPY + STORE +FLAGS (\\Deleted) for older servers (the original is only marked as deleted, not expunged, so the action remains undoable). The target folder must exist."
     )]
     async fn move_email(
         &self,
@@ -629,14 +629,23 @@ impl ImapMcpServer {
         Parameters(params): Parameters<DeleteEmailParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
-        conn.delete_email(&params.folder, params.uid)
+        let moved = conn
+            .delete_email(&params.folder, params.uid)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Email UID {} deleted (moved to Trash) from '{}'",
-            params.uid, params.folder
-        ))]))
+        let msg = if moved {
+            format!(
+                "Email UID {} deleted (moved to Trash) from '{}'",
+                params.uid, params.folder
+            )
+        } else {
+            format!(
+                "Email UID {} is already in Trash — no action taken",
+                params.uid
+            )
+        };
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(
