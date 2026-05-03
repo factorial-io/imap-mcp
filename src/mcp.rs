@@ -262,11 +262,15 @@ pub struct DeleteEmailParams {
     /// Optional account selector (account_id or label).
     #[serde(default)]
     pub account: Option<String>,
-    /// When false (default), moves the message to the Trash folder (safe default).
-    /// When true, permanently deletes the message with STORE +FLAGS (\Deleted) + EXPUNGE.
-    /// Permanent deletion is irreversible.
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateFolderParams {
+    /// Name of the new folder to create (e.g., "Projects", "Archive/2024")
+    pub folder_name: String,
+    /// Optional account selector (account_id or label).
     #[serde(default)]
-    pub permanent: bool,
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -600,7 +604,7 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Move an email to another folder by UID. Uses the IMAP MOVE extension when the server advertises it; falls back to COPY + STORE +FLAGS (\\Deleted) + EXPUNGE for older servers. The target folder must exist."
+        description = "Move an email to another folder by UID. Uses the IMAP MOVE extension when the server advertises it; falls back to COPY + STORE +FLAGS (\\Deleted) + EXPUNGE for older servers. The target folder must exist. This action is undoable — the user can move the message back to the original folder later."
     )]
     async fn move_email(
         &self,
@@ -618,29 +622,39 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Delete an email by UID. When permanent is false (the safe default), the message is moved to the Trash folder. When permanent is true, the message is permanently deleted with STORE +FLAGS (\\Deleted) + EXPUNGE — this is irreversible. If the message is already in Trash and permanent is false, this is a no-op."
+        description = "Delete an email by UID. Moves the message to the Trash folder (safe, undoable). If the message is already in Trash, this is a no-op. The user can recover deleted messages by moving them out of Trash with move_email."
     )]
     async fn delete_email(
         &self,
         Parameters(params): Parameters<DeleteEmailParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
-        conn.delete_email(&params.folder, params.uid, params.permanent)
+        conn.delete_email(&params.folder, params.uid)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
-        let msg = if params.permanent {
-            format!(
-                "Email UID {} permanently deleted from '{}'",
-                params.uid, params.folder
-            )
-        } else {
-            format!(
-                "Email UID {} deleted (moved to Trash) from '{}'",
-                params.uid, params.folder
-            )
-        };
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Email UID {} deleted (moved to Trash) from '{}'",
+            params.uid, params.folder
+        ))]))
+    }
+
+    #[tool(
+        description = "Create a new IMAP folder. The folder name may include hierarchy separators (e.g., 'Projects' or 'Archive/2024') depending on the server's delimiter."
+    )]
+    async fn create_folder(
+        &self,
+        Parameters(params): Parameters<CreateFolderParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
+        conn.create_folder(&params.folder_name)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
+        conn.logout_or_warn().await;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Folder '{}' created",
+            params.folder_name
+        ))]))
     }
 
     #[tool(
@@ -780,7 +794,7 @@ impl ServerHandler for ImapMcpServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions(
-            "IMAP email server with multi-account support. One MCP install can hold multiple mailboxes per user (personal, shared team boxes, etc.). Use list_accounts to see what's connected and to get a manage_url the user can open to add or remove mailboxes; use add_account_url for an 'add a new mailbox' link without first listing. If only one account is connected, IMAP tools default to it; if more than one, pass `account` (account_id from list_accounts, or label) on every IMAP call. The remaining tools — list_folders, list_emails, get_email, search_emails, mark_read, mark_unread, move_email, delete_email, get_attachment, create_draft, update_draft — work as before. When reading an email with get_email, attachment metadata is included; use get_attachment with the attachment index to fetch the actual content. For PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
+            "IMAP email server with multi-account support. One MCP install can hold multiple mailboxes per user (personal, shared team boxes, etc.). Use list_accounts to see what's connected and to get a manage_url the user can open to add or remove mailboxes; use add_account_url for an 'add a new mailbox' link without first listing. If only one account is connected, IMAP tools default to it; if more than one, pass `account` (account_id from list_accounts, or label) on every IMAP call. The remaining tools — list_folders, create_folder, list_emails, get_email, search_emails, mark_read, mark_unread, move_email, delete_email, get_attachment, create_draft, update_draft — work as before. When reading an email with get_email, attachment metadata is included; use get_attachment with the attachment index to fetch the actual content. For PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
         )
     }
 }

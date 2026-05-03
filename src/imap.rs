@@ -139,6 +139,16 @@ impl ImapConnection {
         Ok(result)
     }
 
+    /// Create a new mailbox folder.
+    pub async fn create_folder(&mut self, folder_name: &str) -> Result<(), AppError> {
+        Self::validate_imap_input(folder_name, "folder name")?;
+        self.session
+            .create(folder_name)
+            .await
+            .map_err(|e| AppError::Imap(format!("CREATE {folder_name} failed: {e}")))?;
+        Ok(())
+    }
+
     /// List emails in a folder with pagination.
     pub async fn list_emails(
         &mut self,
@@ -448,65 +458,17 @@ impl ImapConnection {
 
     /// Delete an email by UID.
     ///
-    /// When `permanent` is `false`, moves the message to the Trash folder.
-    /// When `permanent` is `true`, permanently deletes it with STORE +FLAGS
-    /// (\Deleted) followed by UID EXPUNGE (or EXPUNGE if UIDPLUS is unsupported).
-    pub async fn delete_email(
-        &mut self,
-        folder: &str,
-        uid: u32,
-        permanent: bool,
-    ) -> Result<(), AppError> {
+    /// Moves the message to the Trash folder (safe, undoable). If the message is
+    /// already in Trash, this is a no-op.
+    pub async fn delete_email(&mut self, folder: &str, uid: u32) -> Result<(), AppError> {
         Self::validate_imap_input(folder, "folder name")?;
 
-        if permanent {
-            self.session
-                .select(folder)
-                .await
-                .map_err(|e| AppError::Imap(format!("SELECT {folder} failed: {e}")))?;
-
-            let _: Vec<async_imap::types::Fetch> = self
-                .session
-                .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
-                .await
-                .map_err(|e| AppError::Imap(format!("STORE +FLAGS failed: {e}")))?
-                .try_collect()
-                .await
-                .map_err(|e| AppError::Imap(format!("STORE stream failed: {e}")))?;
-
-            let has_uidplus = self
-                .session
-                .capabilities()
-                .await
-                .map_err(|e| AppError::Imap(format!("CAPABILITY failed: {e}")))?
-                .has_str("UIDPLUS");
-
-            if has_uidplus {
-                self.session
-                    .uid_expunge(uid.to_string())
-                    .await
-                    .map_err(|e| AppError::Imap(format!("UID EXPUNGE failed: {e}")))?
-                    .try_collect::<Vec<u32>>()
-                    .await
-                    .map_err(|e| AppError::Imap(format!("UID EXPUNGE stream failed: {e}")))?;
-            } else {
-                self.session
-                    .expunge()
-                    .await
-                    .map_err(|e| AppError::Imap(format!("EXPUNGE failed: {e}")))?
-                    .try_collect::<Vec<u32>>()
-                    .await
-                    .map_err(|e| AppError::Imap(format!("EXPUNGE stream failed: {e}")))?;
-            }
-            Ok(())
-        } else {
-            let trash_folder = self.resolve_trash_folder().await?;
-            if folder.eq_ignore_ascii_case(&trash_folder) {
-                // Already in Trash — no-op
-                return Ok(());
-            }
-            self.move_email(folder, uid, &trash_folder).await
+        let trash_folder = self.resolve_trash_folder().await?;
+        if folder.eq_ignore_ascii_case(&trash_folder) {
+            // Already in Trash — no-op
+            return Ok(());
         }
+        self.move_email(folder, uid, &trash_folder).await
     }
 
     /// Resolve the Trash folder for the current account, caching the result.

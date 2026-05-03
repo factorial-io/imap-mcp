@@ -353,18 +353,32 @@ fn delete_email_params_defaults() {
     let params: imap_mcp::mcp::DeleteEmailParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.uid, 7);
     assert_eq!(params.folder, "INBOX");
-    assert!(!params.permanent);
     assert_eq!(params.account, None);
 }
 
 #[test]
 fn delete_email_params_custom() {
-    let json = r#"{"uid": 3, "folder": "Junk", "permanent": true, "account": "personal"}"#;
+    let json = r#"{"uid": 3, "folder": "Junk", "account": "personal"}"#;
     let params: imap_mcp::mcp::DeleteEmailParams = serde_json::from_str(json).unwrap();
     assert_eq!(params.uid, 3);
     assert_eq!(params.folder, "Junk");
-    assert!(params.permanent);
     assert_eq!(params.account.as_deref(), Some("personal"));
+}
+
+#[test]
+fn create_folder_params_defaults() {
+    let json = r#"{"folder_name": "Projects"}"#;
+    let params: imap_mcp::mcp::CreateFolderParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.folder_name, "Projects");
+    assert_eq!(params.account, None);
+}
+
+#[test]
+fn create_folder_params_custom() {
+    let json = r#"{"folder_name": "Archive/2024", "account": "work"}"#;
+    let params: imap_mcp::mcp::CreateFolderParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.folder_name, "Archive/2024");
+    assert_eq!(params.account.as_deref(), Some("work"));
 }
 
 // --- /manage route tests ---
