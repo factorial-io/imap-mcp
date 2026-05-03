@@ -966,10 +966,10 @@ impl ImapConnection {
             .await
             .map_err(|e| AppError::Imap(format!("TLS handshake failed: {e}")))?;
         let client = async_imap::Client::new(tls_stream);
-        let session = client
-            .login(email, password)
-            .await
-            .map_err(|e| AppError::Imap(format!("IMAP login failed: {}", e.0)))?;
+        let session = client.login(email, password).await.map_err(|e| {
+            tracing::warn!("IMAP login failed: {}", e.0);
+            AppError::ImapAuth
+        })?;
         Ok(Self { session })
     }
 
@@ -1549,6 +1549,17 @@ impl ImapConnection {
             .await
             .map_err(|e| AppError::Imap(format!("logout failed: {e}")))?;
         Ok(())
+    }
+
+    /// Best-effort logout: warns on failure rather than silently swallowing
+    /// it. Used after every successful tool call where the work has already
+    /// been committed and a logout error is informational only — but
+    /// CLAUDE.md forbids silent error suppression, so we log instead of
+    /// `.ok()`-discarding the result.
+    pub async fn logout_or_warn(self) {
+        if let Err(e) = self.logout().await {
+            tracing::warn!("IMAP logout failed: {e}");
+        }
     }
 }
 
