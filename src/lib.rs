@@ -77,6 +77,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/manage/accounts/{account_id}/delete",
             post(manage::delete_account),
         )
+        .route(
+            "/manage/accounts/{account_id}/revalidate",
+            post(manage::revalidate_account),
+        )
         .route("/manage/logout", post(manage::logout))
         .route("/mcp", axum::routing::any(mcp_handler))
         .route("/mcp/{path}", axum::routing::any(mcp_handler))

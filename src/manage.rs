@@ -160,6 +160,11 @@ pub async fn add_account(
         return Err(AppError::Auth("IMAP email is required".into()));
     }
 
+    state
+        .sessions
+        .check_imap_validate_rate_limit(&session.oidc_sub)
+        .await?;
+
     tracing::info!(
         oidc_sub = %session.oidc_sub,
         provider = %provider.id,
@@ -208,6 +213,12 @@ pub struct CsrfForm {
     pub csrf_token: String,
 }
 
+#[derive(Deserialize)]
+pub struct RevalidateForm {
+    pub csrf_token: String,
+    pub imap_password: String,
+}
+
 /// POST /manage/accounts/{id}/delete — remove a mailbox.
 pub async fn delete_account(
     State(state): State<Arc<AppState>>,
@@ -233,12 +244,77 @@ pub async fn delete_account(
     Ok(Redirect::to(&format!("{}/manage?msg=removed", state.base_url)).into_response())
 }
 
+/// POST /manage/accounts/{id}/revalidate — re-enter the IMAP password for an
+/// account whose stored credentials have stopped working. Resets
+/// `auth_failure_count`, clears `disabled_at`, and updates the encrypted
+/// password — but only after a successful IMAP login with the new password.
+pub async fn revalidate_account(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(account_id): Path<String>,
+    Form(form): Form<RevalidateForm>,
+) -> Result<Response, AppError> {
+    let session = require_session(&state, &headers).await?;
+    if !constant_time_eq(&form.csrf_token, &session.csrf_token) {
+        return Err(AppError::Auth("invalid CSRF token".into()));
+    }
+
+    let account = state
+        .sessions
+        .get_account(&session.oidc_sub, &account_id)
+        .await?
+        .ok_or_else(|| AppError::Auth("account not found".into()))?;
+
+    state
+        .sessions
+        .check_imap_validate_rate_limit(&session.oidc_sub)
+        .await?;
+
+    tracing::info!(
+        oidc_sub = %session.oidc_sub,
+        account_id = %account.account_id,
+        imap_email = %account.imap_email,
+        "Re-validating IMAP credentials"
+    );
+    let conn = ImapConnection::connect(
+        &account.imap_host,
+        account.imap_port,
+        &account.imap_email,
+        &form.imap_password,
+    )
+    .await
+    .map_err(|_| AppError::InvalidCredentials)?;
+    conn.logout().await.ok();
+
+    let (enc, iv) = state.sessions.encrypt(&form.imap_password)?;
+    state
+        .sessions
+        .update_account_password(&session.oidc_sub, &account.account_id, enc, iv)
+        .await?;
+
+    tracing::info!(
+        oidc_sub = %session.oidc_sub,
+        account_id = %account.account_id,
+        "Account re-validated"
+    );
+    Ok(Redirect::to(&format!("{}/manage?msg=revalidated", state.base_url)).into_response())
+}
+
 /// POST /manage/logout — clear the management session.
 pub async fn logout(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
 ) -> Result<Response, AppError> {
     if let Some(session_id) = read_cookie(&headers) {
+        // CSRF check: an attacker who can POST cross-origin (same-site +
+        // SameSite=Lax doesn't fully block this) shouldn't be able to log
+        // the user out and force repeated OIDC re-auth.
+        if let Some(sess) = state.sessions.get_manage_session(&session_id).await? {
+            if !constant_time_eq(&form.csrf_token, &sess.csrf_token) {
+                return Err(AppError::Auth("invalid CSRF token".into()));
+            }
+        }
         state.sessions.delete_manage_session(&session_id).await?;
     }
     Ok((
@@ -283,6 +359,7 @@ fn render_manage_page(
     let banner = match msg {
         Some("added") => r#"<div class="banner ok">Account added.</div>"#.to_string(),
         Some("removed") => r#"<div class="banner ok">Account removed.</div>"#.to_string(),
+        Some("revalidated") => r#"<div class="banner ok">Account re-validated.</div>"#.to_string(),
         _ => String::new(),
     };
 
@@ -312,6 +389,22 @@ fn render_manage_page(
                     .unwrap_or_else(|| "—".to_string()),
                 None => "—".to_string(),
             };
+            // Re-validate form rendered only for disabled accounts: a small
+            // password input + button that POSTs to .../revalidate. Hidden
+            // for healthy accounts to keep the table tidy.
+            let revalidate_cell = if a.is_disabled() {
+                format!(
+                    r#"<form method="POST" action="/manage/accounts/{id}/revalidate" style="display:inline-block;margin-right:8px;">
+                            <input type="hidden" name="csrf_token" value="{csrf}">
+                            <input type="password" name="imap_password" placeholder="New password" required style="width:auto;display:inline-block;">
+                            <button type="submit">Re-validate</button>
+                        </form>"#,
+                    id = html_escape(&a.account_id),
+                    csrf = csrf,
+                )
+            } else {
+                String::new()
+            };
             rows.push_str(&format!(
                 r#"<tr>
                     <td>{label}</td>
@@ -320,7 +413,8 @@ fn render_manage_page(
                     <td>{last_used}</td>
                     <td>{status}</td>
                     <td>
-                        <form method="POST" action="/manage/accounts/{id}/delete" data-confirm-label="{label}" onsubmit="return confirm('Remove ' + this.dataset.confirmLabel + '?');">
+                        {revalidate_cell}
+                        <form method="POST" action="/manage/accounts/{id}/delete" data-confirm-label="{label}" onsubmit="return confirm('Remove ' + this.dataset.confirmLabel + '?');" style="display:inline-block;">
                             <input type="hidden" name="csrf_token" value="{csrf}">
                             <button type="submit" class="danger">Remove</button>
                         </form>
@@ -373,6 +467,7 @@ fn render_manage_page(
 </head>
 <body>
     <form method="POST" action="/manage/logout" class="logout">
+        <input type="hidden" name="csrf_token" value="{csrf}">
         <button type="submit" style="background:#6b7280;">Sign out</button>
     </form>
     <h1>IMAP accounts</h1>

@@ -84,10 +84,25 @@ pub struct Session {
     pub created_at: i64,
 
     // --- Legacy fields (pre-multi-account). Optional so new sessions don't
-    // emit them; deserialization tolerates them on old records. ---
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // emit them; deserialization tolerates them on old records via serde
+    // aliases that match the original on-disk field names.
+    //
+    // CRITICAL: the aliases are how pre-migration users keep working after a
+    // server upgrade. Without them, serde silently fills `None` from the
+    // `default`, `maybe_migrate_legacy` finds no credentials to promote, and
+    // every existing user is locked out. There is a unit test in this
+    // module that parses the raw legacy JSON directly to lock this in.
+    #[serde(
+        default,
+        alias = "imap_password_enc",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub legacy_imap_password_enc: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "imap_password_iv",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub legacy_imap_password_iv: Option<String>,
 }
 
@@ -153,6 +168,14 @@ pub const ACCOUNT_TTL: u64 = 365 * 24 * 3600; // 1 year, refreshed on use
 pub const MANAGE_TICKET_TTL: u64 = 15 * 60; // 15 minutes (decision: question 3)
 pub const MANAGE_SESSION_TTL: u64 = 30 * 60; // 30 minutes for the cookie session
 pub const AUTH_FAILURE_LIMIT: u32 = 3; // decision: question 2
+
+/// Sliding-window rate limit for IMAP credential validations: max attempts
+/// per `oidc_sub` per window. Applies to `/auth/setup`, `/manage/accounts`
+/// (add), and `/manage/accounts/{id}/revalidate`. Prevents an authenticated
+/// user from using the server as a credential brute-force oracle against an
+/// allowlisted IMAP host.
+pub const IMAP_VALIDATE_LIMIT: u32 = 5;
+pub const IMAP_VALIDATE_WINDOW_SECS: u64 = 10 * 60;
 
 impl SessionStore {
     pub fn new(redis_url: &str, encryption_key_b64: &str) -> Result<Self, AppError> {
@@ -364,7 +387,7 @@ impl SessionStore {
         for (_, v) in map {
             out.push(serde_json::from_str::<Account>(&v)?);
         }
-        out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        out.sort_by_key(|a| a.created_at);
         Ok(out)
     }
 
@@ -517,6 +540,47 @@ impl SessionStore {
         Ok(())
     }
 
+    // --- Rate limiting (IMAP credential validations per oidc_sub) ---
+
+    /// Increment the IMAP-validation counter for `oidc_sub` and return
+    /// `Ok(())` if the user is still under the limit, or
+    /// `Err(AppError::RateLimited { ... })` if they've exceeded it.
+    ///
+    /// Implementation: a Redis INCR + EXPIRE on `ratelimit:imap_validate:{sub}`
+    /// — fixed-window, not sliding, but cheap and good enough for a low-volume
+    /// auth-adjacent operation. The first call in a window sets the TTL; the
+    /// counter resets when the key expires.
+    pub async fn check_imap_validate_rate_limit(&self, oidc_sub: &str) -> Result<(), AppError> {
+        let key = format!("ratelimit:imap_validate:{oidc_sub}");
+        let mut conn = self.conn().await?;
+        let count: u32 = conn.incr(&key, 1u32).await?;
+        if count == 1 {
+            // First hit in this window — set the TTL so the counter expires.
+            conn.expire::<_, ()>(&key, IMAP_VALIDATE_WINDOW_SECS as i64)
+                .await?;
+        }
+        if count > IMAP_VALIDATE_LIMIT {
+            // Surface a useful message with the remaining TTL. If the TTL
+            // lookup itself fails (Redis hiccup), log it and fall back to
+            // the configured window — refusing the request is the right
+            // call regardless.
+            let ttl: i64 = match conn.ttl(&key).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "ttl lookup failed for rate-limit key {key}: {e}; \
+                         falling back to full window"
+                    );
+                    IMAP_VALIDATE_WINDOW_SECS as i64
+                }
+            };
+            return Err(AppError::RateLimited {
+                retry_after_secs: ttl.max(0) as u64,
+            });
+        }
+        Ok(())
+    }
+
     // --- Encryption helpers ---
 
     pub(crate) fn encrypt(&self, plaintext: &str) -> Result<(String, String), AppError> {
@@ -621,10 +685,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_session_deserializes_with_email_alias_and_password_fields() {
-        // Legacy single-account sessions stored before multi-account migration:
-        // they used `email` (not `oidc_email`) and carried encrypted credentials
-        // inline. We must still be able to read them.
+    fn legacy_session_deserializes_raw_pre_migration_json() {
+        // EXACT shape of pre-migration session records in Redis: `email`
+        // (not `oidc_email`), `imap_password_enc` / `imap_password_iv`
+        // (not `legacy_*`). The production path (`get_session`) calls
+        // `serde_json::from_str::<Session>` directly on the raw Redis
+        // value with no key-renaming, so this test must too — otherwise
+        // a missing alias would silently lock every existing user out
+        // of the server after deployment.
         let json = r#"{
             "email": "alice@factorial.io",
             "oidc_sub": "abc",
@@ -632,19 +700,7 @@ mod tests {
             "imap_password_iv": "IV",
             "created_at": 1700000000
         }"#;
-        // Adapt: legacy field names are `imap_password_enc/iv` — accept those
-        // via serde aliases mapped to our new names.
-        let value: serde_json::Value = serde_json::from_str(json).unwrap();
-        let mut obj = value.as_object().unwrap().clone();
-        // Simulate the simple migration we do at runtime: rename keys.
-        if let Some(v) = obj.remove("imap_password_enc") {
-            obj.insert("legacy_imap_password_enc".to_string(), v);
-        }
-        if let Some(v) = obj.remove("imap_password_iv") {
-            obj.insert("legacy_imap_password_iv".to_string(), v);
-        }
-        let migrated = serde_json::Value::Object(obj).to_string();
-        let session: Session = serde_json::from_str(&migrated).unwrap();
+        let session: Session = serde_json::from_str(json).unwrap();
         assert_eq!(session.oidc_email, "alice@factorial.io");
         assert_eq!(session.oidc_sub, "abc");
         assert_eq!(session.legacy_imap_password_enc.as_deref(), Some("ENC"));

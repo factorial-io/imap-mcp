@@ -405,6 +405,13 @@ pub async fn setup(
         return Err(AppError::Auth("IMAP email is required".into()));
     }
 
+    // Rate-limit credential validations per oidc_sub so the server can't be
+    // used as a brute-force oracle against the allowlisted IMAP host.
+    state
+        .sessions
+        .check_imap_validate_rate_limit(&pending.oidc_sub)
+        .await?;
+
     // Validate IMAP credentials against the chosen provider.
     tracing::info!(
         oidc_sub = %pending.oidc_sub,
