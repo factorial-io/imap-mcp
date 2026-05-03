@@ -478,18 +478,19 @@ impl SessionStore {
     }
 
     /// Single-use: looking the ticket up consumes it.
+    ///
+    /// Uses Redis `GETDEL` (≥ 6.2) for atomic read-and-delete so two
+    /// concurrent redemptions of the same ticket can't both succeed —
+    /// only one of them gets `Some(...)` back, the other gets `None`.
     pub async fn consume_manage_ticket(
         &self,
         ticket: &str,
     ) -> Result<Option<ManageTicket>, AppError> {
         let key = format!("mgmt:ticket:{ticket}");
         let mut conn = self.conn().await?;
-        let value: Option<String> = conn.get(&key).await?;
+        let value: Option<String> = conn.get_del(&key).await?;
         match value {
-            Some(v) => {
-                let _: () = conn.del(&key).await?;
-                Ok(Some(serde_json::from_str(&v)?))
-            }
+            Some(v) => Ok(Some(serde_json::from_str(&v)?)),
             None => Ok(None),
         }
     }

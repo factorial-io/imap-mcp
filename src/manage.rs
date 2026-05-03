@@ -265,6 +265,22 @@ pub async fn revalidate_account(
         .await?
         .ok_or_else(|| AppError::Auth("account not found".into()))?;
 
+    // Allowlist enforcement on use: if the operator removed this provider
+    // after the user connected the mailbox, refuse to revalidate. The
+    // resolver in lib.rs does the same on every tool call; we mirror it
+    // here so /manage doesn't become a sneaky way to keep using a
+    // de-allowlisted host.
+    if state
+        .providers
+        .get_by_host(&account.imap_host, account.imap_port)
+        .is_none()
+    {
+        return Err(AppError::Auth(format!(
+            "provider {}:{} is no longer in the allowlist; remove this account and reconnect",
+            account.imap_host, account.imap_port
+        )));
+    }
+
     state
         .sessions
         .check_imap_validate_rate_limit(&session.oidc_sub)
@@ -337,10 +353,16 @@ async fn require_session(
         .ok_or_else(|| AppError::Auth("no management session".into()))
 }
 
-/// Constant-time string equality, including over unequal-length inputs.
+/// Constant-time string equality for equal-length secrets (e.g. UUID CSRF
+/// tokens).
 ///
-/// Wraps `subtle::ConstantTimeEq` so length mismatch doesn't leak via early
-/// return — both branches do the same work.
+/// Uses [`subtle::ConstantTimeEq`] which is constant-time in the *content*
+/// of the slices but **not** in their *length*: a length mismatch returns
+/// `Choice(0)` without doing the byte-by-byte comparison work, so length
+/// can leak via timing. That's fine in this codebase because every CSRF
+/// token compared here is `uuid::Uuid::new_v4().to_string()` — always
+/// 36 bytes — so the slow path always runs. Future callers must keep
+/// inputs the same length, or accept that unequal lengths short-circuit.
 fn constant_time_eq(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
     a.as_bytes().ct_eq(b.as_bytes()).into()
