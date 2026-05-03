@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
         oidc_client,
         providers,
         cli.base_url,
-    ));
+    )?);
 
     let app = build_router(state);
 

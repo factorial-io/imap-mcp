@@ -30,6 +30,10 @@ pub struct AppState {
     /// Allowlist of IMAP providers users may connect to. Always non-empty.
     pub providers: ProviderList,
     pub base_url: String,
+    /// Hosts the rmcp Streamable-HTTP transport will accept in the `Host`
+    /// header. Without our public hostname here, every MCP request is dropped
+    /// as a DNS-rebinding attempt (rmcp >= 1.6 defaults to localhost only).
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 impl AppState {
@@ -38,13 +42,15 @@ impl AppState {
         oidc_client: CoreClient,
         providers: ProviderList,
         base_url: String,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let mcp_allowed_hosts = derive_mcp_allowed_hosts(&base_url)?;
+        Ok(Self {
             sessions,
             oidc_client,
             providers,
             base_url,
-        }
+            mcp_allowed_hosts,
+        })
     }
 
     /// Convenience: the first provider in the allowlist. Used by the legacy
@@ -52,6 +58,23 @@ impl AppState {
     pub fn default_provider(&self) -> &providers::ImapProvider {
         self.providers.first()
     }
+}
+
+/// Build the rmcp allowed-hosts list from `base_url`. We always keep the
+/// loopback defaults so local dev keeps working when `BASE_URL` is set to a
+/// public hostname.
+fn derive_mcp_allowed_hosts(base_url: &str) -> anyhow::Result<Vec<String>> {
+    let parsed = url::Url::parse(base_url)
+        .map_err(|e| anyhow::anyhow!("BASE_URL is not a valid URL ({base_url}): {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("BASE_URL has no host component: {base_url}"))?;
+    Ok(vec![
+        host.to_string(),
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ])
 }
 
 /// Build the axum Router from shared state. Used by main and integration tests.
@@ -389,7 +412,8 @@ async fn mcp_handler(
 
     let config = StreamableHttpServerConfig::default()
         .with_stateful_mode(false)
-        .with_json_response(true);
+        .with_json_response(true)
+        .with_allowed_hosts(state.mcp_allowed_hosts.iter().cloned());
 
     let service = StreamableHttpService::new(
         move || Ok(mcp::ImapMcpServer::new(resolver.clone())),
