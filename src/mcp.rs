@@ -239,6 +239,41 @@ pub struct MarkParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MoveEmailParams {
+    /// Email UID to move
+    pub uid: u32,
+    /// Source IMAP folder name (default: INBOX)
+    #[serde(default = "default_inbox")]
+    pub source_folder: String,
+    /// Target IMAP folder name
+    pub target_folder: String,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteEmailParams {
+    /// Email UID to delete
+    pub uid: u32,
+    /// IMAP folder name containing the email (default: INBOX)
+    #[serde(default = "default_inbox")]
+    pub folder: String,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateFolderParams {
+    /// Name of the new folder to create (e.g., "Projects", "Archive/2024")
+    pub folder_name: String,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateDraftParams {
     /// Recipient email address(es), comma-separated for multiple
     pub to: String,
@@ -569,6 +604,69 @@ impl ImapMcpServer {
     }
 
     #[tool(
+        description = "Move an email to another folder by UID. Uses the IMAP MOVE extension when the server advertises it; falls back to COPY + STORE +FLAGS (\\Deleted) for older servers (the original is only marked as deleted, not expunged, so the action remains undoable). The target folder must exist."
+    )]
+    async fn move_email(
+        &self,
+        Parameters(params): Parameters<MoveEmailParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
+        conn.move_email(&params.source_folder, params.uid, &params.target_folder)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
+        conn.logout_or_warn().await;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Email UID {} moved from '{}' to '{}'",
+            params.uid, params.source_folder, params.target_folder
+        ))]))
+    }
+
+    #[tool(
+        description = "Delete an email by UID. Moves the message to the Trash folder (safe, undoable). If the message is already in Trash, this is a no-op. The user can recover deleted messages by moving them out of Trash with move_email."
+    )]
+    async fn delete_email(
+        &self,
+        Parameters(params): Parameters<DeleteEmailParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
+        let moved = conn
+            .delete_email(&params.folder, params.uid)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
+        conn.logout_or_warn().await;
+        let msg = if moved {
+            format!(
+                "Email UID {} deleted (moved to Trash) from '{}'",
+                params.uid, params.folder
+            )
+        } else {
+            format!(
+                "Email UID {} is already in Trash — no action taken",
+                params.uid
+            )
+        };
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    #[tool(
+        description = "Create a new IMAP folder. The folder name may include hierarchy separators (e.g., 'Projects' or 'Archive/2024') depending on the server's delimiter."
+    )]
+    async fn create_folder(
+        &self,
+        Parameters(params): Parameters<CreateFolderParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
+        conn.create_folder(&params.folder_name)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
+        conn.logout_or_warn().await;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Folder '{}' created",
+            params.folder_name
+        ))]))
+    }
+
+    #[tool(
         description = "Create a new draft email. The body MUST contain newline characters (\\n) to separate paragraphs and lines — never send the entire body as a single line. Optionally provide html_body for formatted emails (the plain text body is always required as fallback). The draft is saved to the specified folder (default: Drafts) and can be edited later with update_draft or sent from your email client. To create a reply, first use get_email to fetch the original email, then pass its message_id as in_reply_to, and set references to the original references value (if any) plus the original message_id appended. If the original email has no references (thread root), use only its message_id as the references value."
     )]
     async fn create_draft(
@@ -705,7 +803,7 @@ impl ServerHandler for ImapMcpServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions(
-            "IMAP email server with multi-account support. One MCP install can hold multiple mailboxes per user (personal, shared team boxes, etc.). Use list_accounts to see what's connected and to get a manage_url the user can open to add or remove mailboxes; use add_account_url for an 'add a new mailbox' link without first listing. If only one account is connected, IMAP tools default to it; if more than one, pass `account` (account_id from list_accounts, or label) on every IMAP call. The remaining tools — list_folders, list_emails, get_email, search_emails, mark_read, mark_unread, get_attachment, create_draft, update_draft — work as before. When reading an email with get_email, attachment metadata is included; use get_attachment with the attachment index to fetch the actual content. For PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
+            "IMAP email server with multi-account support. One MCP install can hold multiple mailboxes per user (personal, shared team boxes, etc.). Use list_accounts to see what's connected and to get a manage_url the user can open to add or remove mailboxes; use add_account_url for an 'add a new mailbox' link without first listing. If only one account is connected, IMAP tools default to it; if more than one, pass `account` (account_id from list_accounts, or label) on every IMAP call. The remaining tools — list_folders, create_folder, list_emails, get_email, search_emails, mark_read, mark_unread, move_email, delete_email, get_attachment, create_draft, update_draft — work as before. When reading an email with get_email, attachment metadata is included; use get_attachment with the attachment index to fetch the actual content. For PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
         )
     }
 }

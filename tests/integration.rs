@@ -326,6 +326,61 @@ fn list_emails_params_accepts_account() {
     assert_eq!(params.folder, "INBOX");
 }
 
+#[test]
+fn move_email_params_defaults() {
+    let json = r#"{"uid": 42, "target_folder": "Archive"}"#;
+    let params: imap_mcp::mcp::MoveEmailParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.uid, 42);
+    assert_eq!(params.source_folder, "INBOX");
+    assert_eq!(params.target_folder, "Archive");
+    assert_eq!(params.account, None);
+}
+
+#[test]
+fn move_email_params_custom() {
+    let json =
+        r#"{"uid": 1, "source_folder": "Sent", "target_folder": "Archive", "account": "work"}"#;
+    let params: imap_mcp::mcp::MoveEmailParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.uid, 1);
+    assert_eq!(params.source_folder, "Sent");
+    assert_eq!(params.target_folder, "Archive");
+    assert_eq!(params.account.as_deref(), Some("work"));
+}
+
+#[test]
+fn delete_email_params_defaults() {
+    let json = r#"{"uid": 7}"#;
+    let params: imap_mcp::mcp::DeleteEmailParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.uid, 7);
+    assert_eq!(params.folder, "INBOX");
+    assert_eq!(params.account, None);
+}
+
+#[test]
+fn delete_email_params_custom() {
+    let json = r#"{"uid": 3, "folder": "Junk", "account": "personal"}"#;
+    let params: imap_mcp::mcp::DeleteEmailParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.uid, 3);
+    assert_eq!(params.folder, "Junk");
+    assert_eq!(params.account.as_deref(), Some("personal"));
+}
+
+#[test]
+fn create_folder_params_defaults() {
+    let json = r#"{"folder_name": "Projects"}"#;
+    let params: imap_mcp::mcp::CreateFolderParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.folder_name, "Projects");
+    assert_eq!(params.account, None);
+}
+
+#[test]
+fn create_folder_params_custom() {
+    let json = r#"{"folder_name": "Archive/2024", "account": "work"}"#;
+    let params: imap_mcp::mcp::CreateFolderParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.folder_name, "Archive/2024");
+    assert_eq!(params.account.as_deref(), Some("work"));
+}
+
 // --- /manage route tests ---
 
 #[tokio::test]
