@@ -50,16 +50,24 @@ pub enum ExtractionHint {
 /// length of the full path that would be used to fetch the attachment (so the
 /// top-level attachments have `path_len == 1`).
 pub(crate) fn classify_extraction(mime: &str, size: usize, path_len: usize) -> ExtractionHint {
-    if size > MAX_RAW_BYTES_SIZE {
-        return ExtractionHint::TooLarge;
-    }
+    // Text extraction and embedded-message parsing happen server-side and the
+    // result is always ≤ MAX_LLM_CONTENT_SIZE (200 KB) regardless of the
+    // attachment's raw size, so the inline-bytes cap doesn't apply. A 20 MB
+    // PDF still extracts cleanly; a 20 MB forwarded .eml still parses.
     if crate::extract::is_extractable_mime(mime) || is_text_mime(mime) {
         return ExtractionHint::Text;
     }
+    if mime == "message/rfc822" && path_len <= MAX_EML_RECURSION_DEPTH {
+        return ExtractionHint::EmbeddedMessage;
+    }
+    // Falling through to here means the full bytes will be returned to the
+    // client (image, raw_bytes, or a too-deep `.eml`), so the inline cap is
+    // meaningful from this point on.
+    if size > MAX_RAW_BYTES_SIZE {
+        return ExtractionHint::TooLarge;
+    }
     if mime == "message/rfc822" {
-        if path_len <= MAX_EML_RECURSION_DEPTH {
-            return ExtractionHint::EmbeddedMessage;
-        }
+        // The only way we land here is the deep-`.eml` fall-through above.
         return ExtractionHint::RawBytes;
     }
     if mime.starts_with("image/") {
@@ -1976,6 +1984,47 @@ These are my notes.\r\n\
     fn classify_extraction_oversized_is_too_large() {
         assert_eq!(
             classify_extraction("application/zip", MAX_RAW_BYTES_SIZE + 1, 1),
+            ExtractionHint::TooLarge
+        );
+    }
+
+    #[test]
+    fn classify_extraction_large_pdf_still_text() {
+        // The inline-bytes cap doesn't apply to formats the server extracts
+        // server-side: the response is always ≤ 200 KB of extracted text
+        // regardless of the source file's size.
+        assert_eq!(
+            classify_extraction("application/pdf", 20 * 1024 * 1024, 1),
+            ExtractionHint::Text
+        );
+    }
+
+    #[test]
+    fn classify_extraction_large_eml_still_embedded_message() {
+        assert_eq!(
+            classify_extraction("message/rfc822", 20 * 1024 * 1024, 1),
+            ExtractionHint::EmbeddedMessage
+        );
+    }
+
+    #[test]
+    fn classify_extraction_large_text_plain_still_text() {
+        assert_eq!(
+            classify_extraction("text/plain", 20 * 1024 * 1024, 1),
+            ExtractionHint::Text
+        );
+    }
+
+    #[test]
+    fn classify_extraction_deep_oversized_eml_is_too_large() {
+        // A message/rfc822 too deep to parse natively falls through to raw
+        // bytes, and the inline cap then applies normally.
+        assert_eq!(
+            classify_extraction(
+                "message/rfc822",
+                MAX_RAW_BYTES_SIZE + 1,
+                MAX_EML_RECURSION_DEPTH + 1,
+            ),
             ExtractionHint::TooLarge
         );
     }

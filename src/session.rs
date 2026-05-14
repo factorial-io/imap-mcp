@@ -717,7 +717,12 @@ impl SessionStore {
             // normal operation (the two keys were written together under the
             // same TTL). Treat as a missing token; the metadata key has
             // already been consumed, which is what we want.
-            tracing::warn!(token = %token, "download token had metadata but no data");
+            // Don't log the token: it's the bearer credential for the
+            // download endpoint, and even though the meta key has just been
+            // GETDEL'd here, that's an ordering invariant rather than a
+            // security boundary — a future refactor of the key layout
+            // shouldn't be able to turn this into a credential leak.
+            tracing::warn!("download token had metadata but no data (data key missing or expired)");
             return Ok(None);
         };
         Ok(Some((ticket, data)))
