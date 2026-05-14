@@ -189,10 +189,12 @@ pub const AUTH_FAILURE_LIMIT: u32 = 3; // decision: question 2
 /// enough to bound Redis memory consumption from large attachments.
 pub const DOWNLOAD_TICKET_TTL: u64 = 15 * 60;
 
-/// Hard cap on staged-attachment size. Larger than the inline raw-bytes cap so
-/// that users can download attachments that wouldn't fit inline, but bounded
-/// to keep a single download from filling Redis. Aligned with
-/// `imap::MAX_ATTACHMENT_SIZE` (25 MB).
+/// Hard cap on staged-attachment size. Pinned to the same 25 MB ceiling as
+/// `imap::MAX_ATTACHMENT_SIZE`, which is enforced earlier in the pipeline
+/// when `ImapConnection::get_attachment` decodes the part — so under normal
+/// operation the check in `stage_download` is a defence-in-depth assertion
+/// that should never fire. If the two constants ever drift apart, the
+/// smaller one wins and the larger one becomes dead code; keep them in sync.
 pub const DOWNLOAD_TICKET_MAX_SIZE: usize = 25 * 1024 * 1024;
 
 /// Sliding-window rate limit for IMAP credential validations: max attempts

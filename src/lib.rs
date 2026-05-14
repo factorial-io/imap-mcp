@@ -455,7 +455,14 @@ async fn download_handler(
     let result = match state.sessions.consume_download_ticket(&token).await {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!(token = %token, error = %e, "download lookup failed");
+            // The token IS the bearer credential for this endpoint, so it
+            // must never appear in logs: a connection-level Redis failure
+            // can fire before GETDEL reaches the server, leaving the token
+            // live and redeemable for the full TTL. A log line in a shipped
+            // log stream would be a complete authorization bypass. Log a
+            // short prefix purely for cross-referencing if needed.
+            let prefix: String = token.chars().take(8).collect();
+            tracing::error!(token_prefix = %prefix, error = %e, "download lookup failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load download").into_response();
         }
     };

@@ -38,7 +38,10 @@ pub enum ExtractionHint {
     Image,
     /// Returned as base64-encoded raw bytes.
     RawBytes,
-    /// Exceeds the inline raw-bytes cap; use `download_attachment` instead.
+    /// Exceeds the inline raw-bytes cap. For sizes up to `MAX_ATTACHMENT_SIZE`
+    /// (25 MB), `download_attachment` can serve a signed URL. Beyond that the
+    /// IMAP layer refuses to decode the part, so neither tool can deliver it —
+    /// the user has to retrieve it from a regular mail client.
     TooLarge,
 }
 
