@@ -112,6 +112,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/manage/logout", post(manage::logout))
         .route("/mcp", axum::routing::any(mcp_handler))
         .route("/mcp/{path}", axum::routing::any(mcp_handler))
+        .route("/download/{token}", get(download_handler))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -432,6 +433,123 @@ pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     Some(token.to_string())
 }
 
+/// One-shot download endpoint backing `download_attachment`. The token is the
+/// authorization: the random 256-bit identifier the MCP tool returned, looked
+/// up in Redis (with `GETDEL` so the URL works exactly once). The Bearer
+/// token used for the rest of the API is **not** required here — the user
+/// opens the URL in a browser tab where they don't have one.
+async fn download_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Response {
+    // Reject tokens that aren't URL-safe base64. Don't even hit Redis for these.
+    if token.is_empty()
+        || token.len() > 64
+        || !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return (StatusCode::NOT_FOUND, "Unknown or expired download link").into_response();
+    }
+
+    let result = match state.sessions.consume_download_ticket(&token).await {
+        Ok(v) => v,
+        Err(e) => {
+            // The token IS the bearer credential for this endpoint, so it
+            // must never appear in logs: a connection-level Redis failure
+            // can fire before GETDEL reaches the server, leaving the token
+            // live and redeemable for the full TTL. A log line in a shipped
+            // log stream would be a complete authorization bypass. Log a
+            // short prefix purely for cross-referencing if needed.
+            let prefix: String = token.chars().take(8).collect();
+            tracing::error!(token_prefix = %prefix, error = %e, "download lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load download").into_response();
+        }
+    };
+    let Some((ticket, data)) = result else {
+        return (StatusCode::NOT_FOUND, "Unknown or expired download link").into_response();
+    };
+
+    tracing::info!(
+        oidc_sub = %ticket.oidc_sub,
+        filename = %ticket.filename,
+        size = ticket.size,
+        "served attachment download"
+    );
+
+    let disposition = build_content_disposition(&ticket.filename);
+    // Defensive: only echo back ASCII MIME types. IMAP can carry anything.
+    let mime = if ticket.mime_type.is_ascii()
+        && !ticket
+            .mime_type
+            .contains(|c: char| c.is_control() || c == '"' || c == ',')
+    {
+        ticket.mime_type
+    } else {
+        "application/octet-stream".to_string()
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (http::header::CONTENT_TYPE, mime),
+            (http::header::CONTENT_DISPOSITION, disposition),
+            (
+                http::header::CACHE_CONTROL,
+                "no-store, max-age=0".to_string(),
+            ),
+        ],
+        data,
+    )
+        .into_response()
+}
+
+/// Build an RFC 5987-encoded `Content-Disposition` header value that safely
+/// carries Unicode filenames, with an ASCII-only fallback for old clients.
+pub(crate) fn build_content_disposition(filename: &str) -> String {
+    // Strip directory separators — `download_attachment` never accepts paths,
+    // but emails can supply filenames like `../etc/passwd`. We're emitting
+    // headers, not writing files, but it costs nothing to keep these out of
+    // the disposition.
+    let base = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("attachment")
+        .trim();
+    let base = if base.is_empty() { "attachment" } else { base };
+
+    // ASCII-only fallback in the `filename=` parameter.
+    let ascii_fallback: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() && c != '"' && c != '\\' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    // RFC 5987 percent-encoded UTF-8 in `filename*=`. Encode everything that
+    // isn't an unreserved character or token-safe punctuation.
+    let mut encoded = String::new();
+    for b in base.as_bytes() {
+        let c = *b;
+        let safe = c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                b'-' | b'_' | b'.' | b'~' | b'!' | b'#' | b'$' | b'&' | b'+' | b'^'
+            );
+        if safe {
+            encoded.push(c as char);
+        } else {
+            encoded.push_str(&format!("%{c:02X}"));
+        }
+    }
+
+    format!(r#"attachment; filename="{ascii_fallback}"; filename*=UTF-8''{encoded}"#)
+}
+
 /// Stable account_id used by the legacy single-account migration shim.
 /// Deterministic over `(oidc_sub, imap_email)` so concurrent migrations for
 /// the same legacy session converge on the same record. The `mig-` prefix
@@ -480,5 +598,43 @@ mod tests {
             legacy_migrated_account_id("a", "b"),
             legacy_migrated_account_id("ab", ""),
         );
+    }
+
+    #[test]
+    fn content_disposition_ascii_filename_quoted() {
+        let header = build_content_disposition("report.pdf");
+        assert!(header.contains(r#"filename="report.pdf""#));
+        assert!(header.contains(r"filename*=UTF-8''report.pdf"));
+    }
+
+    #[test]
+    fn content_disposition_unicode_filename_is_percent_encoded() {
+        // Cyrillic + emoji. RFC 5987 requires UTF-8 percent-encoding for
+        // anything outside the safe ASCII subset; the ASCII fallback for old
+        // clients replaces non-graphic characters with underscores.
+        let header = build_content_disposition("Отчёт 📊.pdf");
+        // ASCII fallback: non-graphics → underscores.
+        assert!(header.contains("filename=\""));
+        // Percent-encoded UTF-8 of "Отчёт" includes %D0 %9E … and the period
+        // and "pdf" remain unescaped.
+        assert!(header.contains("filename*=UTF-8''"));
+        assert!(header.contains("%D0%9E")); // 'О' in UTF-8
+        assert!(header.contains(".pdf"));
+        // No raw non-ASCII bytes — the entire header must be 7-bit safe.
+        assert!(header.is_ascii(), "header must be ASCII-safe: {header}");
+    }
+
+    #[test]
+    fn content_disposition_strips_path_traversal_segments() {
+        // Even though we're not writing files, keep "../" out of the header.
+        let header = build_content_disposition("../etc/passwd");
+        assert!(!header.contains("../"));
+        assert!(header.contains("passwd"));
+    }
+
+    #[test]
+    fn content_disposition_empty_filename_falls_back() {
+        let header = build_content_disposition("");
+        assert!(header.contains(r#"filename="attachment""#));
     }
 }

@@ -1,6 +1,8 @@
+use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as URLB64;
 use base64::Engine;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -151,6 +153,19 @@ pub struct ManageSession {
     pub created_at: i64,
 }
 
+/// One-shot signed-URL staging record for `download_attachment`. The bytes
+/// themselves are stored separately under the same token to avoid round-trip
+/// base64-encoding them through JSON.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DownloadTicket {
+    pub filename: String,
+    pub mime_type: String,
+    pub size: usize,
+    /// OIDC subject of the user who staged the file. Logged on redemption so
+    /// the server's access log can attribute the download.
+    pub oidc_sub: String,
+}
+
 /// Manages sessions, accounts, and auth state in Redis with AES-256-GCM
 /// encryption.
 #[derive(Clone)]
@@ -168,6 +183,19 @@ pub const ACCOUNT_TTL: u64 = 365 * 24 * 3600; // 1 year, refreshed on use
 pub const MANAGE_TICKET_TTL: u64 = 15 * 60; // 15 minutes (decision: question 3)
 pub const MANAGE_SESSION_TTL: u64 = 30 * 60; // 30 minutes for the cookie session
 pub const AUTH_FAILURE_LIMIT: u32 = 3; // decision: question 2
+
+/// How long a staged attachment is fetchable from `/download/{token}` before
+/// it expires. Plenty of time for a user to click the link in chat; short
+/// enough to bound Redis memory consumption from large attachments.
+pub const DOWNLOAD_TICKET_TTL: u64 = 15 * 60;
+
+/// Hard cap on staged-attachment size. Pinned to the same 25 MB ceiling as
+/// `imap::MAX_ATTACHMENT_SIZE`, which is enforced earlier in the pipeline
+/// when `ImapConnection::get_attachment` decodes the part — so under normal
+/// operation the check in `stage_download` is a defence-in-depth assertion
+/// that should never fire. If the two constants ever drift apart, the
+/// smaller one wins and the larger one becomes dead code; keep them in sync.
+pub const DOWNLOAD_TICKET_MAX_SIZE: usize = 25 * 1024 * 1024;
 
 /// Sliding-window rate limit for IMAP credential validations: max attempts
 /// per `oidc_sub` per window. Applies to `/auth/setup`, `/manage/accounts`
@@ -627,6 +655,77 @@ impl SessionStore {
             Some(v) => Ok(Some(serde_json::from_str(&v)?)),
             None => Ok(None),
         }
+    }
+
+    // --- Download tickets (one-shot signed URLs for attachment downloads) ---
+
+    /// Stage attachment `data` under a fresh random token. The caller
+    /// embeds the token in a download URL; the user fetching that URL
+    /// redeems the token via `consume_download_ticket`, which returns the
+    /// metadata and bytes and atomically deletes the staging records.
+    pub async fn stage_download(
+        &self,
+        ticket: &DownloadTicket,
+        data: &[u8],
+    ) -> Result<String, AppError> {
+        if data.len() > DOWNLOAD_TICKET_MAX_SIZE {
+            return Err(AppError::Imap(format!(
+                "attachment too large to stage for download ({} bytes, max {})",
+                data.len(),
+                DOWNLOAD_TICKET_MAX_SIZE
+            )));
+        }
+        let mut token_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut token_bytes);
+        let token = URLB64.encode(token_bytes);
+        let meta_key = format!("download:meta:{token}");
+        let data_key = format!("download:data:{token}");
+        let meta = serde_json::to_string(ticket)?;
+        let mut conn = self.conn().await?;
+        // Stage data first, then metadata. Reverse order on consumption.
+        // If staging the second key fails, the orphan first key expires on its
+        // own TTL — no leakage, just briefly wasted Redis memory.
+        conn.set_ex::<_, &[u8], ()>(&data_key, data, DOWNLOAD_TICKET_TTL)
+            .await?;
+        conn.set_ex::<_, _, ()>(&meta_key, meta, DOWNLOAD_TICKET_TTL)
+            .await?;
+        Ok(token)
+    }
+
+    /// Redeem a download token: returns metadata + bytes and atomically
+    /// deletes the staging records via `GETDEL`. Returns `Ok(None)` if the
+    /// token is unknown, expired, or already consumed.
+    pub async fn consume_download_ticket(
+        &self,
+        token: &str,
+    ) -> Result<Option<(DownloadTicket, Vec<u8>)>, AppError> {
+        let meta_key = format!("download:meta:{token}");
+        let data_key = format!("download:data:{token}");
+        let mut conn = self.conn().await?;
+        // Atomic read-and-delete on the metadata key first: if two clicks
+        // race, only one gets `Some(...)` back. The loser sees `None` and
+        // we never even touch the data key.
+        let meta: Option<String> = conn.get_del(&meta_key).await?;
+        let Some(meta) = meta else {
+            // Token not found, expired, or already consumed.
+            return Ok(None);
+        };
+        let ticket: DownloadTicket = serde_json::from_str(&meta)?;
+        let data: Option<Vec<u8>> = conn.get_del(&data_key).await?;
+        let Some(data) = data else {
+            // Metadata existed but data didn't — should be impossible under
+            // normal operation (the two keys were written together under the
+            // same TTL). Treat as a missing token; the metadata key has
+            // already been consumed, which is what we want.
+            // Don't log the token: it's the bearer credential for the
+            // download endpoint, and even though the meta key has just been
+            // GETDEL'd here, that's an ordering invariant rather than a
+            // security boundary — a future refactor of the key layout
+            // shouldn't be able to turn this into a credential leak.
+            tracing::warn!("download token had metadata but no data (data key missing or expired)");
+            return Ok(None);
+        };
+        Ok(Some((ticket, data)))
     }
 
     // --- Manage cookie sessions ---

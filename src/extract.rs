@@ -61,6 +61,20 @@ pub fn mime_to_format_label(mime: &str) -> &str {
     }
 }
 
+/// Whether the server can extract plain text from this MIME type via the
+/// in-process or subprocess extractors. Used to pre-classify attachments for
+/// the `extraction` hint in `get_email`.
+pub fn is_extractable_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "application/pdf"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            | "application/msword"
+    )
+}
+
 /// Attempt to extract text from a binary attachment based on its MIME type.
 ///
 /// - `Ok(Some(text))` — extraction succeeded

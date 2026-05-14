@@ -6,9 +6,12 @@ use serde::Deserialize;
 
 use crate::error::AppError;
 use crate::extract;
-use crate::imap::{self, DraftContent, ImapConnection, MAX_LLM_CONTENT_SIZE};
+use crate::imap::{
+    self, AttachmentData, DraftContent, ExtractionHint, ImapConnection, MAX_LLM_CONTENT_SIZE,
+    MAX_RAW_BYTES_SIZE,
+};
 use crate::manage::{AccountSummary, ListAccountsResult};
-use crate::session::Account;
+use crate::session::{Account, DownloadTicket, DOWNLOAD_TICKET_TTL};
 use crate::{AccountResolver, ResolveError};
 
 /// MCP server instance — one per request, holds session context.
@@ -216,8 +219,27 @@ pub struct SearchEmailsParams {
 pub struct GetAttachmentParams {
     /// Email UID
     pub uid: u32,
-    /// Zero-based attachment index (from the attachments list in get_email)
-    pub attachment_index: usize,
+    /// Path to the attachment from the email root, taken verbatim from the
+    /// `index` field returned by `get_email`. Top-level attachments are a
+    /// single-element array like `[0]`; an attachment nested inside a
+    /// forwarded `.eml` looks like `[0, 1]` ("the second attachment inside the
+    /// first attachment of the parent email"). Paths can descend through up
+    /// to five levels of `message/rfc822` parts.
+    pub attachment_index: Vec<usize>,
+    /// IMAP folder name (default: INBOX)
+    #[serde(default = "default_inbox")]
+    pub folder: String,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DownloadAttachmentParams {
+    /// Email UID
+    pub uid: u32,
+    /// Path to the attachment (same syntax as `get_attachment`).
+    pub attachment_index: Vec<usize>,
     /// IMAP folder name (default: INBOX)
     #[serde(default = "default_inbox")]
     pub folder: String,
@@ -419,7 +441,7 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Fetch an email attachment by UID and attachment index. Use get_email first to see the list of attachments. For PDFs and Office documents (DOCX, XLSX, PPTX), returns extracted text content. For text files, returns content directly. Large content is truncated to 200 KB. Images under 200 KB are returned visually; larger images and unsupported binary formats return metadata only."
+        description = "Fetch an email attachment by UID and attachment_index (a path-array, e.g. [0] for the first top-level attachment or [0, 1] for the second attachment inside the first forwarded .eml). The response shape is hinted in get_email's `extraction` field: PDFs and Office documents return extracted text (truncated at 200 KB); message/rfc822 attachments are parsed natively into headers, body, and nested attachments; text files are returned verbatim; images under ~150 KB are returned visually; anything else under 5 MB is returned as base64-encoded raw_bytes; over 5 MB use `download_attachment` instead."
     )]
     async fn get_attachment(
         &self,
@@ -427,95 +449,57 @@ impl ImapMcpServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
         let attachment = conn
-            .get_attachment(&params.folder, params.uid, params.attachment_index)
+            .get_attachment(&params.folder, params.uid, &params.attachment_index)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
 
-        let mime = &attachment.info.mime_type;
-        let size = attachment.info.size;
+        render_attachment(attachment, &params.attachment_index).await
+    }
+
+    #[tool(
+        description = "Stage an attachment for download via a one-shot signed URL and return the URL. Use this for attachments larger than 5 MB (which `get_attachment` refuses to inline) and for any binary the user wants to save to disk. The link is valid for 15 minutes, redeems exactly once, and writes the file to the user's browser with the original filename. The MCP client should surface the URL to the user as a clickable link — Claude itself cannot fetch it. Use the same `attachment_index` path you'd pass to `get_attachment`."
+    )]
+    async fn download_attachment(
+        &self,
+        Parameters(params): Parameters<DownloadAttachmentParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
+        let attachment = conn
+            .get_attachment(&params.folder, params.uid, &params.attachment_index)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
+        conn.logout_or_warn().await;
+
         let filename = attachment
             .info
             .filename
             .clone()
-            .unwrap_or_else(|| format!("attachment_{}", params.attachment_index));
-
-        // 1. Try text extraction for supported document formats. In-memory
-        //    extractors first (PDF, DOCX, XLSX, PPTX); fall through to
-        //    subprocess-based extractors for legacy formats (DOC via antiword).
-        let extraction = match extract::extract_text(&attachment.data, mime) {
-            Ok(None) => extract::extract_text_subprocess(&attachment.data, mime).await,
-            other => other,
+            .unwrap_or_else(|| format!("attachment_{}", format_path(&params.attachment_index)));
+        let ticket = DownloadTicket {
+            filename: filename.clone(),
+            mime_type: attachment.info.mime_type.clone(),
+            size: attachment.info.size,
+            oidc_sub: self.resolver.oidc_sub.clone(),
         };
-        match extraction {
-            Ok(Some(raw_text)) => {
-                let format_label = extract::mime_to_format_label(mime);
-                let extracted = extract::build_extracted(raw_text, format_label);
-                let mut header = format!(
-                    "Text content extracted from: {filename} ({format_label}, {size} bytes)"
-                );
-                if extracted.truncated {
-                    header.push_str(&format!(
-                        "\nNOTE: Extracted text truncated to {} KB (full text: {} KB). Showing first portion only.",
-                        extracted.included_bytes / 1024,
-                        extracted.total_bytes / 1024,
-                    ));
-                }
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "{header}\n\n{}",
-                    extracted.text
-                ))]));
-            }
-            Err(err_msg) => {
-                // Extraction failed — return metadata with error explanation
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Attachment: {filename} ({mime}, {size} bytes)\nText extraction failed: {err_msg}. Content cannot be displayed."
-                ))]));
-            }
-            Ok(None) => {
-                // Not an extractable format — fall through to other handlers
-            }
-        }
+        let token = self
+            .resolver
+            .store
+            .stage_download(&ticket, &attachment.data)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
 
-        // 2. Images: return as image content if within size limit
-        if mime.starts_with("image/") {
-            // Account for ~33% base64 expansion: raw_limit * 4/3 ≈ MAX_LLM_CONTENT_SIZE
-            if size > MAX_LLM_CONTENT_SIZE * 3 / 4 {
-                let human_size = format_size(size);
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Image attachment: {filename} ({mime}, {size} bytes)\nNOTE: Image too large to include ({human_size}). Only metadata is shown."
-                ))]));
-            }
-            let b64 = imap::base64_encode(&attachment.data);
-            return Ok(CallToolResult::success(vec![
-                Content::text(format!(
-                    "Image attachment: {filename} ({mime}, {size} bytes)"
-                )),
-                Content::image(b64, mime.clone()),
-            ]));
-        }
-
-        // 3. Text-based content types: return with truncation if needed
-        if is_text_mime(mime) {
-            let text = String::from_utf8_lossy(&attachment.data);
-            let (content, truncated) = extract::truncate_to_limit(&text, MAX_LLM_CONTENT_SIZE);
-            let mut header = format!("Text attachment: {filename} ({mime}, {size} bytes)");
-            if truncated {
-                header.push_str(&format!(
-                    "\nNOTE: Content truncated to {} KB (full size: {} KB). Showing first portion only.",
-                    content.len() / 1024,
-                    text.len() / 1024,
-                ));
-            }
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "{header}\n\n{content}"
-            ))]));
-        }
-
-        // 4. Unsupported binary: metadata only
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Binary attachment: {filename} ({mime}, {size} bytes)\nText extraction is not supported for this format. Only metadata is shown."
-        ))]))
+        let url = format!("{}/download/{}", self.resolver.base_url, token);
+        let payload = DownloadAttachmentResponse {
+            url,
+            filename,
+            mime_type: attachment.info.mime_type,
+            size: attachment.info.size,
+            expires_in_seconds: DOWNLOAD_TICKET_TTL,
+        };
+        let json = Content::json(&payload)
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
+        Ok(CallToolResult::success(vec![json]))
     }
 
     #[tool(
@@ -678,15 +662,6 @@ fn reject_flat_body(body: &str) -> Result<(), rmcp::ErrorData> {
     Ok(())
 }
 
-/// Check if a MIME type is text-based (returned as-is, not extracted).
-fn is_text_mime(mime: &str) -> bool {
-    mime.starts_with("text/")
-        || mime == "application/json"
-        || mime == "application/xml"
-        || mime == "application/javascript"
-        || mime == "application/csv"
-}
-
 /// Format a byte size as a human-readable string.
 fn format_size(bytes: usize) -> String {
     if bytes >= 1024 * 1024 {
@@ -698,6 +673,149 @@ fn format_size(bytes: usize) -> String {
     }
 }
 
+/// Format an attachment path for human-readable error messages and fallback
+/// filenames: `[0, 1]` → `"0.1"`.
+fn format_path(path: &[usize]) -> String {
+    path.iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Payload returned when an attachment is delivered as base64 raw bytes.
+#[derive(Debug, serde::Serialize)]
+struct RawBytesResponse {
+    filename: String,
+    mime_type: String,
+    size: usize,
+    extraction: &'static str,
+    raw_base64: String,
+}
+
+/// Payload returned by `download_attachment` after staging the bytes in Redis.
+/// The client should render `url` as a clickable link for the user.
+#[derive(Debug, serde::Serialize)]
+struct DownloadAttachmentResponse {
+    url: String,
+    filename: String,
+    mime_type: String,
+    size: usize,
+    expires_in_seconds: u64,
+}
+
+/// Render a fetched attachment into the appropriate MCP `Content` based on the
+/// classified `ExtractionHint`. Centralised so `get_attachment` stays a thin
+/// dispatcher.
+async fn render_attachment(
+    attachment: AttachmentData,
+    requested_path: &[usize],
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let mime = attachment.info.mime_type.clone();
+    let size = attachment.info.size;
+    let filename = attachment
+        .info
+        .filename
+        .clone()
+        .unwrap_or_else(|| format!("attachment_{}", format_path(requested_path)));
+
+    match attachment.info.extraction {
+        ExtractionHint::Text => render_text_attachment(&attachment.data, &mime, &filename, size).await,
+        ExtractionHint::EmbeddedMessage => {
+            let embedded = imap::parse_embedded_message(&attachment.data, requested_path)
+                .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
+            let json = Content::json(&embedded)
+                .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
+            Ok(CallToolResult::success(vec![json]))
+        }
+        ExtractionHint::Image => {
+            let b64 = imap::base64_encode(&attachment.data);
+            Ok(CallToolResult::success(vec![
+                Content::text(format!(
+                    "Image attachment: {filename} ({mime}, {size} bytes)"
+                )),
+                Content::image(b64, mime.clone()),
+            ]))
+        }
+        ExtractionHint::RawBytes => {
+            let payload = RawBytesResponse {
+                filename,
+                mime_type: mime,
+                size,
+                extraction: "raw_bytes",
+                raw_base64: imap::base64_encode(&attachment.data),
+            };
+            let json = Content::json(&payload)
+                .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
+            Ok(CallToolResult::success(vec![json]))
+        }
+        ExtractionHint::TooLarge => Ok(CallToolResult::success(vec![Content::text(format!(
+            "Attachment {filename} ({mime}, {size} bytes / {human}) exceeds the {cap} inline cap. \
+             Call download_attachment with the same uid and attachment_index to get a one-shot signed URL.",
+            human = format_size(size),
+            cap = format_size(MAX_RAW_BYTES_SIZE),
+        ))])),
+    }
+}
+
+/// Inner dispatch for `ExtractionHint::Text`: tries the in-process and
+/// subprocess extractors for binary document formats, falling back to a
+/// verbatim UTF-8 decode for plain-text MIME types.
+async fn render_text_attachment(
+    data: &[u8],
+    mime: &str,
+    filename: &str,
+    size: usize,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    if extract::is_extractable_mime(mime) {
+        let extraction = match extract::extract_text(data, mime) {
+            Ok(None) => extract::extract_text_subprocess(data, mime).await,
+            other => other,
+        };
+        return match extraction {
+            Ok(Some(raw_text)) => {
+                let format_label = extract::mime_to_format_label(mime);
+                let extracted = extract::build_extracted(raw_text, format_label);
+                let mut header = format!(
+                    "Text content extracted from: {filename} ({format_label}, {size} bytes)"
+                );
+                if extracted.truncated {
+                    header.push_str(&format!(
+                        "\nNOTE: Extracted text truncated to {} KB (full text: {} KB). Showing first portion only.",
+                        extracted.included_bytes / 1024,
+                        extracted.total_bytes / 1024,
+                    ));
+                }
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "{header}\n\n{}",
+                    extracted.text
+                ))]))
+            }
+            Err(err_msg) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Attachment: {filename} ({mime}, {size} bytes)\nText extraction failed: {err_msg}. Content cannot be displayed."
+            ))])),
+            Ok(None) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Attachment: {filename} ({mime}, {size} bytes)\nText extraction is not supported for this format."
+            ))])),
+        };
+    }
+
+    // Plain-text MIMEs (text/*, JSON, XML, etc.): return verbatim with the
+    // standard 200 KB cap.
+    let text = String::from_utf8_lossy(data);
+    let (content, truncated) = extract::truncate_to_limit(&text, MAX_LLM_CONTENT_SIZE);
+    let mut header = format!("Text attachment: {filename} ({mime}, {size} bytes)");
+    if truncated {
+        header.push_str(&format!(
+            "\nNOTE: Content truncated to {} KB (full size: {} KB). Showing first portion only.",
+            content.len() / 1024,
+            text.len() / 1024,
+        ));
+    }
+    Ok(CallToolResult::success(vec![Content::text(format!(
+        "{header}\n\n{content}"
+    ))]))
+}
+
 #[tool_handler]
 impl ServerHandler for ImapMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -705,7 +823,7 @@ impl ServerHandler for ImapMcpServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions(
-            "IMAP email server with multi-account support. One MCP install can hold multiple mailboxes per user (personal, shared team boxes, etc.). Use list_accounts to see what's connected and to get a manage_url the user can open to add or remove mailboxes; use add_account_url for an 'add a new mailbox' link without first listing. If only one account is connected, IMAP tools default to it; if more than one, pass `account` (account_id from list_accounts, or label) on every IMAP call. The remaining tools — list_folders, list_emails, get_email, search_emails, mark_read, mark_unread, get_attachment, create_draft, update_draft — work as before. When reading an email with get_email, attachment metadata is included; use get_attachment with the attachment index to fetch the actual content. For PDFs and Office documents, extracted text is returned. Text files are returned directly. Large content is truncated to 200 KB. Images under 200 KB are shown visually. Larger images and unsupported binary formats return metadata only. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
+            "IMAP email server with multi-account support. One MCP install can hold multiple mailboxes per user (personal, shared team boxes, etc.). Use list_accounts to see what's connected and to get a manage_url the user can open to add or remove mailboxes; use add_account_url for an 'add a new mailbox' link without first listing. If only one account is connected, IMAP tools default to it; if more than one, pass `account` (account_id from list_accounts, or label) on every IMAP call. Tools: list_folders, list_emails, get_email, search_emails, mark_read, mark_unread, get_attachment, download_attachment, create_draft, update_draft. When get_email returns attachment metadata, each attachment has an `extraction` field telling you what get_attachment will return: `text` (PDFs, Office docs, plain text — server extracts text, truncated to 200 KB); `embedded_message` (the attachment is itself an email — server parses it natively and returns headers, body, and its own attachments); `image` (returned visually if small enough); `raw_bytes` (returned as base64 for binary formats under 5 MB); `too_large` (call download_attachment instead). The `index` field is a path array: top-level attachments are like [0], an attachment inside a forwarded .eml is [0, 1], and so on up to 5 levels deep. Use the same array as `attachment_index` for get_attachment and download_attachment. download_attachment returns a one-shot signed URL valid for 15 minutes — surface it to the user as a clickable link; Claude cannot fetch it directly. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
         )
     }
 }
