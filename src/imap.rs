@@ -14,6 +14,71 @@ const MAX_ATTACHMENT_SIZE: usize = 25 * 1024 * 1024;
 /// Maximum text content size returned to the LLM (200 KB).
 pub const MAX_LLM_CONTENT_SIZE: usize = 200 * 1024;
 
+/// Cap on raw-bytes inline return (5 MB). Attachments larger than this must be
+/// downloaded with `download_attachment` rather than inlined as base64.
+pub const MAX_RAW_BYTES_SIZE: usize = 5 * 1024 * 1024;
+
+/// Maximum length of an attachment path. Walking deeper than this through
+/// nested `message/rfc822` parts returns raw bytes instead of a parsed
+/// representation.
+pub const MAX_EML_RECURSION_DEPTH: usize = 5;
+
+/// Hint a client can use to decide whether to call `get_attachment` (which
+/// inlines content) or `download_attachment` (which writes to disk). Computed
+/// from MIME type and size; included in every `AttachmentInfo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionHint {
+    /// Server will extract plain text (PDF, DOCX, XLSX, PPTX, plain text).
+    Text,
+    /// Server will natively parse `message/rfc822` and return headers + body
+    /// + nested attachment list.
+    EmbeddedMessage,
+    /// Image that fits within the inline image size budget.
+    Image,
+    /// Returned as base64-encoded raw bytes.
+    RawBytes,
+    /// Exceeds the inline raw-bytes cap; use `download_attachment` instead.
+    TooLarge,
+}
+
+/// Classify an attachment based on its MIME type, decoded size, and the depth
+/// at which it lives within nested `message/rfc822` parts. `path_len` is the
+/// length of the full path that would be used to fetch the attachment (so the
+/// top-level attachments have `path_len == 1`).
+pub(crate) fn classify_extraction(mime: &str, size: usize, path_len: usize) -> ExtractionHint {
+    if size > MAX_RAW_BYTES_SIZE {
+        return ExtractionHint::TooLarge;
+    }
+    if crate::extract::is_extractable_mime(mime) || is_text_mime(mime) {
+        return ExtractionHint::Text;
+    }
+    if mime == "message/rfc822" {
+        if path_len <= MAX_EML_RECURSION_DEPTH {
+            return ExtractionHint::EmbeddedMessage;
+        }
+        return ExtractionHint::RawBytes;
+    }
+    if mime.starts_with("image/") {
+        // Account for ~33% base64 expansion when the image is returned visually.
+        let inline_budget = MAX_LLM_CONTENT_SIZE * 3 / 4;
+        if size <= inline_budget {
+            return ExtractionHint::Image;
+        }
+    }
+    ExtractionHint::RawBytes
+}
+
+/// Whether a MIME type is text-based (plain text returned verbatim, not via a
+/// binary extractor). Kept in sync with the dispatch in `mcp::render_attachment`.
+fn is_text_mime(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || mime == "application/json"
+        || mime == "application/xml"
+        || mime == "application/javascript"
+        || mime == "application/csv"
+}
+
 /// Summary of an email for list views.
 #[derive(Debug, Serialize)]
 pub struct EmailSummary {
@@ -27,14 +92,21 @@ pub struct EmailSummary {
 /// Metadata about an email attachment.
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachmentInfo {
-    /// Zero-based index of this attachment within the email.
-    pub index: usize,
+    /// Path to this attachment from the email root. Pass this back as
+    /// `attachment_index` to `get_attachment` or `download_attachment`.
+    /// Top-level attachments have a single-element path like `[0]`; an
+    /// attachment nested inside a forwarded `.eml` has `[0, 1]` ("the second
+    /// attachment inside the first attachment of the parent message").
+    pub index: Vec<usize>,
     /// Filename if available.
     pub filename: Option<String>,
     /// MIME type (e.g. "image/png", "application/pdf").
     pub mime_type: String,
     /// Size in bytes of the decoded content.
     pub size: usize,
+    /// Hint describing how `get_attachment` will represent this attachment so
+    /// the client can pick the right tool the first time.
+    pub extraction: ExtractionHint,
 }
 
 /// A fetched attachment with its data.
@@ -43,6 +115,23 @@ pub struct AttachmentData {
     pub info: AttachmentInfo,
     /// Raw decoded bytes of the attachment.
     pub data: Vec<u8>,
+}
+
+/// A `message/rfc822` attachment that has been parsed into its constituent
+/// headers, body, and nested attachments. Mirrors `EmailDetail` but with no
+/// `uid` (this part lives inside another message, not as a top-level message
+/// in a mailbox).
+#[derive(Debug, Serialize)]
+pub struct EmbeddedMessage {
+    pub date: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub cc: Option<String>,
+    pub subject: Option<String>,
+    pub message_id: Option<String>,
+    pub references: Option<String>,
+    pub body: String,
+    pub attachments: Vec<AttachmentInfo>,
 }
 
 /// Full email content.
@@ -211,7 +300,7 @@ impl ImapConnection {
                     }
                 });
                 let mut attachments = Vec::new();
-                collect_attachment_infos(&parsed, &mut attachments);
+                collect_attachment_infos(&parsed, &[], &mut attachments);
                 let references = extract_header_from_parsed(&parsed.headers, "References");
                 let message_id = extract_header_from_parsed(&parsed.headers, "Message-ID");
                 (extracted.text, attachments, references, message_id)
@@ -246,12 +335,14 @@ impl ImapConnection {
         })
     }
 
-    /// Fetch a specific attachment from an email by UID and attachment index.
+    /// Fetch a specific attachment from an email by UID and attachment path.
+    /// The path walks into nested `message/rfc822` parts up to
+    /// `MAX_EML_RECURSION_DEPTH` levels deep.
     pub async fn get_attachment(
         &mut self,
         folder: &str,
         uid: u32,
-        attachment_index: usize,
+        attachment_path: &[usize],
     ) -> Result<AttachmentData, AppError> {
         Self::validate_imap_input(folder, "folder name")?;
         self.session
@@ -273,7 +364,7 @@ impl ImapConnection {
             .ok_or_else(|| AppError::Imap(format!("email UID {uid} not found")))?;
 
         let body_raw = fetch.body().unwrap_or(b"");
-        extract_attachment_data(body_raw, attachment_index)
+        extract_attachment_data(body_raw, attachment_path)
     }
 
     /// Search emails using IMAP SEARCH criteria.
@@ -834,32 +925,49 @@ fn attachment_filename(part: &mailparse::ParsedMail) -> Option<String> {
     part.ctype.params.get("name").cloned()
 }
 
-/// Recursively collect attachment metadata from a parsed email.
-fn collect_attachment_infos(part: &mailparse::ParsedMail, out: &mut Vec<AttachmentInfo>) {
+/// Recursively collect attachment metadata from a parsed email, prefixing each
+/// attachment's `index` path with `parent_path`. For top-level emails pass
+/// `&[]`; for an embedded `.eml` at path `[2]`, pass `&[2]` so its attachments
+/// come back as `[2, 0]`, `[2, 1]`, …
+fn collect_attachment_infos(
+    part: &mailparse::ParsedMail,
+    parent_path: &[usize],
+    out: &mut Vec<AttachmentInfo>,
+) {
     if part.ctype.mimetype.to_lowercase().starts_with("multipart/") {
         for sub in &part.subparts {
-            collect_attachment_infos(sub, out);
+            collect_attachment_infos(sub, parent_path, out);
         }
         return;
     }
     if is_attachment(part) {
         let size = part.get_body_raw().map(|b| b.len()).unwrap_or(0);
+        let mime = part.ctype.mimetype.to_lowercase();
+        let local_index = out
+            .iter()
+            .filter(|info| info.index.len() == parent_path.len() + 1)
+            .filter(|info| info.index[..parent_path.len()] == *parent_path)
+            .count();
+        let mut path = parent_path.to_vec();
+        path.push(local_index);
+        let extraction = classify_extraction(&mime, size, path.len());
         out.push(AttachmentInfo {
-            index: out.len(),
+            index: path,
             filename: attachment_filename(part),
-            mime_type: part.ctype.mimetype.to_lowercase(),
+            mime_type: mime,
             size,
+            extraction,
         });
     }
 }
 
-/// Extract attachment metadata from raw email bytes.
+/// Extract top-level attachment metadata from raw email bytes.
 #[cfg(test)]
 fn extract_attachment_infos(raw: &[u8]) -> Vec<AttachmentInfo> {
     match mailparse::parse_mail(raw) {
         Ok(parsed) => {
             let mut infos = Vec::new();
-            collect_attachment_infos(&parsed, &mut infos);
+            collect_attachment_infos(&parsed, &[], &mut infos);
             infos
         }
         Err(_) => Vec::new(),
@@ -882,11 +990,30 @@ fn collect_attachment_parts<'a>(
     }
 }
 
-/// Extract a specific attachment's data by index.
+/// Resolve an attachment by path, descending through nested `message/rfc822`
+/// parts as required.
+///
+/// `path[0]` selects the n-th attachment at the top level of `raw`; if that
+/// attachment is itself a `message/rfc822` and `path` has more elements, the
+/// embedded message is parsed and `path[1]` selects an attachment within it,
+/// and so on. The total path length must not exceed
+/// `MAX_EML_RECURSION_DEPTH` — paths longer than that return an error so the
+/// caller can fall back to fetching the parent `.eml` as raw bytes.
 pub(crate) fn extract_attachment_data(
     raw: &[u8],
-    index: usize,
+    path: &[usize],
 ) -> Result<AttachmentData, AppError> {
+    if path.is_empty() {
+        return Err(AppError::Imap(
+            "attachment_index path must not be empty".to_string(),
+        ));
+    }
+    if path.len() > MAX_EML_RECURSION_DEPTH {
+        return Err(AppError::Imap(format!(
+            "attachment path exceeds maximum nesting depth of {MAX_EML_RECURSION_DEPTH}"
+        )));
+    }
+
     let parsed =
         mailparse::parse_mail(raw).map_err(|e| AppError::Imap(format!("parse error: {e}")))?;
 
@@ -894,8 +1021,8 @@ pub(crate) fn extract_attachment_data(
     collect_attachment_parts(&parsed, &mut parts);
 
     let part = parts
-        .get(index)
-        .ok_or_else(|| AppError::Imap(format!("attachment index {index} not found")))?;
+        .get(path[0])
+        .ok_or_else(|| AppError::Imap(format!("attachment index {} not found", path[0])))?;
 
     let data = part
         .get_body_raw()
@@ -909,14 +1036,74 @@ pub(crate) fn extract_attachment_data(
         )));
     }
 
+    if path.len() == 1 {
+        let mime = part.ctype.mimetype.to_lowercase();
+        let size = data.len();
+        let extraction = classify_extraction(&mime, size, path.len());
+        return Ok(AttachmentData {
+            info: AttachmentInfo {
+                index: path.to_vec(),
+                filename: attachment_filename(part),
+                mime_type: mime,
+                size,
+                extraction,
+            },
+            data,
+        });
+    }
+
+    // Path descends further — the current part must be a `message/rfc822`.
+    let mime = part.ctype.mimetype.to_lowercase();
+    if mime != "message/rfc822" {
+        return Err(AppError::Imap(format!(
+            "attachment_index path descends into part of type {mime}, but only message/rfc822 parts can be entered"
+        )));
+    }
+
+    // Recurse into the embedded message. The remaining path is interpreted
+    // relative to that message. Wrap the resulting `AttachmentData` so its
+    // `info.index` is the full path from the top of `raw`.
+    let nested = extract_attachment_data(&data, &path[1..])?;
+    let mut full_index = path[..1].to_vec();
+    full_index.extend(nested.info.index.iter().copied());
     Ok(AttachmentData {
         info: AttachmentInfo {
-            index,
-            filename: attachment_filename(part),
-            mime_type: part.ctype.mimetype.to_lowercase(),
-            size: data.len(),
+            index: full_index,
+            ..nested.info
         },
-        data,
+        data: nested.data,
+    })
+}
+
+/// Parse a `message/rfc822` payload into headers, body, and a list of nested
+/// attachments. Each nested attachment's `index` is prefixed with `base_path`
+/// so callers receive a path that can be passed back to `get_attachment`.
+pub(crate) fn parse_embedded_message(
+    raw: &[u8],
+    base_path: &[usize],
+) -> Result<EmbeddedMessage, AppError> {
+    let parsed = mailparse::parse_mail(raw)
+        .map_err(|e| AppError::Imap(format!("failed to parse embedded message: {e}")))?;
+    let extracted = extract_body_from_parsed(&parsed).unwrap_or_else(|e| {
+        tracing::warn!("failed to sanitize HTML for embedded message: {e}");
+        ExtractedBody {
+            text: String::new(),
+            #[cfg(test)]
+            raw_html: None,
+        }
+    });
+    let mut attachments = Vec::new();
+    collect_attachment_infos(&parsed, base_path, &mut attachments);
+    Ok(EmbeddedMessage {
+        date: extract_header_from_parsed(&parsed.headers, "Date"),
+        from: extract_header_from_parsed(&parsed.headers, "From"),
+        to: extract_header_from_parsed(&parsed.headers, "To"),
+        cc: extract_header_from_parsed(&parsed.headers, "Cc"),
+        subject: extract_header_from_parsed(&parsed.headers, "Subject"),
+        message_id: extract_header_from_parsed(&parsed.headers, "Message-ID"),
+        references: extract_header_from_parsed(&parsed.headers, "References"),
+        body: extracted.text,
+        attachments,
     })
 }
 
@@ -1267,10 +1454,11 @@ iVBORw0KGgo=\r\n\
 --bound--";
         let infos = extract_attachment_infos(raw);
         assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].index, 0);
+        assert_eq!(infos[0].index, vec![0]);
         assert_eq!(infos[0].filename, Some("photo.png".to_string()));
         assert_eq!(infos[0].mime_type, "image/png");
         assert!(infos[0].size > 0);
+        assert_eq!(infos[0].extraction, ExtractionHint::Image);
     }
 
     #[test]
@@ -1294,10 +1482,12 @@ Content-Transfer-Encoding: base64\r\n\r\n\
         assert_eq!(infos.len(), 2);
         assert_eq!(infos[0].filename, Some("report.pdf".to_string()));
         assert_eq!(infos[0].mime_type, "application/pdf");
-        assert_eq!(infos[0].index, 0);
+        assert_eq!(infos[0].index, vec![0]);
+        assert_eq!(infos[0].extraction, ExtractionHint::Text);
         assert_eq!(infos[1].filename, Some("photo.jpg".to_string()));
         assert_eq!(infos[1].mime_type, "image/jpeg");
-        assert_eq!(infos[1].index, 1);
+        assert_eq!(infos[1].index, vec![1]);
+        assert_eq!(infos[1].extraction, ExtractionHint::Image);
     }
 
     #[test]
@@ -1311,11 +1501,12 @@ Content-Type: text/csv\r\n\
 Content-Disposition: attachment; filename=\"data.csv\"\r\n\r\n\
 name,age\r\nAlice,30\r\n\
 --bound--";
-        let result = extract_attachment_data(raw, 0);
+        let result = extract_attachment_data(raw, &[0]);
         assert!(result.is_ok());
         let att = result.unwrap();
         assert_eq!(att.info.filename, Some("data.csv".to_string()));
         assert_eq!(att.info.mime_type, "text/csv");
+        assert_eq!(att.info.index, vec![0]);
         let text = String::from_utf8_lossy(&att.data);
         assert!(text.contains("Alice,30"));
     }
@@ -1323,7 +1514,7 @@ name,age\r\nAlice,30\r\n\
     #[test]
     fn extract_attachment_data_invalid_index() {
         let raw = b"Content-Type: text/plain\r\n\r\nNo attachments here.";
-        let result = extract_attachment_data(raw, 0);
+        let result = extract_attachment_data(raw, &[0]);
         assert!(result.is_err());
     }
 
@@ -1714,6 +1905,213 @@ These are my notes.\r\n\
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].filename, Some("notes.txt".to_string()));
         assert_eq!(infos[0].mime_type, "text/plain");
+        assert_eq!(infos[0].extraction, ExtractionHint::Text);
+    }
+
+    // --- Extraction-hint classification ---
+
+    #[test]
+    fn classify_extraction_pdf_is_text() {
+        assert_eq!(
+            classify_extraction("application/pdf", 1024, 1),
+            ExtractionHint::Text
+        );
+    }
+
+    #[test]
+    fn classify_extraction_text_plain_is_text() {
+        assert_eq!(
+            classify_extraction("text/plain", 1024, 1),
+            ExtractionHint::Text
+        );
+    }
+
+    #[test]
+    fn classify_extraction_eml_is_embedded_message() {
+        assert_eq!(
+            classify_extraction("message/rfc822", 1024, 1),
+            ExtractionHint::EmbeddedMessage
+        );
+    }
+
+    #[test]
+    fn classify_extraction_deeply_nested_eml_falls_back_to_raw_bytes() {
+        // At path length 6, an .eml can no longer be parsed natively.
+        assert_eq!(
+            classify_extraction("message/rfc822", 1024, MAX_EML_RECURSION_DEPTH + 1),
+            ExtractionHint::RawBytes
+        );
+    }
+
+    #[test]
+    fn classify_extraction_image_under_budget_is_image() {
+        assert_eq!(
+            classify_extraction("image/png", 50 * 1024, 1),
+            ExtractionHint::Image
+        );
+    }
+
+    #[test]
+    fn classify_extraction_image_over_budget_is_raw_bytes() {
+        // Larger than the inline image budget but smaller than the raw-bytes cap.
+        let size = MAX_LLM_CONTENT_SIZE * 3 / 4 + 1;
+        assert_eq!(
+            classify_extraction("image/png", size, 1),
+            ExtractionHint::RawBytes
+        );
+    }
+
+    #[test]
+    fn classify_extraction_unknown_binary_is_raw_bytes() {
+        assert_eq!(
+            classify_extraction("application/zip", 3 * 1024 * 1024, 1),
+            ExtractionHint::RawBytes
+        );
+    }
+
+    #[test]
+    fn classify_extraction_oversized_is_too_large() {
+        assert_eq!(
+            classify_extraction("application/zip", MAX_RAW_BYTES_SIZE + 1, 1),
+            ExtractionHint::TooLarge
+        );
+    }
+
+    // --- Embedded message (message/rfc822) parsing ---
+
+    /// Helper: build a multipart email with an embedded `.eml` attachment.
+    fn multipart_with_embedded_eml(inner: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"Content-Type: multipart/mixed; boundary=bound\r\n\r\n");
+        out.extend_from_slice(b"--bound\r\n");
+        out.extend_from_slice(b"Content-Type: text/plain\r\n\r\n");
+        out.extend_from_slice(b"See forwarded message.\r\n");
+        out.extend_from_slice(b"--bound\r\n");
+        out.extend_from_slice(
+            b"Content-Type: message/rfc822\r\n\
+              Content-Disposition: attachment; filename=\"forwarded.eml\"\r\n\r\n",
+        );
+        out.extend_from_slice(inner);
+        out.extend_from_slice(b"\r\n--bound--\r\n");
+        out
+    }
+
+    #[test]
+    fn detect_embedded_eml_attachment_with_extraction_hint() {
+        let inner = b"From: alice@example.com\r\n\
+                      To: bob@example.com\r\n\
+                      Subject: Hello\r\n\
+                      Message-ID: <orig@example.com>\r\n\r\n\
+                      Body of the forwarded message.\r\n";
+        let raw = multipart_with_embedded_eml(inner);
+        let infos = extract_attachment_infos(&raw);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].mime_type, "message/rfc822");
+        assert_eq!(infos[0].extraction, ExtractionHint::EmbeddedMessage);
+        assert_eq!(infos[0].index, vec![0]);
+    }
+
+    #[test]
+    fn parse_embedded_message_returns_headers_and_body() {
+        let inner = b"From: alice@example.com\r\n\
+                      To: bob@example.com\r\n\
+                      Subject: Forwarded\r\n\
+                      Message-ID: <orig@example.com>\r\n\
+                      References: <prev@example.com>\r\n\r\n\
+                      Body of the forwarded message.\r\n";
+        let parsed = parse_embedded_message(inner, &[0]).unwrap();
+        assert_eq!(parsed.from.as_deref(), Some("alice@example.com"));
+        assert_eq!(parsed.to.as_deref(), Some("bob@example.com"));
+        assert_eq!(parsed.subject.as_deref(), Some("Forwarded"));
+        assert_eq!(parsed.message_id.as_deref(), Some("<orig@example.com>"));
+        assert_eq!(parsed.references.as_deref(), Some("<prev@example.com>"));
+        assert!(parsed.body.contains("Body of the forwarded message"));
+        assert!(parsed.attachments.is_empty());
+    }
+
+    #[test]
+    fn parse_embedded_message_nested_attachments_have_full_path() {
+        // The embedded message has its own PDF attachment, whose path should be
+        // prefixed with the parent's path so it can be re-addressed.
+        let inner_with_pdf = b"Content-Type: multipart/mixed; boundary=inner\r\n\r\n\
+--inner\r\n\
+Content-Type: text/plain\r\n\r\n\
+Inner body.\r\n\
+--inner\r\n\
+Content-Type: application/pdf\r\n\
+Content-Disposition: attachment; filename=\"inner.pdf\"\r\n\r\n\
+%PDF-1.4 fake\r\n\
+--inner--\r\n";
+        let parsed = parse_embedded_message(inner_with_pdf, &[2]).unwrap();
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].mime_type, "application/pdf");
+        // Path is parent (2) + local position (0) within the embedded message.
+        assert_eq!(parsed.attachments[0].index, vec![2, 0]);
+        assert_eq!(parsed.attachments[0].extraction, ExtractionHint::Text);
+    }
+
+    #[test]
+    fn extract_attachment_data_walks_into_embedded_message() {
+        // Outer email has an embedded .eml at [0]; the embedded .eml has a CSV
+        // attachment at local index 0. We should be able to fetch it via [0, 0].
+        let inner = b"Content-Type: multipart/mixed; boundary=inner\r\n\r\n\
+--inner\r\n\
+Content-Type: text/plain\r\n\r\n\
+Inner body.\r\n\
+--inner\r\n\
+Content-Type: text/csv\r\n\
+Content-Disposition: attachment; filename=\"data.csv\"\r\n\r\n\
+name,age\r\nAlice,30\r\n\
+--inner--\r\n";
+        let raw = multipart_with_embedded_eml(inner);
+        let attachment = extract_attachment_data(&raw, &[0, 0]).unwrap();
+        assert_eq!(attachment.info.filename.as_deref(), Some("data.csv"));
+        assert_eq!(attachment.info.mime_type, "text/csv");
+        assert_eq!(attachment.info.index, vec![0, 0]);
+        let text = String::from_utf8_lossy(&attachment.data);
+        assert!(text.contains("Alice,30"));
+    }
+
+    #[test]
+    fn extract_attachment_data_rejects_descent_into_non_eml() {
+        // [0, 0] on an email whose only attachment is a CSV (not an .eml)
+        // should error out — you can't recurse into a non-message/rfc822 part.
+        let raw = b"Content-Type: multipart/mixed; boundary=bound\r\n\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\r\n\
+Body.\r\n\
+--bound\r\n\
+Content-Type: text/csv\r\n\
+Content-Disposition: attachment; filename=\"data.csv\"\r\n\r\n\
+a,b\r\n\
+--bound--";
+        let result = extract_attachment_data(raw, &[0, 0]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("text/csv") || msg.contains("message/rfc822"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn extract_attachment_data_rejects_too_deep_path() {
+        // Six-level path exceeds MAX_EML_RECURSION_DEPTH = 5.
+        let raw = b"Content-Type: text/plain\r\n\r\nHello";
+        let result = extract_attachment_data(raw, &[0, 0, 0, 0, 0, 0]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("nesting depth"));
+    }
+
+    #[test]
+    fn extract_attachment_data_rejects_empty_path() {
+        let raw = b"Content-Type: text/plain\r\n\r\nHello";
+        let result = extract_attachment_data(raw, &[]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty"));
     }
 
     // --- HTML body tests ---
