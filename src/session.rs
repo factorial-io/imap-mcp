@@ -197,6 +197,12 @@ pub const DOWNLOAD_TICKET_TTL: u64 = 15 * 60;
 /// smaller one wins and the larger one becomes dead code; keep them in sync.
 pub const DOWNLOAD_TICKET_MAX_SIZE: usize = 25 * 1024 * 1024;
 
+/// Aggregate cap on bytes a single user may have staged across all unredeemed
+/// download tickets at once. Without this, a misbehaving LLM session could
+/// chain N `download_attachment` calls before consuming any URL and park
+/// `N * DOWNLOAD_TICKET_MAX_SIZE` in Redis until the TTL expires.
+pub const DOWNLOAD_TICKET_USER_CAP: usize = 100 * 1024 * 1024;
+
 /// Sliding-window rate limit for IMAP credential validations: max attempts
 /// per `oidc_sub` per window. Applies to `/auth/setup`, `/manage/accounts`
 /// (add), and `/manage/accounts/{id}/revalidate`. Prevents an authenticated
@@ -659,10 +665,19 @@ impl SessionStore {
 
     // --- Download tickets (one-shot signed URLs for attachment downloads) ---
 
+    /// Per-user counter key tracking the sum of unredeemed staged bytes.
+    fn user_bytes_key(oidc_sub: &str) -> String {
+        format!("download:bytes:{oidc_sub}")
+    }
+
     /// Stage attachment `data` under a fresh random token. The caller
     /// embeds the token in a download URL; the user fetching that URL
     /// redeems the token via `consume_download_ticket`, which returns the
     /// metadata and bytes and atomically deletes the staging records.
+    ///
+    /// Enforces both a per-call ceiling (`DOWNLOAD_TICKET_MAX_SIZE`) and a
+    /// per-user aggregate ceiling (`DOWNLOAD_TICKET_USER_CAP`) so a session
+    /// can't park hundreds of MB in Redis by chaining calls.
     pub async fn stage_download(
         &self,
         ticket: &DownloadTicket,
@@ -675,13 +690,42 @@ impl SessionStore {
                 DOWNLOAD_TICKET_MAX_SIZE
             )));
         }
+        let mut conn = self.conn().await?;
+
+        // Reserve quota first: INCRBY → check → roll back if over.
+        // The reserve-then-rollback pattern is racey at the edges (two
+        // concurrent stages can both pass the check if they fire between
+        // each other's INCR and rollback), but the worst case is a brief
+        // overshoot that the TTL clears within `DOWNLOAD_TICKET_TTL`.
+        let user_key = Self::user_bytes_key(&ticket.oidc_sub);
+        let delta = data.len() as i64;
+        let new_total: i64 = conn.incr(&user_key, delta).await?;
+        conn.expire::<_, ()>(&user_key, DOWNLOAD_TICKET_TTL as i64)
+            .await?;
+        if new_total > DOWNLOAD_TICKET_USER_CAP as i64 {
+            // Roll back our INCRBY. Best effort: if the DECRBY itself fails
+            // (Redis hiccup), the counter is stuck high until TTL expiry,
+            // which just means the user has to wait. Acceptable.
+            if let Err(e) = conn.decr::<_, _, i64>(&user_key, delta).await {
+                tracing::warn!(
+                    oidc_sub = %ticket.oidc_sub,
+                    error = %e,
+                    "failed to roll back download bytes counter"
+                );
+            }
+            return Err(AppError::Imap(format!(
+                "user has too many pending download tickets ({} MB cap reached); \
+                 wait for outstanding download URLs to expire or be opened",
+                DOWNLOAD_TICKET_USER_CAP / 1024 / 1024
+            )));
+        }
+
         let mut token_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut token_bytes);
         let token = URLB64.encode(token_bytes);
         let meta_key = format!("download:meta:{token}");
         let data_key = format!("download:data:{token}");
         let meta = serde_json::to_string(ticket)?;
-        let mut conn = self.conn().await?;
         // Stage data first, then metadata. Reverse order on consumption.
         // If staging the second key fails, the orphan first key expires on its
         // own TTL — no leakage, just briefly wasted Redis memory.
@@ -694,7 +738,9 @@ impl SessionStore {
 
     /// Redeem a download token: returns metadata + bytes and atomically
     /// deletes the staging records via `GETDEL`. Returns `Ok(None)` if the
-    /// token is unknown, expired, or already consumed.
+    /// token is unknown, expired, or already consumed. Also decrements the
+    /// owner's per-user byte counter so future stages don't see the bytes as
+    /// still pending.
     pub async fn consume_download_ticket(
         &self,
         token: &str,
@@ -725,6 +771,18 @@ impl SessionStore {
             tracing::warn!("download token had metadata but no data (data key missing or expired)");
             return Ok(None);
         };
+        // Release the per-user quota. Best effort: a Redis hiccup here means
+        // the user keeps the bytes "charged" against their cap until TTL
+        // expiry, which is annoying but not a security or correctness issue.
+        let user_key = Self::user_bytes_key(&ticket.oidc_sub);
+        let delta = data.len() as i64;
+        if let Err(e) = conn.decr::<_, _, i64>(&user_key, delta).await {
+            tracing::warn!(
+                oidc_sub = %ticket.oidc_sub,
+                error = %e,
+                "failed to decrement download bytes counter"
+            );
+        }
         Ok(Some((ticket, data)))
     }
 

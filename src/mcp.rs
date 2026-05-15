@@ -215,6 +215,28 @@ pub struct SearchEmailsParams {
     pub account: Option<String>,
 }
 
+/// Either a bare integer or a path array for `attachment_index`. The path
+/// array (`[0]`, `[0, 1]`, …) is the canonical form; the bare integer is a
+/// transition-window back-compat shim so callers that haven't been updated
+/// from the old `attachment_index: 0` shape still work. `0` becomes `[0]`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum AttachmentIndex {
+    /// Single top-level attachment (legacy form, kept for back-compat).
+    Scalar(usize),
+    /// Path through nested `message/rfc822` parts.
+    Path(Vec<usize>),
+}
+
+impl AttachmentIndex {
+    pub fn into_path(self) -> Vec<usize> {
+        match self {
+            Self::Scalar(n) => vec![n],
+            Self::Path(v) => v,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetAttachmentParams {
     /// Email UID
@@ -224,8 +246,9 @@ pub struct GetAttachmentParams {
     /// single-element array like `[0]`; an attachment nested inside a
     /// forwarded `.eml` looks like `[0, 1]` ("the second attachment inside the
     /// first attachment of the parent email"). Paths can descend through up
-    /// to five levels of `message/rfc822` parts.
-    pub attachment_index: Vec<usize>,
+    /// to five levels of `message/rfc822` parts. A bare integer is also
+    /// accepted as shorthand for a single-element path.
+    pub attachment_index: AttachmentIndex,
     /// IMAP folder name (default: INBOX)
     #[serde(default = "default_inbox")]
     pub folder: String,
@@ -238,8 +261,9 @@ pub struct GetAttachmentParams {
 pub struct DownloadAttachmentParams {
     /// Email UID
     pub uid: u32,
-    /// Path to the attachment (same syntax as `get_attachment`).
-    pub attachment_index: Vec<usize>,
+    /// Path to the attachment (same syntax as `get_attachment`; a bare
+    /// integer is accepted as shorthand for a single-element path).
+    pub attachment_index: AttachmentIndex,
     /// IMAP folder name (default: INBOX)
     #[serde(default = "default_inbox")]
     pub folder: String,
@@ -448,13 +472,14 @@ impl ImapMcpServer {
         Parameters(params): Parameters<GetAttachmentParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
+        let path = params.attachment_index.into_path();
         let attachment = conn
-            .get_attachment(&params.folder, params.uid, &params.attachment_index)
+            .get_attachment(&params.folder, params.uid, &path)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
 
-        render_attachment(attachment, &params.attachment_index).await
+        render_attachment(attachment, &path).await
     }
 
     #[tool(
@@ -465,8 +490,9 @@ impl ImapMcpServer {
         Parameters(params): Parameters<DownloadAttachmentParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
+        let path = params.attachment_index.into_path();
         let attachment = conn
-            .get_attachment(&params.folder, params.uid, &params.attachment_index)
+            .get_attachment(&params.folder, params.uid, &path)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
@@ -475,7 +501,7 @@ impl ImapMcpServer {
             .info
             .filename
             .clone()
-            .unwrap_or_else(|| format!("attachment_{}", format_path(&params.attachment_index)));
+            .unwrap_or_else(|| format!("attachment_{}", format_path(&path)));
         let ticket = DownloadTicket {
             filename: filename.clone(),
             mime_type: attachment.info.mime_type.clone(),

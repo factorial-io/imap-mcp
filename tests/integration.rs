@@ -326,6 +326,31 @@ fn list_emails_params_accepts_account() {
     assert_eq!(params.folder, "INBOX");
 }
 
+// --- attachment_index back-compat shim ---
+
+#[test]
+fn get_attachment_params_accept_scalar_index() {
+    // Old-shape callers pass a bare integer; we wrap it as a single-element path.
+    let json = r#"{"uid": 7, "attachment_index": 0}"#;
+    let params: imap_mcp::mcp::GetAttachmentParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.uid, 7);
+    assert_eq!(params.attachment_index.into_path(), vec![0]);
+}
+
+#[test]
+fn get_attachment_params_accept_path_array() {
+    let json = r#"{"uid": 7, "attachment_index": [0, 1]}"#;
+    let params: imap_mcp::mcp::GetAttachmentParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.attachment_index.into_path(), vec![0, 1]);
+}
+
+#[test]
+fn download_attachment_params_accept_scalar_index() {
+    let json = r#"{"uid": 7, "attachment_index": 2}"#;
+    let params: imap_mcp::mcp::DownloadAttachmentParams = serde_json::from_str(json).unwrap();
+    assert_eq!(params.attachment_index.into_path(), vec![2]);
+}
+
 // --- /manage route tests ---
 
 #[tokio::test]

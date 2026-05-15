@@ -438,6 +438,13 @@ pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
 /// up in Redis (with `GETDEL` so the URL works exactly once). The Bearer
 /// token used for the rest of the API is **not** required here — the user
 /// opens the URL in a browser tab where they don't have one.
+///
+/// Operator note: because the token rides in the URL path, it will appear
+/// verbatim in any upstream HTTP access log (nginx, ALB, CloudFront, etc.)
+/// for the full `DOWNLOAD_TICKET_TTL` (15 min) window. The application-layer
+/// hygiene below only covers what *this* process logs. Same trade-off as S3
+/// presigned URLs; treat upstream access logs accordingly (short retention,
+/// restricted access).
 async fn download_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Path(token): axum::extract::Path<String>,
