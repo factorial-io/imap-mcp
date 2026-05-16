@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4](https://github.com/factorial-io/imap-mcp/compare/imap-mcp-v0.1.3...imap-mcp-v0.1.4) (2026-05-16)
+
+
+### Features
+
+* make unknown attachments usable to LLMs ([c0f606b](https://github.com/factorial-io/imap-mcp/commit/c0f606b0094e7f3e55f0268f2d16e2d7964d4da0))
+* make unknown attachments usable to LLMs ([3bedab6](https://github.com/factorial-io/imap-mcp/commit/3bedab6dff556ae6a4c4652a22ad4b0318eb8986))
+
+
+### Bug Fixes
+
+* address PR [#70](https://github.com/factorial-io/imap-mcp/issues/70) review feedback ([ae04b07](https://github.com/factorial-io/imap-mcp/commit/ae04b07f46efd8320583bf74b985039c159dbc0f))
+* address second round of PR [#70](https://github.com/factorial-io/imap-mcp/issues/70) review ([d243b5a](https://github.com/factorial-io/imap-mcp/commit/d243b5a828bd9477ca384964453234eaf0e51444))
+* allowlist public host for rmcp DNS rebinding protection ([202e464](https://github.com/factorial-io/imap-mcp/commit/202e46416aa8fb90ea0a2ba03d0ef54b934eef12))
+* allowlist public host for rmcp DNS rebinding protection ([8188d58](https://github.com/factorial-io/imap-mcp/commit/8188d586e513bf49f3ea458d040d4fa8688d41e6))
+* **deps:** update rust crate calamine to 0.35 ([ca57b8b](https://github.com/factorial-io/imap-mcp/commit/ca57b8b5135e3a676b57117ffa6a862a1e6911a6))
+* **deps:** update rust crate calamine to 0.35 ([d135ac2](https://github.com/factorial-io/imap-mcp/commit/d135ac220c8075fc3591362c94e772b8b93af44c))
+* **deps:** update rust crate html2text to 0.17.0 ([2008a95](https://github.com/factorial-io/imap-mcp/commit/2008a95a69e89ddd5ab89ecb36bea494a243589b))
+* **deps:** update rust crate quick-xml to 0.40 ([ac663c1](https://github.com/factorial-io/imap-mcp/commit/ac663c1520eb1f10fcc6aa8098dad262394618b6))
+* **deps:** update rust crate quick-xml to 0.40 ([1b1fdae](https://github.com/factorial-io/imap-mcp/commit/1b1fdae8a3702c1c32cd33001821672ee9995e50))
+
 ## [imap-mcp-v0.1.3] - 2026-05-03
 
 ### Features
