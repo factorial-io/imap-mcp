@@ -7,7 +7,7 @@ license = "MIT"
 [dependencies]
 # Web framework
 axum = { version = "0.8.4", features = ["macros"] }
-tower-http = { version = "0.6.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7.0", features = ["cors", "trace"] }
 tower = { version = "0.5.2" }
 tokio = { version = "1.44.2", features = ["full"] }
 tokio-util = { version = "0.7.15" }
