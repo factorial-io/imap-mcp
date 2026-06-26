@@ -52,7 +52,7 @@ sha2 = { version = "0.11.0" }
 secrecy = { version = "0.10.3", features = ["serde"] }
 
 # Text extraction
-pdf-extract = { version = "0.10" }
+pdf-extract = { version = "0.12" }
 calamine = { version = "0.35" }
 zip = { version = "2" }
 quick-xml = { version = "0.40" }
