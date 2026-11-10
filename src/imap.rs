@@ -4,6 +4,7 @@ use futures::TryStreamExt;
 use serde::Serialize;
 
 use crate::error::AppError;
+use async_imap::types::NameAttribute;
 
 use crate::sanitize::html_to_safe_text;
 pub use crate::sanitize::{sanitize_html_for_draft, DraftContent};
@@ -174,8 +175,6 @@ pub struct FolderInfo {
 /// Short-lived IMAP connection wrapper. Opened per-request, not pooled.
 pub struct ImapConnection {
     session: async_imap::Session<async_native_tls::TlsStream<tokio::net::TcpStream>>,
-    /// Cached Trash folder name per session to avoid repeated LIST calls.
-    trash_folder: Option<String>,
 }
 
 impl ImapConnection {
@@ -199,10 +198,7 @@ impl ImapConnection {
             tracing::warn!("IMAP login failed: {}", e.0);
             AppError::ImapAuth
         })?;
-        Ok(Self {
-            session,
-            trash_folder: None,
-        })
+        Ok(Self { session })
     }
 
     /// Validate that an IMAP string does not contain injection characters.
@@ -478,28 +474,42 @@ impl ImapConnection {
 
     /// Move an email from one folder to another by UID.
     ///
-    /// Uses IMAP MOVE (RFC 6851) when advertised; otherwise falls back to
-    /// COPY → STORE +FLAGS (\Deleted). The message is not expunged so the
-    /// action remains undoable (remove the \Deleted flag to recover).
+    /// Strategy, in order of preference:
+    /// 1. `UID MOVE` (RFC 6851) — atomic on the server.
+    /// 2. `UID COPY` → `UID STORE +FLAGS (\Deleted)` → `UID EXPUNGE`
+    ///    (RFC 4315 / UIDPLUS) — `UID EXPUNGE` only touches this one UID.
+    /// 3. `UID COPY` → `UID STORE +FLAGS (\Deleted)` without any expunge.
+    ///    A plain `EXPUNGE` would permanently remove *every* `\Deleted`
+    ///    message in the folder (RFC 3501 §6.4.3), including ones flagged by
+    ///    other clients, so we never issue it. The original stays visible in
+    ///    the source folder, flagged `\Deleted`, until a client expunges it.
     pub async fn move_email(
         &mut self,
         source_folder: &str,
         uid: u32,
         target_folder: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<MoveOutcome, AppError> {
         Self::validate_imap_input(source_folder, "source folder name")?;
         Self::validate_imap_input(target_folder, "target folder name")?;
+        if source_folder == target_folder {
+            return Err(AppError::Imap(format!(
+                "Source and target folder are the same ('{source_folder}')"
+            )));
+        }
 
-        // Query capabilities early — they don't change mid-session.
-        let has_move = self
+        // One CAPABILITY round-trip covers both extensions we care about.
+        let caps = self
             .session
             .capabilities()
             .await
-            .map_err(|e| AppError::Imap(format!("CAPABILITY failed: {e}")))?
-            .has_str("MOVE");
+            .map_err(|e| AppError::Imap(format!("CAPABILITY failed: {e}")))?;
+        let has_move = caps.has_str("MOVE");
+        let has_uidplus = caps.has_str("UIDPLUS");
 
-        // Validate target exists using LIST (no side effects, unlike SELECT)
-        let target_exists: Vec<async_imap::types::Name> = self
+        // LIST has no side effects, unlike SELECT. The pattern may contain
+        // the `*` / `%` wildcards, so require an exact, selectable match
+        // instead of just a non-empty result.
+        let matches: Vec<async_imap::types::Name> = self
             .session
             .list(Some(""), Some(target_folder))
             .await
@@ -507,84 +517,134 @@ impl ImapConnection {
             .try_collect()
             .await
             .map_err(|e| AppError::Imap(format!("LIST stream failed: {e}")))?;
-        if target_exists.is_empty() {
+        let target_selectable = matches.iter().any(|n| {
+            n.name() == target_folder && !n.attributes().contains(&NameAttribute::NoSelect)
+        });
+        if !target_selectable {
             return Err(AppError::Imap(format!(
-                "Target folder '{target_folder}' does not exist"
+                "Target folder '{target_folder}' does not exist or cannot hold messages"
             )));
         }
 
-        // Select source
-        self.session
-            .select(source_folder)
-            .await
-            .map_err(|e| AppError::Imap(format!("SELECT {source_folder} failed: {e}")))?;
+        self.select_and_require_uid(source_folder, uid).await?;
+        let uid_set = uid.to_string();
 
-        // Verify the UID actually exists before attempting to move/copy.
-        // RFC 3501 §6.4.8: UID COPY with a nonexistent UID returns OK without
-        // copying anything, which would misleadingly report success.
-        let uid_exists = self
+        if has_move {
+            self.session
+                .uid_mv(&uid_set, target_folder)
+                .await
+                .map_err(|e| AppError::Imap(format!("UID MOVE failed: {e}")))?;
+            return Ok(MoveOutcome::Moved);
+        }
+
+        self.session
+            .uid_copy(&uid_set, target_folder)
+            .await
+            .map_err(|e| AppError::Imap(format!("UID COPY failed: {e}")))?;
+
+        // From here on the message exists in both folders. Make any failure
+        // say so explicitly, so the caller does not blindly retry and pile
+        // up further copies in the target folder.
+        let partial = |step: &str, e: &dyn std::fmt::Display| {
+            AppError::Imap(format!(
+                "Email UID {uid} was copied to '{target_folder}', but {step} in \
+                 '{source_folder}' failed: {e}. The message now exists in both \
+                 folders; do not retry the move."
+            ))
+        };
+
+        let _: Vec<async_imap::types::Fetch> = self
+            .session
+            .uid_store(&uid_set, "+FLAGS.SILENT (\\Deleted)")
+            .await
+            .map_err(|e| partial("flagging the original as \\Deleted", &e))?
+            .try_collect()
+            .await
+            .map_err(|e| partial("flagging the original as \\Deleted", &e))?;
+
+        if !has_uidplus {
+            return Ok(MoveOutcome::CopiedAndFlaggedDeleted);
+        }
+
+        let _: Vec<u32> = self
+            .session
+            .uid_expunge(&uid_set)
+            .await
+            .map_err(|e| partial("expunging the original", &e))?
+            .try_collect()
+            .await
+            .map_err(|e| partial("expunging the original", &e))?;
+        Ok(MoveOutcome::Moved)
+    }
+
+    /// Delete an email by moving it to the account's Trash folder.
+    ///
+    /// Never expunges permanently. If `folder` already is the Trash folder,
+    /// nothing is changed and [`DeleteOutcome::AlreadyInTrash`] is returned
+    /// (after verifying that the UID actually exists there).
+    pub async fn delete_email(
+        &mut self,
+        folder: &str,
+        uid: u32,
+    ) -> Result<DeleteOutcome, AppError> {
+        Self::validate_imap_input(folder, "folder name")?;
+
+        let trash_folder = self.resolve_trash_folder().await?;
+        if folder == trash_folder {
+            self.select_and_require_uid(folder, uid).await?;
+            return Ok(DeleteOutcome::AlreadyInTrash { trash_folder });
+        }
+        let outcome = self.move_email(folder, uid, &trash_folder).await?;
+        Ok(DeleteOutcome::MovedToTrash {
+            trash_folder,
+            outcome,
+        })
+    }
+
+    /// Resolve the account's Trash folder from a fresh `LIST`.
+    ///
+    /// Not cached: connections are opened per request, so a cache would
+    /// never be read twice.
+    pub async fn resolve_trash_folder(&mut self) -> Result<String, AppError> {
+        let names: Vec<async_imap::types::Name> = self
+            .session
+            .list(Some(""), Some("*"))
+            .await
+            .map_err(|e| AppError::Imap(format!("LIST failed: {e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| AppError::Imap(format!("LIST stream failed: {e}")))?;
+        let candidates: Vec<TrashCandidate> = names.iter().map(TrashCandidate::from_name).collect();
+        find_trash_folder(&candidates).ok_or_else(|| {
+            AppError::Imap(
+                "Trash folder not found: no folder has the \\Trash special-use \
+                 attribute or a well-known Trash name"
+                    .to_string(),
+            )
+        })
+    }
+
+    /// SELECT `folder` and fail if `uid` does not exist in it.
+    ///
+    /// `UID COPY`, `UID MOVE` and `UID STORE` all return OK for a UID set
+    /// that matches nothing (RFC 3501 §6.4.8), which would otherwise turn a
+    /// typo into a false success report.
+    async fn select_and_require_uid(&mut self, folder: &str, uid: u32) -> Result<(), AppError> {
+        self.session
+            .select(folder)
+            .await
+            .map_err(|e| AppError::Imap(format!("SELECT {folder} failed: {e}")))?;
+        let found = self
             .session
             .uid_search(format!("UID {uid}"))
             .await
             .map_err(|e| AppError::Imap(format!("UID SEARCH failed: {e}")))?;
-        if !uid_exists.contains(&uid) {
+        if !found.contains(&uid) {
             return Err(AppError::Imap(format!(
-                "Email UID {uid} not found in '{source_folder}'"
+                "Email UID {uid} not found in '{folder}'"
             )));
         }
-
-        if has_move {
-            self.session
-                .uid_mv(uid.to_string(), target_folder)
-                .await
-                .map_err(|e| AppError::Imap(format!("UID MOVE failed: {e}")))?;
-        } else {
-            // Fallback: COPY → STORE \Deleted (no EXPUNGE, so the action is undoable)
-            self.session
-                .uid_copy(uid.to_string(), target_folder)
-                .await
-                .map_err(|e| AppError::Imap(format!("UID COPY failed: {e}")))?;
-
-            let _: Vec<async_imap::types::Fetch> = self
-                .session
-                .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
-                .await
-                .map_err(|e| AppError::Imap(format!("STORE +FLAGS failed: {e}")))?
-                .try_collect()
-                .await
-                .map_err(|e| AppError::Imap(format!("STORE stream failed: {e}")))?;
-        }
-
         Ok(())
-    }
-
-    /// Delete an email by UID.
-    ///
-    /// Moves the message to the Trash folder (safe, undoable). Returns `true`
-    /// if a move was performed, `false` if the message was already in Trash
-    /// (no-op).
-    pub async fn delete_email(&mut self, folder: &str, uid: u32) -> Result<bool, AppError> {
-        Self::validate_imap_input(folder, "folder name")?;
-
-        let trash_folder = self.resolve_trash_folder().await?;
-        if folder.eq_ignore_ascii_case(&trash_folder) {
-            // Already in Trash — no-op
-            return Ok(false);
-        }
-        self.move_email(folder, uid, &trash_folder).await?;
-        Ok(true)
-    }
-
-    /// Resolve the Trash folder for the current account, caching the result.
-    pub async fn resolve_trash_folder(&mut self) -> Result<String, AppError> {
-        if let Some(ref trash) = self.trash_folder {
-            return Ok(trash.clone());
-        }
-        let folders = self.list_folders().await?;
-        let trash = find_trash_folder(&folders)
-            .ok_or_else(|| AppError::Imap("Trash folder not found".to_string()))?;
-        self.trash_folder = Some(trash.clone());
-        Ok(trash)
     }
 
     /// Build an RFC 5322 message from draft content using `mail-builder`.
@@ -918,34 +978,97 @@ impl ImapConnection {
     }
 }
 
-/// Determine the Trash folder from a list of folders.
-///
-/// 1. Looks for a folder with the `Trash` special-use attribute.
-/// 2. Falls back to common names: `Trash`, `Deleted Items`, `Deleted Messages`.
-/// 3. Returns `None` if no match is found.
-fn find_trash_folder(folders: &[FolderInfo]) -> Option<String> {
-    // Prefer the special-use flag.
-    // Attributes are stored via format!("{:?}") on imap-proto's NameAttribute.
-    // NameAttribute::Trash (unit variant) → "Trash".
-    // NameAttribute::Extension("\\Trash") → Extension("\\Trash").
-    // We check both forms so servers that return \Trash as an extension
-    // attribute (rather than the dedicated Trash variant) are still matched.
-    for folder in folders {
-        if folder
-            .attributes
-            .iter()
-            .any(|a| a == "Trash" || a == r#"Extension("\\Trash")"#)
-        {
-            return Some(folder.name.clone());
+/// Result of [`ImapConnection::move_email`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveOutcome {
+    /// The message is in the target folder and gone from the source.
+    Moved,
+    /// The server supports neither MOVE nor UIDPLUS: the message was copied
+    /// to the target and the original flagged `\Deleted`, but it stays in
+    /// the source folder until a client expunges that folder.
+    CopiedAndFlaggedDeleted,
+}
+
+/// Result of [`ImapConnection::delete_email`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    MovedToTrash {
+        trash_folder: String,
+        outcome: MoveOutcome,
+    },
+    AlreadyInTrash {
+        trash_folder: String,
+    },
+}
+
+/// The parts of a `LIST` response needed to pick the Trash folder, taken
+/// from the typed `NameAttribute` values rather than their `Debug` strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrashCandidate {
+    name: String,
+    delimiter: Option<String>,
+    special_use_trash: bool,
+    selectable: bool,
+}
+
+impl TrashCandidate {
+    fn from_name(name: &async_imap::types::Name) -> Self {
+        let attrs = name.attributes();
+        Self {
+            name: name.name().to_string(),
+            delimiter: name.delimiter().map(str::to_string),
+            special_use_trash: attrs.iter().any(is_trash_attribute),
+            selectable: !attrs.contains(&NameAttribute::NoSelect),
         }
     }
-    // Fall back to well-known names
-    let fallbacks = ["Trash", "Deleted Items", "Deleted Messages"];
-    for folder in folders {
-        for fb in &fallbacks {
-            if folder.name.eq_ignore_ascii_case(fb) {
-                return Some(folder.name.clone());
-            }
+
+    /// Last hierarchy segment, e.g. `Trash` for `INBOX.Trash`.
+    fn leaf(&self) -> &str {
+        match self.delimiter.as_deref() {
+            Some(d) if !d.is_empty() => self.name.rsplit(d).next().unwrap_or(&self.name),
+            _ => &self.name,
+        }
+    }
+}
+
+/// `\Trash` (RFC 6154). imap-proto parses it into `NameAttribute::Trash`;
+/// the `Extension` arm covers parsers that do not know the attribute.
+fn is_trash_attribute(attr: &NameAttribute<'_>) -> bool {
+    match attr {
+        NameAttribute::Trash => true,
+        NameAttribute::Extension(s) => s.eq_ignore_ascii_case("\\Trash"),
+        _ => false,
+    }
+}
+
+/// Well-known Trash folder names, most common first.
+const TRASH_FALLBACK_NAMES: &[&str] = &[
+    "Trash",
+    "Deleted Items",
+    "Deleted Messages",
+    "Deleted",
+    "Papierkorb",
+];
+
+/// Pick the Trash folder.
+///
+/// 1. A selectable folder with the `\Trash` special-use attribute.
+/// 2. A selectable folder whose full name, then whose last hierarchy
+///    segment (e.g. `INBOX.Trash` on Courier/Dovecot namespaces), matches a
+///    well-known name, case-insensitively.
+fn find_trash_folder(folders: &[TrashCandidate]) -> Option<String> {
+    let selectable = || folders.iter().filter(|f| f.selectable);
+    if let Some(f) = selectable().find(|f| f.special_use_trash) {
+        return Some(f.name.clone());
+    }
+    for fallback in TRASH_FALLBACK_NAMES {
+        if let Some(f) = selectable().find(|f| f.name.eq_ignore_ascii_case(fallback)) {
+            return Some(f.name.clone());
+        }
+    }
+    for fallback in TRASH_FALLBACK_NAMES {
+        if let Some(f) = selectable().find(|f| f.leaf().eq_ignore_ascii_case(fallback)) {
+            return Some(f.name.clone());
         }
     }
     None
@@ -2462,37 +2585,56 @@ Content-Type: text/html\r\n\r\n\
 
     // --- Trash folder resolution tests ---
 
+    fn candidate(name: &str, special_use_trash: bool) -> TrashCandidate {
+        TrashCandidate {
+            name: name.to_string(),
+            delimiter: Some("/".to_string()),
+            special_use_trash,
+            selectable: true,
+        }
+    }
+
+    #[test]
+    fn trash_attribute_matches_typed_variant_and_extension() {
+        assert!(is_trash_attribute(&NameAttribute::Trash));
+        assert!(is_trash_attribute(&NameAttribute::Extension(
+            std::borrow::Cow::Borrowed("\\Trash")
+        )));
+        assert!(!is_trash_attribute(&NameAttribute::Junk));
+        assert!(!is_trash_attribute(&NameAttribute::Extension(
+            std::borrow::Cow::Borrowed("\\Foobar")
+        )));
+    }
+
+    #[test]
+    fn trash_attribute_detected_from_real_list_response() {
+        // Goes through the actual imap-proto parser instead of hand-built
+        // strings, so a parser change cannot silently break detection.
+        let raw = b"* LIST (\\HasNoChildren \\Trash) \"/\" \"Papierkorb\"\r\n";
+        let (_, resp) = imap_proto::parser::parse_response(raw).expect("valid LIST response");
+        let imap_proto::types::Response::MailboxData(imap_proto::types::MailboxDatum::List {
+            name_attributes,
+            ..
+        }) = resp
+        else {
+            panic!("expected LIST mailbox data");
+        };
+        assert!(name_attributes.iter().any(is_trash_attribute));
+    }
+
     #[test]
     fn find_trash_folder_prefers_special_use_flag() {
         let folders = vec![
-            FolderInfo {
-                name: "INBOX".to_string(),
-                attributes: vec![],
-                delimiter: Some("/".to_string()),
-            },
-            FolderInfo {
-                name: "Trash".to_string(),
-                attributes: vec!["Trash".to_string()],
-                delimiter: Some("/".to_string()),
-            },
+            candidate("INBOX", false),
+            candidate("Trash", false),
+            candidate("Bin", true),
         ];
-        assert_eq!(find_trash_folder(&folders), Some("Trash".to_string()));
+        assert_eq!(find_trash_folder(&folders), Some("Bin".to_string()));
     }
 
     #[test]
     fn find_trash_folder_falls_back_to_common_name() {
-        let folders = vec![
-            FolderInfo {
-                name: "INBOX".to_string(),
-                attributes: vec![],
-                delimiter: Some("/".to_string()),
-            },
-            FolderInfo {
-                name: "Deleted Items".to_string(),
-                attributes: vec!["HasNoChildren".to_string()],
-                delimiter: Some("/".to_string()),
-            },
-        ];
+        let folders = vec![candidate("INBOX", false), candidate("Deleted Items", false)];
         assert_eq!(
             find_trash_folder(&folders),
             Some("Deleted Items".to_string())
@@ -2500,19 +2642,44 @@ Content-Type: text/html\r\n\r\n\
     }
 
     #[test]
-    fn find_trash_folder_returns_none_when_no_match() {
+    fn find_trash_folder_matches_namespaced_leaf() {
         let folders = vec![
-            FolderInfo {
+            TrashCandidate {
                 name: "INBOX".to_string(),
-                attributes: vec![],
-                delimiter: Some("/".to_string()),
+                delimiter: Some(".".to_string()),
+                special_use_trash: false,
+                selectable: true,
             },
-            FolderInfo {
-                name: "Archive".to_string(),
-                attributes: vec![],
-                delimiter: Some("/".to_string()),
+            TrashCandidate {
+                name: "INBOX.Trash".to_string(),
+                delimiter: Some(".".to_string()),
+                special_use_trash: false,
+                selectable: true,
             },
         ];
+        assert_eq!(find_trash_folder(&folders), Some("INBOX.Trash".to_string()));
+    }
+
+    #[test]
+    fn find_trash_folder_prefers_exact_name_over_leaf() {
+        let folders = vec![candidate("Archive/Trash", false), candidate("Trash", false)];
+        assert_eq!(find_trash_folder(&folders), Some("Trash".to_string()));
+    }
+
+    #[test]
+    fn find_trash_folder_skips_noselect() {
+        let mut flagged = candidate("Trash", true);
+        flagged.selectable = false;
+        let folders = vec![flagged, candidate("Deleted Messages", false)];
+        assert_eq!(
+            find_trash_folder(&folders),
+            Some("Deleted Messages".to_string())
+        );
+    }
+
+    #[test]
+    fn find_trash_folder_returns_none_when_no_match() {
+        let folders = vec![candidate("INBOX", false), candidate("Archive", false)];
         assert_eq!(find_trash_folder(&folders), None);
     }
 }

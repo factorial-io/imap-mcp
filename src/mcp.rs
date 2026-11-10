@@ -7,8 +7,8 @@ use serde::Deserialize;
 use crate::error::AppError;
 use crate::extract;
 use crate::imap::{
-    self, AttachmentData, DraftContent, ExtractionHint, ImapConnection, MAX_LLM_CONTENT_SIZE,
-    MAX_RAW_BYTES_SIZE,
+    self, AttachmentData, DeleteOutcome, DraftContent, ExtractionHint, ImapConnection, MoveOutcome,
+    MAX_LLM_CONTENT_SIZE, MAX_RAW_BYTES_SIZE,
 };
 use crate::manage::{AccountSummary, ListAccountsResult};
 use crate::session::{Account, DownloadTicket, DOWNLOAD_TICKET_TTL};
@@ -588,46 +588,54 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Move an email to another folder by UID. Uses the IMAP MOVE extension when the server advertises it; falls back to COPY + STORE +FLAGS (\\Deleted) for older servers (the original is only marked as deleted, not expunged, so the action remains undoable). The target folder must exist."
+        description = "Move an email to another folder by UID. The target folder must already exist (see list_folders / create_folder). Uses IMAP MOVE when the server supports it, otherwise COPY + flag \\Deleted + UID EXPUNGE of just that message. On old servers without MOVE and UIDPLUS the original is only flagged \\Deleted and stays visible in the source folder until a mail client expunges it; the result text says when that happened. Errors if the UID does not exist in the source folder."
     )]
     async fn move_email(
         &self,
         Parameters(params): Parameters<MoveEmailParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
-        conn.move_email(&params.source_folder, params.uid, &params.target_folder)
+        let outcome = conn
+            .move_email(&params.source_folder, params.uid, &params.target_folder)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        let mut msg = format!(
             "Email UID {} moved from '{}' to '{}'",
             params.uid, params.source_folder, params.target_folder
-        ))]))
+        );
+        msg.push_str(move_outcome_note(outcome));
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     #[tool(
-        description = "Delete an email by UID. Moves the message to the Trash folder (safe, undoable). If the message is already in Trash, this is a no-op. The user can recover deleted messages by moving them out of Trash with move_email."
+        description = "Delete an email by UID by moving it to the account's Trash folder (found via the \\Trash special-use flag or a well-known name). This never deletes permanently; the user can recover the message by moving it out of Trash with move_email. If the folder already is Trash, nothing is changed. Errors if the UID does not exist in the folder."
     )]
     async fn delete_email(
         &self,
         Parameters(params): Parameters<DeleteEmailParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
-        let moved = conn
+        let outcome = conn
             .delete_email(&params.folder, params.uid)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
-        let msg = if moved {
-            format!(
-                "Email UID {} deleted (moved to Trash) from '{}'",
-                params.uid, params.folder
-            )
-        } else {
-            format!(
-                "Email UID {} is already in Trash — no action taken",
-                params.uid
-            )
+        let msg = match outcome {
+            DeleteOutcome::MovedToTrash {
+                trash_folder,
+                outcome,
+            } => format!(
+                "Email UID {} moved from '{}' to Trash ('{}'){}",
+                params.uid,
+                params.folder,
+                trash_folder,
+                move_outcome_note(outcome)
+            ),
+            DeleteOutcome::AlreadyInTrash { trash_folder } => format!(
+                "Email UID {} is already in Trash ('{}') — no action taken",
+                params.uid, trash_folder
+            ),
         };
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
@@ -912,6 +920,19 @@ async fn render_text_attachment(
     Ok(CallToolResult::success(vec![Content::text(format!(
         "{header}\n\n{content}"
     ))]))
+}
+
+/// Extra note appended to move/delete results when the server could not
+/// remove the original from the source folder.
+fn move_outcome_note(outcome: MoveOutcome) -> &'static str {
+    match outcome {
+        MoveOutcome::Moved => "",
+        MoveOutcome::CopiedAndFlaggedDeleted => {
+            ". The server supports neither MOVE nor UIDPLUS, so the original was only \
+             flagged \\Deleted and stays in the source folder until a mail client \
+             expunges it"
+        }
+    }
 }
 
 #[tool_handler]

@@ -25,7 +25,7 @@ Never suppress errors with `.unwrap()`, `.expect()`, or silent `let _ =`. Propag
 - `src/lib.rs` — app config, shared state
 - `src/oauth.rs` — OAuth 2.1 authorization server for MCP clients (grantry: registration, authorize, token, refresh, metadata)
 - `src/auth.rs` — OIDC login and IMAP setup form (the consent step that approves grantry's pending authorization)
-- `src/mcp.rs` — MCP tool definitions (list_folders, list_emails, get_email, search_emails, mark_read, mark_unread)
+- `src/mcp.rs` — MCP tool definitions (list_folders, create_folder, list_emails, get_email, search_emails, mark_read, mark_unread, move_email, delete_email)
 - `src/imap.rs` — IMAP client operations
 - `src/session.rs` — Redis session storage, encryption
 - `src/error.rs` — error types
