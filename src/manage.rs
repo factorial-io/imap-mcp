@@ -30,7 +30,7 @@ const COOKIE_NAME: &str = "mgmt_session";
 /// no business riding along with `/mcp` tool calls or `/auth/*` flows. The
 /// other handlers ignore unknown cookies anyway, but tighter scope is the
 /// right default.
-fn build_cookie(value: &str) -> String {
+fn build_cookie(_base_url: &str, value: &str) -> String {
     format!(
         "{COOKIE_NAME}={value}; HttpOnly; Secure; SameSite=Lax; Path=/manage; \
          Max-Age={ttl}",
@@ -38,7 +38,7 @@ fn build_cookie(value: &str) -> String {
     )
 }
 
-fn clear_cookie() -> String {
+fn clear_cookie(_base_url: &str) -> String {
     format!("{COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/manage; Max-Age=0")
 }
 
@@ -55,12 +55,12 @@ fn read_cookie(headers: &HeaderMap) -> Option<String> {
 
 /// 303-redirect to `dest` while setting the management cookie. Used by
 /// the OIDC-callback path when `intent = ManageEntry`.
-pub fn set_manage_cookie_response(session_id: &str, dest: &str) -> Response {
+pub fn set_manage_cookie_response(base_url: &str, session_id: &str, dest: &str) -> Response {
     (
         StatusCode::SEE_OTHER,
         [
             ("location", dest.to_string()),
-            ("set-cookie", build_cookie(session_id)),
+            ("set-cookie", build_cookie(base_url, session_id)),
         ],
         "",
     )
@@ -92,7 +92,11 @@ pub async fn manage_page(
                 .await?;
             // Drop the `t` query param to avoid replays from browser history.
             let dest = format!("{}/manage", state.base_url);
-            return Ok(set_manage_cookie_response(&session_id, &dest));
+            return Ok(set_manage_cookie_response(
+                &state.base_url,
+                &session_id,
+                &dest,
+            ));
         }
         // Ticket invalid or expired — fall through to the OIDC bounce path.
     }
@@ -113,8 +117,10 @@ pub async fn manage_page(
         .sessions
         .get_default_account_id(&session.oidc_sub)
         .await?;
+    let provider_options = render_provider_options(&state, None);
     let html = render_manage_page(
-        &state,
+        &state.base_url,
+        &provider_options,
         &session,
         &accounts,
         default_id.as_deref(),
@@ -389,7 +395,7 @@ pub async fn logout(
         StatusCode::SEE_OTHER,
         [
             ("location", format!("{}/manage", state.base_url)),
-            ("set-cookie", clear_cookie()),
+            ("set-cookie", clear_cookie(&state.base_url)),
         ],
         "",
     )
@@ -421,7 +427,8 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 fn render_manage_page(
-    state: &AppState,
+    base_url: &str,
+    provider_options: &str,
     session: &ManageSession,
     accounts: &[Account],
     default_id: Option<&str>,
@@ -429,7 +436,6 @@ fn render_manage_page(
 ) -> String {
     let csrf = html_escape(&session.csrf_token);
     let oidc_email = html_escape(&session.oidc_email);
-    let provider_options = render_provider_options(state, None);
 
     let banner = match msg {
         Some("added") => r#"<div class="banner ok">Account added.</div>"#.to_string(),
@@ -663,7 +669,7 @@ mod tests {
 
     #[test]
     fn cookie_round_trips() {
-        let raw = build_cookie("abc-123");
+        let raw = build_cookie("https://imap-mcp.example.com", "abc-123");
         assert!(raw.contains("mgmt_session=abc-123"));
         assert!(raw.contains("HttpOnly"));
         assert!(raw.contains("SameSite=Lax"));
@@ -731,5 +737,100 @@ mod tests {
         let a = make_account("a");
         let s = AccountSummary::from_account(&a, None);
         assert!(!s.is_default);
+    }
+
+    // --- #95: deployments with a path prefix in BASE_URL ---
+
+    const PREFIXED_BASE: &str = "https://example.com/imap-mcp";
+
+    /// Collect every `action="..."` attribute value in rendered HTML.
+    fn form_actions(html: &str) -> Vec<String> {
+        html.split(r#"action=""#)
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn manage_session() -> ManageSession {
+        ManageSession {
+            oidc_sub: "sub-1".to_string(),
+            oidc_email: "alice@example.com".to_string(),
+            csrf_token: "csrf-1".to_string(),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn manage_page_form_actions_use_base_url_path_prefix() {
+        // Two accounts, one disabled: renders every form on the page
+        // (logout, add, revalidate, set_default, delete).
+        let healthy = make_account("a1");
+        let mut disabled = make_account("a2");
+        disabled.disabled_at = Some(0);
+        let html = render_manage_page(
+            PREFIXED_BASE,
+            "",
+            &manage_session(),
+            &[healthy, disabled],
+            Some("a1"),
+            None,
+        );
+        let actions = form_actions(&html);
+        assert_eq!(
+            actions,
+            vec![
+                format!("{PREFIXED_BASE}/manage/logout"),
+                format!("{PREFIXED_BASE}/manage/accounts/a1/delete"),
+                format!("{PREFIXED_BASE}/manage/accounts/a2/revalidate"),
+                format!("{PREFIXED_BASE}/manage/accounts/a2/set_default"),
+                format!("{PREFIXED_BASE}/manage/accounts/a2/delete"),
+                format!("{PREFIXED_BASE}/manage/accounts"),
+            ]
+        );
+    }
+
+    #[test]
+    fn manage_page_form_actions_without_prefix() {
+        let html = render_manage_page(
+            "https://imap-mcp.example.com",
+            "",
+            &manage_session(),
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(
+            form_actions(&html),
+            vec![
+                "https://imap-mcp.example.com/manage/logout".to_string(),
+                "https://imap-mcp.example.com/manage/accounts".to_string(),
+            ]
+        );
+    }
+
+    /// The browser only sends a cookie back if the request path is under
+    /// the cookie's `Path`. Behind a prefix the browser sees
+    /// `/imap-mcp/manage`, so `Path=/manage` would never match.
+    #[test]
+    fn cookie_path_includes_base_url_path_prefix() {
+        let set = build_cookie(PREFIXED_BASE, "abc");
+        assert!(set.contains("; Path=/imap-mcp/manage;"), "got {set}");
+        let clear = clear_cookie(PREFIXED_BASE);
+        assert!(clear.contains("; Path=/imap-mcp/manage;"), "got {clear}");
+    }
+
+    #[test]
+    fn cookie_path_ignores_trailing_slash_in_base_url() {
+        let set = build_cookie("https://example.com/imap-mcp/", "abc");
+        assert!(set.contains("; Path=/imap-mcp/manage;"), "got {set}");
+    }
+
+    #[test]
+    fn cookie_path_without_prefix_is_manage() {
+        let set = build_cookie("https://imap-mcp.example.com", "abc");
+        assert!(set.contains("; Path=/manage;"), "got {set}");
+        let clear = clear_cookie("https://imap-mcp.example.com/");
+        assert!(clear.contains("; Path=/manage;"), "got {clear}");
     }
 }

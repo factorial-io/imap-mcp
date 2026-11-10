@@ -173,7 +173,11 @@ pub async fn callback(
         tracing::info!(oidc_sub = %sub, "OIDC re-auth for /manage successful");
         let (session_id, _csrf) = state.sessions.create_manage_session(&sub, &email).await?;
         let dest = format!("{}/manage", state.base_url);
-        return Ok(set_manage_cookie_response(&session_id, &dest));
+        return Ok(set_manage_cookie_response(
+            &state.base_url,
+            &session_id,
+            &dest,
+        ));
     }
 
     let pending_id = flow
@@ -194,11 +198,6 @@ pub async fn callback(
 
     tracing::info!("OIDC auth successful, showing IMAP setup form");
 
-    // HTML-escape user-controlled values to prevent XSS
-    let name_escaped = html_escape(&name);
-    let email_display = html_escape(&email);
-    let client_name = html_escape(&authorization.client_name);
-
     // Store pending setup in Redis
     let setup_id = uuid::Uuid::new_v4().to_string();
     let pending = PendingSetup {
@@ -214,7 +213,35 @@ pub async fn callback(
 
     // Render IMAP password form with provider dropdown + editable IMAP email + label.
     let provider_options = render_provider_options(&state, None);
-    let html = format!(
+    let html = render_setup_form(
+        &state.base_url,
+        &name,
+        &email,
+        &authorization.client_name,
+        &setup_id,
+        &provider_options,
+    );
+
+    Ok(Html(html).into_response())
+}
+
+/// Render the IMAP setup form shown after a successful OIDC login.
+///
+/// User-controlled values (`name`, `email`, `client_name`) are HTML-escaped
+/// here; `provider_options` is pre-rendered, already-escaped markup.
+fn render_setup_form(
+    base_url: &str,
+    name: &str,
+    email: &str,
+    client_name: &str,
+    setup_id: &str,
+    provider_options: &str,
+) -> String {
+    // HTML-escape user-controlled values to prevent XSS
+    let name_escaped = html_escape(name);
+    let email_display = html_escape(email);
+    let client_name = html_escape(client_name);
+    format!(
         r#"<!DOCTYPE html>
 <html>
 <head>
@@ -254,9 +281,7 @@ pub async fn callback(
     </form>
 </body>
 </html>"#,
-    );
-
-    Ok(Html(html).into_response())
+    )
 }
 
 /// Render `<option>` tags for the provider dropdown.
@@ -398,4 +423,65 @@ pub(crate) fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Collect every `action="..."` attribute value in rendered HTML.
+    fn form_actions(html: &str) -> Vec<String> {
+        html.split(r#"action=""#)
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn render(base_url: &str) -> String {
+        render_setup_form(
+            base_url,
+            "Alice",
+            "alice@example.com",
+            "Claude",
+            "setup-123",
+            r#"<option value="default">Default</option>"#,
+        )
+    }
+
+    /// Regression test for #95: with `BASE_URL` carrying a path prefix, the
+    /// setup form must post back under that prefix, not to the host root.
+    #[test]
+    fn setup_form_posts_under_base_url_path_prefix() {
+        let html = render("https://example.com/imap-mcp");
+        assert_eq!(
+            form_actions(&html),
+            vec!["https://example.com/imap-mcp/auth/setup".to_string()]
+        );
+    }
+
+    #[test]
+    fn setup_form_posts_to_auth_setup_without_prefix() {
+        let html = render("https://imap-mcp.example.com");
+        assert_eq!(
+            form_actions(&html),
+            vec!["https://imap-mcp.example.com/auth/setup".to_string()]
+        );
+    }
+
+    #[test]
+    fn setup_form_escapes_user_values() {
+        let html = render_setup_form(
+            "https://example.com",
+            "<script>",
+            "a\"b@example.com",
+            "Evil & Co",
+            "setup-123",
+            "",
+        );
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("a&quot;b@example.com"));
+        assert!(html.contains("Evil &amp; Co"));
+    }
 }
