@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5](https://github.com/factorial-io/imap-mcp/compare/imap-mcp-v0.1.4...imap-mcp-v0.1.5) (2026-11-10)
+
+
+### Features
+
+* add move_email, delete_email and create_folder MCP tools ([#101](https://github.com/factorial-io/imap-mcp/issues/101)) ([7dd6cce](https://github.com/factorial-io/imap-mcp/commit/7dd6ccee7b56979608cecd0cc4797aeb4e08c736))
+
 ## [imap-mcp-v0.1.4] - 2026-11-10
 
 ### Features
