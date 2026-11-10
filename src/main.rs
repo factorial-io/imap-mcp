@@ -1,5 +1,7 @@
 use clap::Parser;
-use imap_mcp::{auth, build_router, providers::ProviderList, session::SessionStore, AppState};
+use imap_mcp::{
+    auth, build_router, oauth, providers::ProviderList, session::SessionStore, AppState,
+};
 use std::sync::Arc;
 
 /// Server configuration. Most fields are sourced from environment variables;
@@ -34,6 +36,11 @@ struct Cli {
 
     #[arg(long, env = "ENCRYPTION_KEY")]
     encryption_key: String,
+
+    /// Base64 HMAC key (32+ bytes) for signing OAuth access tokens. When
+    /// unset, a key is derived from ENCRYPTION_KEY.
+    #[arg(long, env = "TOKEN_SIGNING_KEY")]
+    token_signing_key: Option<String>,
 
     #[arg(long, env = "BIND_ADDR", default_value = "0.0.0.0:8080")]
     bind_addr: String,
@@ -86,9 +93,17 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    let redis = redis::Client::open(cli.redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let oauth_store = Arc::new(grantry_redis::RedisStore::<oauth::Identity>::new(redis));
+    let signer = oauth::signer(cli.token_signing_key.as_deref(), &cli.encryption_key)?;
+    let oauth_server = oauth::build_server(&cli.base_url, signer, oauth_store);
+
     let state = Arc::new(AppState::new(
         sessions,
         oidc_client,
+        oauth_server,
         providers,
         cli.base_url,
     )?);

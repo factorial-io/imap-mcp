@@ -4,6 +4,7 @@ pub mod extract;
 pub mod imap;
 pub mod manage;
 pub mod mcp;
+pub mod oauth;
 pub mod providers;
 pub(crate) mod sanitize;
 pub mod session;
@@ -12,7 +13,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use grantry::metadata::ProtectedResourceMetadata;
+use grantry::ActiveError;
 use http::Request;
+use oauth::{Identity, OAuthServer};
 use openidconnect::core::CoreClient;
 use providers::ProviderList;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -28,6 +32,8 @@ use tower_http::trace::TraceLayer;
 pub struct AppState {
     pub sessions: SessionStore,
     pub oidc_client: CoreClient,
+    /// The OAuth 2.1 authorization server MCP clients connect through.
+    pub oauth: OAuthServer,
     /// Allowlist of IMAP providers users may connect to. Always non-empty.
     pub providers: ProviderList,
     pub base_url: String,
@@ -41,6 +47,7 @@ impl AppState {
     pub fn new(
         sessions: SessionStore,
         oidc_client: CoreClient,
+        oauth: OAuthServer,
         providers: ProviderList,
         base_url: String,
     ) -> anyhow::Result<Self> {
@@ -48,6 +55,7 @@ impl AppState {
         Ok(Self {
             sessions,
             oidc_client,
+            oauth,
             providers,
             base_url,
             mcp_allowed_hosts,
@@ -80,21 +88,23 @@ fn derive_mcp_allowed_hosts(base_url: &str) -> anyhow::Result<Vec<String>> {
 
 /// Build the axum Router from shared state. Used by main and integration tests.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    // grantry: authorization server metadata, authorize, token, register.
+    let oauth_routes = oauth::router(state.oauth.clone(), &state.base_url);
     Router::new()
+        // RFC 9728: served at the bare path (what our 401s point at) and with
+        // the resource path appended (where clients look for `/mcp`).
         .route(
             "/.well-known/oauth-protected-resource",
-            get(auth::oauth_protected_resource),
+            get(oauth::oauth_protected_resource),
         )
         .route(
-            "/.well-known/oauth-authorization-server",
-            get(auth::oauth_authorization_server),
+            "/.well-known/oauth-protected-resource/mcp",
+            get(oauth::oauth_protected_resource),
         )
-        .route("/register", post(auth::register))
-        .route("/auth/login", get(auth::login))
+        .route(oauth::CONSENT_PATH, get(auth::connect))
         .route("/auth/manage_login", get(auth::manage_login))
         .route("/auth/callback", get(auth::callback))
         .route("/auth/setup", post(auth::setup))
-        .route("/auth/token", post(auth::token))
         .route("/manage", get(manage::manage_page))
         .route("/manage/accounts", post(manage::add_account))
         .route(
@@ -113,6 +123,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/mcp", axum::routing::any(mcp_handler))
         .route("/mcp/{path}", axum::routing::any(mcp_handler))
         .route("/download/{token}", get(download_handler))
+        .with_state(state)
+        .merge(oauth_routes)
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -129,7 +141,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 ]),
         )
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
 }
 
 /// Resolves the IMAP account a tool call should target, given the verified
@@ -141,10 +152,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 /// - 1 account: defaults to it when no selector given.
 /// - 2+ accounts: requires explicit selector; ambiguous labels error.
 ///
-/// Also handles legacy single-account migration: if the bearer-token session
-/// still has the old encrypted-password fields and no `Account` records exist
-/// yet for the user, we promote the legacy credentials into an `Account` on
-/// first read and clear them from the session.
+/// Also handles legacy single-account migration: if the request came with a
+/// pre-grantry bearer-token session that still has the old encrypted-password
+/// fields and no `Account` records exist yet for the user, we promote the
+/// legacy credentials into an `Account` on first read and clear them from the
+/// session.
 #[derive(Clone)]
 pub struct AccountResolver {
     pub store: SessionStore,
@@ -152,7 +164,9 @@ pub struct AccountResolver {
     pub oidc_sub: String,
     pub oidc_email: String,
     pub base_url: String,
-    pub mcp_token: String,
+    /// The pre-grantry session token the request authenticated with, if any.
+    /// Only such sessions can carry legacy credentials to migrate.
+    pub legacy_session_token: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -301,10 +315,13 @@ impl AccountResolver {
             return Ok(existing);
         }
 
-        // No accounts yet — see if the session still carries legacy creds.
+        // No accounts yet — see if a legacy session still carries creds.
+        let Some(legacy_token) = self.legacy_session_token.as_deref() else {
+            return Ok(existing);
+        };
         let session = self
             .store
-            .get_session(&self.mcp_token)
+            .get_session(legacy_token)
             .await
             .map_err(|e| ResolveError::Internal(e.to_string()))?;
         let (Some(enc), Some(iv)) = (
@@ -351,7 +368,7 @@ impl AccountResolver {
             .await
             .map_err(|e| ResolveError::Internal(e.to_string()))?;
         self.store
-            .clear_session_legacy_password(&self.mcp_token)
+            .clear_session_legacy_password(legacy_token)
             .await
             .map_err(|e| ResolveError::Internal(e.to_string()))?;
         tracing::info!(
@@ -371,45 +388,41 @@ async fn mcp_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     req: Request<axum::body::Body>,
 ) -> Response {
-    let token = match extract_bearer_token(&headers) {
-        Some(t) => t,
-        None => {
+    let metadata_url = oauth::protected_resource_metadata_url(&state.base_url);
+    let Some(token) = extract_bearer_token(&headers) else {
+        return unauthorized(&metadata_url, false, "Bearer token required");
+    };
+
+    let (identity, legacy_session_token) = match authenticate(&state, &token).await {
+        Ok(found) => found,
+        Err(BearerError::Invalid) => {
+            return unauthorized(&metadata_url, true, "Invalid or expired token")
+        }
+        Err(BearerError::InsufficientScope) => {
             let www_auth = format!(
-                r#"Bearer resource_metadata="{}/.well-known/oauth-protected-resource""#,
-                state.base_url
+                r#"Bearer error="insufficient_scope", scope="{}", resource_metadata="{metadata_url}""#,
+                oauth::MAIL_SCOPE
             );
             return (
-                StatusCode::UNAUTHORIZED,
+                StatusCode::FORBIDDEN,
                 [("WWW-Authenticate", www_auth)],
-                "Bearer token required",
+                "Token lacks the mail scope",
             )
                 .into_response();
         }
-    };
-
-    let session = match state.sessions.get_session(&token).await {
-        Ok(s) => s,
-        Err(_) => {
-            let www_auth = format!(
-                r#"Bearer resource_metadata="{}/.well-known/oauth-protected-resource""#,
-                state.base_url
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                [("WWW-Authenticate", www_auth)],
-                "Invalid or expired token",
-            )
-                .into_response();
+        Err(BearerError::Backend(e)) => {
+            tracing::error!(error = %e, "bearer token lookup failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
         }
     };
 
     let resolver = AccountResolver {
         store: state.sessions.clone(),
         providers: state.providers.clone(),
-        oidc_sub: session.oidc_sub.clone(),
-        oidc_email: session.oidc_email.clone(),
+        oidc_sub: identity.sub,
+        oidc_email: identity.email,
         base_url: state.base_url.clone(),
-        mcp_token: token.clone(),
+        legacy_session_token,
     };
 
     let config = StreamableHttpServerConfig::default()
@@ -425,6 +438,64 @@ async fn mcp_handler(
 
     let resp: http::Response<_> = service.handle(req).await;
     resp.map(axum::body::Body::new)
+}
+
+fn unauthorized(metadata_url: &str, token_sent: bool, body: &'static str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            "WWW-Authenticate",
+            ProtectedResourceMetadata::challenge(metadata_url, token_sent),
+        )],
+        body,
+    )
+        .into_response()
+}
+
+#[derive(Debug)]
+enum BearerError {
+    Invalid,
+    InsufficientScope,
+    Backend(String),
+}
+
+/// The identity behind a bearer token, and the token itself when it is a
+/// pre-grantry session (for the legacy credential migration).
+///
+/// grantry access tokens are JWTs whose grant must still be active. Legacy
+/// tokens are UUIDs looked up as `mcp:session:{uuid}`; they are never minted
+/// any more and go away as their sessions idle out.
+async fn authenticate(
+    state: &AppState,
+    token: &str,
+) -> Result<(Identity, Option<String>), BearerError> {
+    if uuid::Uuid::parse_str(token).is_ok() {
+        return match state.sessions.get_session(token).await {
+            Ok(session) => Ok((
+                Identity {
+                    sub: session.oidc_sub,
+                    email: session.oidc_email,
+                },
+                Some(token.to_string()),
+            )),
+            Err(error::AppError::SessionNotFound) => Err(BearerError::Invalid),
+            Err(e) => Err(BearerError::Backend(e.to_string())),
+        };
+    }
+    match state.oauth.verify_active(token).await {
+        Ok((grant, _claims)) => {
+            if !grant
+                .scope
+                .split_whitespace()
+                .any(|s| s == oauth::MAIL_SCOPE)
+            {
+                return Err(BearerError::InsufficientScope);
+            }
+            Ok((grant.subject, None))
+        }
+        Err(ActiveError::Invalid(_) | ActiveError::Inactive) => Err(BearerError::Invalid),
+        Err(ActiveError::Backend(e)) => Err(BearerError::Backend(e.to_string())),
+    }
 }
 
 pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {

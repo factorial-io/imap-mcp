@@ -148,16 +148,20 @@ action. Users without an entry on the allowlist cannot connect that mailbox.
 ## Architecture
 
 ```
-claude.ai → POST /register (dynamic client registration)
-         → GET  /auth/login (OAuth authorize → redirects to OIDC provider)
+claude.ai → POST /register (dynamic client registration)                     [grantry]
+         → GET  /auth/login (OAuth authorize: client, redirect URI, PKCE S256,
+                             resource = BASE_URL/mcp; stored as pending)    [grantry]
+                    → GET /auth/connect?pending=… (redirects to OIDC provider)
                     → OIDC provider login
-                    → GET /auth/callback (IMAP setup form: provider + login + password + nickname)
-                    → POST /auth/setup (validate IMAP, create first Account, generate auth code)
+                    → GET /auth/callback (binds the pending request to the OIDC
+                                          identity; IMAP setup form)
+                    → POST /auth/setup (validate IMAP, create first Account,
+                                        approve → grant + one-time code)
                     → redirect to claude.ai with authorization code
-         → POST /auth/token (exchange code for access token, PKCE verified)
+         → POST /auth/token (code exchange with PKCE; refresh with rotation)  [grantry]
          → POST /mcp (Bearer token → MCP JSON-RPC)
                     ↓
-           Validate token (Redis)
+           Verify JWT access token + grant still active (Redis)
                     ↓
            Resolve Account from oidc_sub + optional `account` selector
                     ↓
@@ -189,6 +193,7 @@ User → GET  /manage?t=<ticket>  (15-min single-use link from MCP tools)
 | `BASE_URL` | Yes | Public URL of this service, no trailing slash |
 | `REDIS_URL` | Yes | Redis connection URL |
 | `ENCRYPTION_KEY` | Yes | 32-byte AES-256 key, base64-encoded |
+| `TOKEN_SIGNING_KEY` | No | Base64 HMAC key (32+ bytes) that signs OAuth access tokens. Defaults to a key derived from `ENCRYPTION_KEY`; set it to rotate token signing independently. Changing it invalidates outstanding access tokens (clients refresh). |
 | `RUST_LOG` | No | Log level (default: info) |
 | `BIND_ADDR` | No | Listen address (default: 0.0.0.0:8080) |
 
