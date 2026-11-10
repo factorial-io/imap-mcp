@@ -3,6 +3,7 @@ use axum::http::{Request, StatusCode};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use http_body_util::BodyExt;
+use imap_mcp::oauth::{self, Identity};
 use imap_mcp::providers::ProviderList;
 use imap_mcp::{build_router, session::SessionStore, AppState};
 use openidconnect::core::{
@@ -42,17 +43,24 @@ fn fake_oidc_client() -> CoreClient {
     )
 }
 
-/// Build a test AppState with a fake OIDC client and dummy Redis URL.
+const BASE_URL: &str = "https://imap-mcp.example.com";
+
+/// Build a test AppState with a fake OIDC client, dummy Redis URL and an
+/// in-memory OAuth store.
 fn test_state() -> Arc<AppState> {
     let encryption_key = B64.encode([0xABu8; 32]);
     let sessions = SessionStore::new("redis://localhost:6379", &encryption_key).unwrap();
     let providers = ProviderList::factorial_default("imap.example.com", 993).unwrap();
+    let signer = oauth::signer(None, &encryption_key).unwrap();
+    let store = Arc::new(grantry::memory::MemoryStore::<Identity>::default());
+    let oauth_server = oauth::build_server(BASE_URL, signer, store);
     Arc::new(
         AppState::new(
             sessions,
             fake_oidc_client(),
+            oauth_server,
             providers,
-            "https://imap-mcp.example.com".to_string(),
+            BASE_URL.to_string(),
         )
         .unwrap(),
     )
@@ -60,8 +68,32 @@ fn test_state() -> Arc<AppState> {
 
 /// Helper: send a request to the test router and get response.
 async fn send_request(req: Request<Body>) -> axum::response::Response {
-    let app = build_router(test_state());
-    app.oneshot(req).await.unwrap()
+    send_request_to(test_state(), req).await
+}
+
+async fn send_request_to(state: Arc<AppState>, req: Request<Body>) -> axum::response::Response {
+    build_router(state).oneshot(req).await.unwrap()
+}
+
+fn alice() -> Identity {
+    Identity {
+        sub: "alice-sub".to_string(),
+        email: "alice@example.com".to_string(),
+    }
+}
+
+fn mcp_request(token: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "imap-mcp.example.com")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
+        ))
+        .unwrap()
 }
 
 /// Helper: read response body as string.
@@ -84,13 +116,25 @@ async fn well_known_oauth_protected_resource_returns_correct_json() {
 
     let body = body_string(resp).await;
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["resource"], "https://imap-mcp.example.com");
+    assert_eq!(json["resource"], "https://imap-mcp.example.com/mcp");
     assert!(json["authorization_servers"].is_array());
     assert_eq!(
         json["authorization_servers"][0],
         "https://imap-mcp.example.com"
     );
     assert!(json["bearer_methods_supported"].is_array());
+}
+
+#[tokio::test]
+async fn well_known_oauth_protected_resource_with_resource_path() {
+    let req = Request::builder()
+        .uri("/.well-known/oauth-protected-resource/mcp")
+        .body(Body::empty())
+        .unwrap();
+    let resp = send_request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(json["resource"], "https://imap-mcp.example.com/mcp");
 }
 
 #[tokio::test]
@@ -126,6 +170,11 @@ async fn well_known_oauth_authorization_server_returns_correct_json() {
         .as_array()
         .unwrap()
         .contains(&serde_json::json!("S256")));
+    assert!(json["grant_types_supported"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("refresh_token")));
+    assert_eq!(json["client_id_metadata_document_supported"], false);
 }
 
 // --- Dynamic client registration tests ---
@@ -140,10 +189,125 @@ async fn register_without_redirect_uris_returns_error() {
         .unwrap();
 
     let resp = send_request(req).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(json["error"], "invalid_redirect_uri");
+}
+
+/// Register a client, send an authorization request, and land on our
+/// consent entry point with a pending id.
+#[tokio::test]
+async fn register_then_authorize_redirects_to_consent() {
+    let state = test_state();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/register")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"redirect_uris":["https://claude.ai/api/mcp/auth_callback"],"client_name":"Claude","token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]}"#,
+        ))
+        .unwrap();
+    let resp = send_request_to(state.clone(), req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let client_id = json["client_id"].as_str().unwrap().to_string();
+
+    let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    let uri = format!(
+        "/auth/login?response_type=code&client_id={client_id}\
+         &redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback\
+         &code_challenge={challenge}&code_challenge_method=S256&state=xyz\
+         &resource=https%3A%2F%2Fimap-mcp.example.com%2Fmcp"
+    );
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let resp = send_request_to(state.clone(), req).await;
+    assert!(resp.status().is_redirection(), "got {}", resp.status());
+    let location = resp.headers()["location"].to_str().unwrap();
+    assert!(
+        location.starts_with("https://imap-mcp.example.com/auth/connect?pending="),
+        "unexpected redirect: {location}"
+    );
+    let pending: uuid::Uuid = location.rsplit('=').next().unwrap().parse().unwrap();
+    let found = state
+        .oauth
+        .pending(pending, &alice())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.client_name, "Claude");
+    assert_eq!(found.scope, "mail offline_access");
+}
+
+#[tokio::test]
+async fn authorize_with_wrong_resource_redirects_with_error() {
+    let state = test_state();
+    let registered = state
+        .oauth
+        .register(
+            serde_json::json!({"redirect_uris": ["https://claude.ai/cb"]})
+                .as_object()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let uri = format!(
+        "/auth/login?response_type=code&client_id={}\
+         &redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb\
+         &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\
+         &code_challenge_method=S256&state=s&resource=https%3A%2F%2Fevil.example",
+        registered.client_id
+    );
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let resp = send_request_to(state, req).await;
+    let location = resp.headers()["location"].to_str().unwrap();
+    assert!(location.starts_with("https://claude.ai/cb?error=invalid_target"));
 }
 
 // --- MCP endpoint auth tests ---
+
+#[tokio::test]
+async fn mcp_accepts_grantry_access_token() {
+    let state = test_state();
+    let (_grant, tokens) = state
+        .oauth
+        .issue_grant(alice(), "client", "Claude", "")
+        .await
+        .unwrap();
+    assert!(tokens.refresh_token.is_some());
+    let resp = send_request_to(state, mcp_request(&tokens.access_token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn mcp_rejects_token_of_revoked_grant() {
+    let state = test_state();
+    let (_grant, tokens) = state
+        .oauth
+        .issue_grant(alice(), "client", "Claude", "")
+        .await
+        .unwrap();
+    assert!(state
+        .oauth
+        .revoke_token(&tokens.access_token, "logout", None)
+        .await
+        .unwrap());
+    let resp = send_request_to(state, mcp_request(&tokens.access_token)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let www_auth = resp.headers()["www-authenticate"].to_str().unwrap();
+    assert!(www_auth.contains(r#"error="invalid_token""#));
+}
+
+#[tokio::test]
+async fn mcp_rejects_token_without_mail_scope() {
+    let state = test_state();
+    let (_grant, tokens) = state
+        .oauth
+        .issue_grant(alice(), "client", "Claude", "offline_access")
+        .await
+        .unwrap();
+    let resp = send_request_to(state, mcp_request(&tokens.access_token)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
 
 #[tokio::test]
 async fn mcp_without_bearer_returns_401_with_www_authenticate() {

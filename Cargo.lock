@@ -154,6 +154,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84a22b5d51209f6de83d37a0b33d320acb8da88823e42a94c075140708f032a5"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arcstr"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -334,6 +343,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
 ]
 
 [[package]]
@@ -1374,6 +1392,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "grantry"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "003668af63f43652a57068e39b38831ce663c16b23fba3e6b080875d81435509"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "hex",
+ "hmac",
+ "jsonwebtoken",
+ "rand 0.9.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "grantry-redis"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0116d1182f9d958af95879921a7e96d3d6409727b13f3d86e761b1ea465a2211"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "grantry",
+ "redis",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1784,12 +1842,15 @@ dependencies = [
  "anyhow",
  "async-imap",
  "async-native-tls",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "calamine",
  "chrono",
  "clap",
  "futures",
+ "grantry",
+ "grantry-redis",
  "html2text",
  "http 1.4.2",
  "http-body-util",
@@ -1908,6 +1969,21 @@ checksum = "b49715b7073f385ba4bc528e5747d02e66cb39c6146efb66b781f131f0fb399c"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonwebtoken"
+version = "11.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e75fe14a82d81e5f5af639997db37d8b96045938a7ac6ab18cdbe1c7467e05e1"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "signature",
+ "zeroize",
 ]
 
 [[package]]
@@ -2809,11 +2885,14 @@ version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bae41a63fd0b8a5372f82b21e810e09a316f5dd7efd96bf08e678fb240fc1918"
 dependencies = [
+ "arc-swap",
  "arcstr",
  "async-lock",
+ "backon",
  "bytes",
  "cfg-if",
  "combine",
+ "futures-channel",
  "futures-util",
  "itoa",
  "num-bigint",
@@ -4053,6 +4132,7 @@ checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

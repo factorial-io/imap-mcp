@@ -9,23 +9,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
-/// Dynamic OAuth client registration data.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OAuthClient {
-    pub client_id: String,
-    pub redirect_uris: Vec<String>,
-    pub client_name: Option<String>,
-}
-
-/// State stored during the OAuth + OIDC auth flow.
-/// Combines claude.ai's OAuth params with OIDC params.
+/// State stored during an OIDC login, keyed by its CSRF state.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuthFlowState {
-    pub oauth_client_id: String,
-    pub oauth_redirect_uri: String,
-    pub oauth_state: String,
-    pub oauth_code_challenge: String,
-    pub oauth_code_challenge_method: String,
+    /// The grantry pending authorization this login consents to. `None` for
+    /// a `/manage` entry.
+    #[serde(default)]
+    pub pending_id: Option<uuid::Uuid>,
     pub pkce_verifier: String,
     pub nonce: String,
     /// Where to send the user after a successful OIDC callback.
@@ -49,29 +39,13 @@ pub struct PendingSetup {
     pub email: String,
     pub oidc_sub: String,
     pub name: String,
-    pub oauth_client_id: String,
-    pub oauth_redirect_uri: String,
-    pub oauth_state: String,
-    pub oauth_code_challenge: String,
-    pub oauth_code_challenge_method: String,
+    /// The grantry pending authorization, already bound to `oidc_sub`.
+    pub pending_id: uuid::Uuid,
 }
 
-/// Authorization code data, stored briefly between setup and token exchange.
-/// IMAP credentials live in `Account` records (keyed by `oidc_sub`); this
-/// only carries the OIDC identity that owns those accounts.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AuthCode {
-    pub client_id: String,
-    pub redirect_uri: String,
-    pub code_challenge: String,
-    pub code_challenge_method: String,
-    pub email: String,
-    pub oidc_sub: String,
-}
-
-/// Bearer-token session. Holds the verified OIDC identity only — IMAP
-/// credentials are looked up at tool-call time from the per-`oidc_sub`
-/// `Account` list.
+/// Pre-grantry bearer-token session (`mcp:session:{uuid}`). New tokens are
+/// grantry JWTs; these records are only read, so clients connected before
+/// the switch keep working until their session idles out.
 ///
 /// Legacy single-account sessions stored before the multi-account migration
 /// keep their encrypted-password fields here as `Option`; the resolver
@@ -174,10 +148,8 @@ pub struct SessionStore {
     encryption_key: Vec<u8>,
 }
 
-const OAUTH_CLIENT_TTL: u64 = 365 * 24 * 3600; // 1 year
 const AUTH_FLOW_TTL: u64 = 600; // 10 minutes
 const PENDING_SETUP_TTL: u64 = 600; // 10 minutes
-const AUTH_CODE_TTL: u64 = 300; // 5 minutes
 const SESSION_TTL: u64 = 30 * 24 * 3600; // 30 days
 pub const ACCOUNT_TTL: u64 = 365 * 24 * 3600; // 1 year, refreshed on use
 pub const MANAGE_TICKET_TTL: u64 = 15 * 60; // 15 minutes (decision: question 3)
@@ -229,30 +201,7 @@ impl SessionStore {
             .map_err(AppError::Redis)
     }
 
-    // --- OAuth client registration ---
-
-    pub async fn store_oauth_client(
-        &self,
-        client_id: &str,
-        client: &OAuthClient,
-    ) -> Result<(), AppError> {
-        let key = format!("oauth:client:{client_id}");
-        let value = serde_json::to_string(client)?;
-        let mut conn = self.conn().await?;
-        conn.set_ex::<_, _, ()>(&key, &value, OAUTH_CLIENT_TTL)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn get_oauth_client(&self, client_id: &str) -> Result<OAuthClient, AppError> {
-        let key = format!("oauth:client:{client_id}");
-        let mut conn = self.conn().await?;
-        let value: Option<String> = conn.get(&key).await?;
-        let value = value.ok_or(AppError::Auth("unknown client_id".into()))?;
-        Ok(serde_json::from_str(&value)?)
-    }
-
-    // --- Auth flow state (OAuth + OIDC combined) ---
+    // --- OIDC login flow state ---
 
     pub async fn store_auth_flow(
         &self,
@@ -301,50 +250,7 @@ impl SessionStore {
         Ok(serde_json::from_str(&value)?)
     }
 
-    // --- Authorization codes ---
-
-    pub async fn store_auth_code(&self, code: &str, auth_code: &AuthCode) -> Result<(), AppError> {
-        let key = format!("auth:code:{code}");
-        let value = serde_json::to_string(auth_code)?;
-        let mut conn = self.conn().await?;
-        conn.set_ex::<_, _, ()>(&key, &value, AUTH_CODE_TTL).await?;
-        Ok(())
-    }
-
-    pub async fn get_auth_code(&self, code: &str) -> Result<AuthCode, AppError> {
-        let key = format!("auth:code:{code}");
-        let mut conn = self.conn().await?;
-        let value: Option<String> = conn.get(&key).await?;
-        let value = value.ok_or(AppError::Auth(
-            "authorization code not found or expired".into(),
-        ))?;
-        let _: () = conn.del(&key).await?;
-        Ok(serde_json::from_str(&value)?)
-    }
-
-    // --- MCP sessions ---
-
-    /// Create an MCP session bound to an OIDC identity. IMAP credentials are
-    /// stored separately as `Account` records.
-    pub async fn create_session(
-        &self,
-        oidc_email: &str,
-        oidc_sub: &str,
-    ) -> Result<String, AppError> {
-        let mcp_token = uuid::Uuid::new_v4().to_string();
-        let session = Session {
-            oidc_email: oidc_email.to_string(),
-            oidc_sub: oidc_sub.to_string(),
-            created_at: chrono::Utc::now().timestamp(),
-            legacy_imap_password_enc: None,
-            legacy_imap_password_iv: None,
-        };
-        let key = format!("mcp:session:{mcp_token}");
-        let value = serde_json::to_string(&session)?;
-        let mut conn = self.conn().await?;
-        conn.set_ex::<_, _, ()>(&key, &value, SESSION_TTL).await?;
-        Ok(mcp_token)
-    }
+    // --- Legacy MCP sessions (pre-grantry bearer tokens) ---
 
     pub async fn get_session(&self, mcp_token: &str) -> Result<Session, AppError> {
         let key = format!("mcp:session:{mcp_token}");
@@ -907,15 +813,10 @@ mod tests {
 
     #[test]
     fn session_serialization_roundtrip() {
-        let session = Session {
-            oidc_email: "user@example.com".to_string(),
-            oidc_sub: "12345".to_string(),
-            created_at: 1700000000,
-            legacy_imap_password_enc: None,
-            legacy_imap_password_iv: None,
-        };
-        let json = serde_json::to_string(&session).unwrap();
-        let deserialized: Session = serde_json::from_str(&json).unwrap();
+        // Shape written by the pre-grantry `create_session`.
+        let json =
+            r#"{"oidc_email":"user@example.com","oidc_sub":"12345","created_at":1700000000}"#;
+        let deserialized: Session = serde_json::from_str(json).unwrap();
         assert_eq!(deserialized.oidc_email, "user@example.com");
         assert_eq!(deserialized.oidc_sub, "12345");
         assert_eq!(deserialized.created_at, 1700000000);
@@ -947,19 +848,16 @@ mod tests {
 
     #[test]
     fn auth_flow_state_serialization_roundtrip() {
+        let pending = uuid::Uuid::new_v4();
         let state = AuthFlowState {
-            oauth_client_id: "client123".to_string(),
-            oauth_redirect_uri: "https://example.com/callback".to_string(),
-            oauth_state: "state456".to_string(),
-            oauth_code_challenge: "challenge789".to_string(),
-            oauth_code_challenge_method: "S256".to_string(),
+            pending_id: Some(pending),
             pkce_verifier: "verifier123".to_string(),
             nonce: "nonce456".to_string(),
             intent: AuthFlowIntent::Connector,
         };
         let json = serde_json::to_string(&state).unwrap();
         let deserialized: AuthFlowState = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.oauth_client_id, "client123");
+        assert_eq!(deserialized.pending_id, Some(pending));
         assert_eq!(deserialized.pkce_verifier, "verifier123");
         assert_eq!(deserialized.intent, AuthFlowIntent::Connector);
     }
