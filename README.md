@@ -93,11 +93,14 @@ The service will be available at `https://<YOUR_DOMAIN>`.
 | `list_accounts` | List the user's connected mailboxes (account_id, label, IMAP login, host, last-used time, disabled flag) and return a 15-minute signed `manage_url` for adding/removing accounts |
 | `add_account_url` | Return a fresh 15-minute signed link the user opens in a browser to connect another mailbox |
 | `list_folders` | List all IMAP mailbox folders |
+| `create_folder` | Create a new IMAP folder (supports hierarchy separators) |
 | `list_emails` | List emails in a folder (uid, date, from, subject, seen flag) |
 | `get_email` | Fetch full email by UID (headers + plain text body, S/MIME signed supported) |
 | `search_emails` | Search emails using IMAP SEARCH criteria |
 | `mark_read` | Set \Seen flag on an email by UID |
 | `mark_unread` | Unset \Seen flag on an email by UID |
+| `move_email` | Move an email to another folder by UID |
+| `delete_email` | Delete an email by UID (moves to Trash, undoable) |
 | `get_attachment` | Fetch an attachment (text, image, or extracted text from PDF/Office docs) |
 | `create_draft` / `update_draft` | Compose or modify a draft email |
 
