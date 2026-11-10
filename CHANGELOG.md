@@ -2,13 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.5](https://github.com/factorial-io/imap-mcp/compare/imap-mcp-v0.1.4...imap-mcp-v0.1.5) (2026-11-10)
-
+## [imap-mcp-v0.1.5] - 2026-11-10
 
 ### Features
 
-* add move_email, delete_email and create_folder MCP tools ([#101](https://github.com/factorial-io/imap-mcp/issues/101)) ([7dd6cce](https://github.com/factorial-io/imap-mcp/commit/7dd6ccee7b56979608cecd0cc4797aeb4e08c736))
+- Add move_email, delete_email and create_folder MCP tools (#101) ([7dd6cce](https://github.com/factorial-io/imap-mcp/commit/7dd6ccee7b56979608cecd0cc4797aeb4e08c736))
 
+### Miscellaneous
+
+- *(main)* Release imap-mcp 0.1.5 (#102) ([d088057](https://github.com/factorial-io/imap-mcp/commit/d088057f83df87ec32a8fe369ae534bbb2940152))
+- Publish semver-tagged Docker images on release-please releases (#100) ([9f3d2fe](https://github.com/factorial-io/imap-mcp/commit/9f3d2fef318147097f136556fd80d0ed9d1a43e9))
 ## [imap-mcp-v0.1.4] - 2026-11-10
 
 ### Features
