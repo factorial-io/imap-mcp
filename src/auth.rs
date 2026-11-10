@@ -241,6 +241,8 @@ fn render_setup_form(
     let name_escaped = html_escape(name);
     let email_display = html_escape(email);
     let client_name = html_escape(client_name);
+    // Post back under BASE_URL so deployments behind a path prefix work (#95).
+    let setup_action = html_escape(&format!("{base_url}/auth/setup"));
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -262,7 +264,7 @@ fn render_setup_form(
     <h1>Hello {name_escaped}!</h1>
     <p><strong>{client_name}</strong> is asking to read your email.
     Connect a mailbox to allow it. You'll be able to add more later.</p>
-    <form method="POST" action="/auth/setup">
+    <form method="POST" action="{setup_action}">
         <input type="hidden" name="setup_id" value="{setup_id}">
         <p>Signed in as <strong>{email_display}</strong></p>
         <label for="provider_id">Mail provider</label>
