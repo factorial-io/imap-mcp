@@ -2,32 +2,80 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.4](https://github.com/factorial-io/imap-mcp/compare/imap-mcp-v0.1.3...imap-mcp-v0.1.4) (2026-11-10)
-
+## [imap-mcp-v0.1.4] - 2026-11-10
 
 ### Features
 
-* make unknown attachments usable to LLMs ([c0f606b](https://github.com/factorial-io/imap-mcp/commit/c0f606b0094e7f3e55f0268f2d16e2d7964d4da0))
-* make unknown attachments usable to LLMs ([3bedab6](https://github.com/factorial-io/imap-mcp/commit/3bedab6dff556ae6a4c4652a22ad4b0318eb8986))
-
+- Make unknown attachments usable to LLMs ([3bedab6](https://github.com/factorial-io/imap-mcp/commit/3bedab6dff556ae6a4c4652a22ad4b0318eb8986))
+- Default account + fourth-round PR review fixes ([4762d16](https://github.com/factorial-io/imap-mcp/commit/4762d1668f129e8028e4388263d38dd7f4dd0f20))
+- Multi-account support ([498bcf6](https://github.com/factorial-io/imap-mcp/commit/498bcf611918d79739158fc58e620da841f0bd83))
 
 ### Bug Fixes
 
-* address PR [#70](https://github.com/factorial-io/imap-mcp/issues/70) review feedback ([ae04b07](https://github.com/factorial-io/imap-mcp/commit/ae04b07f46efd8320583bf74b985039c159dbc0f))
-* address second round of PR [#70](https://github.com/factorial-io/imap-mcp/issues/70) review ([d243b5a](https://github.com/factorial-io/imap-mcp/commit/d243b5a828bd9477ca384964453234eaf0e51444))
-* allowlist public host for rmcp DNS rebinding protection ([202e464](https://github.com/factorial-io/imap-mcp/commit/202e46416aa8fb90ea0a2ba03d0ef54b934eef12))
-* allowlist public host for rmcp DNS rebinding protection ([8188d58](https://github.com/factorial-io/imap-mcp/commit/8188d586e513bf49f3ea458d040d4fa8688d41e6))
-* **deps:** update rust crate calamine to 0.35 ([ca57b8b](https://github.com/factorial-io/imap-mcp/commit/ca57b8b5135e3a676b57117ffa6a862a1e6911a6))
-* **deps:** update rust crate calamine to 0.35 ([d135ac2](https://github.com/factorial-io/imap-mcp/commit/d135ac220c8075fc3591362c94e772b8b93af44c))
-* **deps:** update rust crate html2text to 0.17.0 ([2008a95](https://github.com/factorial-io/imap-mcp/commit/2008a95a69e89ddd5ab89ecb36bea494a243589b))
-* **deps:** update rust crate pdf-extract to 0.12 ([bf6cc3f](https://github.com/factorial-io/imap-mcp/commit/bf6cc3fc5998ae70a2d1e21a9016a90825cc6609))
-* **deps:** update rust crate pdf-extract to 0.12 ([d7c16ed](https://github.com/factorial-io/imap-mcp/commit/d7c16ed8986904c3fb69af8b40fd1e76b5c37122))
-* **deps:** update rust crate quick-xml to 0.40 ([ac663c1](https://github.com/factorial-io/imap-mcp/commit/ac663c1520eb1f10fcc6aa8098dad262394618b6))
-* **deps:** update rust crate quick-xml to 0.40 ([1b1fdae](https://github.com/factorial-io/imap-mcp/commit/1b1fdae8a3702c1c32cd33001821672ee9995e50))
-* **deps:** update rust crate tower-http to 0.7.0 ([eb6f76d](https://github.com/factorial-io/imap-mcp/commit/eb6f76d850d878ddbc6b3d2ca265f90a8e8e7bee))
-* **deps:** update rust crate tower-http to 0.7.0 ([0084418](https://github.com/factorial-io/imap-mcp/commit/008441899509e46597b1185eade13b6884503201))
-* honour BASE_URL path prefix in HTML forms and manage cookie ([#99](https://github.com/factorial-io/imap-mcp/issues/99)) ([c0da4cb](https://github.com/factorial-io/imap-mcp/commit/c0da4cbd5b51b745cd870c3acc80a1e46776f141))
+- Honour BASE_URL path prefix in HTML forms and manage cookie (#99) ([c0da4cb](https://github.com/factorial-io/imap-mcp/commit/c0da4cbd5b51b745cd870c3acc80a1e46776f141))
+- *(deps)* Update rust crate pdf-extract to 0.12 ([d7c16ed](https://github.com/factorial-io/imap-mcp/commit/d7c16ed8986904c3fb69af8b40fd1e76b5c37122))
+- *(deps)* Update rust crate tower-http to 0.7.0 ([0084418](https://github.com/factorial-io/imap-mcp/commit/008441899509e46597b1185eade13b6884503201))
+- *(deps)* Update rust crate calamine to 0.35 ([d135ac2](https://github.com/factorial-io/imap-mcp/commit/d135ac220c8075fc3591362c94e772b8b93af44c))
+- *(deps)* Update rust crate html2text to 0.17.0 ([f426438](https://github.com/factorial-io/imap-mcp/commit/f426438dca9a4104355fee93cc240f2f66b6179f))
+- *(deps)* Update rust crate quick-xml to 0.40 ([1b1fdae](https://github.com/factorial-io/imap-mcp/commit/1b1fdae8a3702c1c32cd33001821672ee9995e50))
+- Address second round of PR #70 review ([d243b5a](https://github.com/factorial-io/imap-mcp/commit/d243b5a828bd9477ca384964453234eaf0e51444))
+- Address PR #70 review feedback ([ae04b07](https://github.com/factorial-io/imap-mcp/commit/ae04b07f46efd8320583bf74b985039c159dbc0f))
+- Allowlist public host for rmcp DNS rebinding protection ([8188d58](https://github.com/factorial-io/imap-mcp/commit/8188d586e513bf49f3ea458d040d4fa8688d41e6))
+- Address fifth-round PR review feedback ([3c683e4](https://github.com/factorial-io/imap-mcp/commit/3c683e41deb265afe11baa4f2c6df613cc5aa5b5))
+- Address third-round PR review feedback ([5b60803](https://github.com/factorial-io/imap-mcp/commit/5b60803674b1adc0b04b0214c09cdd8ee5d34bcc))
+- Address second-round PR review feedback ([fd2ff58](https://github.com/factorial-io/imap-mcp/commit/fd2ff58f11c874abc7be6706c3288d0dd6655092))
+- Address PR review feedback ([1019f91](https://github.com/factorial-io/imap-mcp/commit/1019f916884cdae38ade5c3c16642047c3d81e78))
 
+### Refactor
+
+- Restrict html_to_safe_text visibility to pub(crate) ([53d0355](https://github.com/factorial-io/imap-mcp/commit/53d0355e42ce180152f8fabe2e1db5f48e8c51a0))
+- Extract HTML sanitization from imap.rs ([ac51a66](https://github.com/factorial-io/imap-mcp/commit/ac51a6669e8161ad6984b96adf71c57338bb0035))
+
+### Documentation
+
+- Resolve five open questions on multi-account plan ([49b26c1](https://github.com/factorial-io/imap-mcp/commit/49b26c1dcd45cee3ed64df7380423e79ec36b030))
+- Lock in product decisions on multi-account plan ([ea88d98](https://github.com/factorial-io/imap-mcp/commit/ea88d9814a44f1b8d905d7c4b1cf6f0d458e724e))
+- Revise multi-account plan for Team-plan connector constraint ([ae84906](https://github.com/factorial-io/imap-mcp/commit/ae849065573ae53c64cee840e5ff321561d2e3bc))
+- Add multi-account support plan ([7131192](https://github.com/factorial-io/imap-mcp/commit/713119261970b3ba814f09480cbbbb2d0f5545d2))
+
+### Dependencies
+
+- *(deps)* Update rust dependencies auto-merge (patch) ([86a5ba0](https://github.com/factorial-io/imap-mcp/commit/86a5ba081cca5ecb328f3df287d1bcd66adebb23))
+- *(deps)* Update rust crate http to v1.5.0 ([dcd2a3b](https://github.com/factorial-io/imap-mcp/commit/dcd2a3b47b78b254403786e24660e02f6bec2501))
+- *(deps)* Update rust crate tokio to v1.54.1 ([5ec40f1](https://github.com/factorial-io/imap-mcp/commit/5ec40f14c83b7742e5933daafa35a111d2ca48d7))
+- *(deps)* Update rust crate rmcp to v1.8.0 ([487b087](https://github.com/factorial-io/imap-mcp/commit/487b08773885d802aa846a8dd8c907843c40f6e7))
+- *(deps)* Update actions/checkout action to v7 ([fa66d52](https://github.com/factorial-io/imap-mcp/commit/fa66d52357282566bde754c308e9942bb42abe53))
+- *(deps)* Update rust crate redis to v1.8.1 ([22be4f4](https://github.com/factorial-io/imap-mcp/commit/22be4f46cd0a77b8acbe4128dc24d39eb39d8f94))
+- *(deps)* Update rust crate ammonia to v4.2.4 ([2717dc4](https://github.com/factorial-io/imap-mcp/commit/2717dc4d11958409bfb10587a8f4bdee360bd7b7))
+- *(deps)* Update rust dependencies auto-merge (patch) (#93) ([fd7e351](https://github.com/factorial-io/imap-mcp/commit/fd7e351fd482b0fc6014919dba6e781453265802))
+- *(deps)* Update rust dependencies auto-merge (patch) (#91) ([e2a50af](https://github.com/factorial-io/imap-mcp/commit/e2a50af56f0254dbd46b3ad80a164f075f972978))
+- *(deps)* Update rust crate anyhow to v1.0.103 (#86) ([ecc63a9](https://github.com/factorial-io/imap-mcp/commit/ecc63a9818f2e74e1f11f05a079e917e2c12440a))
+- *(deps)* Update rust dependencies auto-merge (patch) (#85) ([b1b731c](https://github.com/factorial-io/imap-mcp/commit/b1b731c713b6b4ff7023543ef8a7e022ce90e55a))
+- *(deps)* Update rust dependencies auto-merge (patch) to v1.2.4 (#83) ([cdb663f](https://github.com/factorial-io/imap-mcp/commit/cdb663fe11ea152bb81e35a8e469349d415162fb))
+- *(deps)* Update rust dependencies auto-merge (patch) to v1.2.3 (#80) ([f947cdc](https://github.com/factorial-io/imap-mcp/commit/f947cdc5348a0c1c1f1dc2ae4143dc4476916881))
+- *(deps)* Update rust dependencies auto-merge (patch) to v1.23.3 (#79) ([0e0b82b](https://github.com/factorial-io/imap-mcp/commit/0e0b82b230dd6ccc29d19bda5d5e5bf43e8194cc))
+- *(deps)* Update rust dependencies auto-merge (patch) to v1.4.2 (#78) ([3334d90](https://github.com/factorial-io/imap-mcp/commit/3334d90cd47e7cb3b238a90f10d2ce0c738bf614))
+- *(deps)* Update rust dependencies auto-merge (patch) to v0.4.45 (#77) ([49ef06a](https://github.com/factorial-io/imap-mcp/commit/49ef06a8144cac2a4b40bc32aafca1448f6eed77))
+- *(deps)* Update rust dependencies auto-merge (patch) (#75) ([0559cc2](https://github.com/factorial-io/imap-mcp/commit/0559cc28c61067ce55cb4fb7d0b1d44fbd42479a))
+- *(deps)* Update rust crate http to v1.4.1 (#74) ([ce0b9f3](https://github.com/factorial-io/imap-mcp/commit/ce0b9f349f4c0d37315b473d0f673f7b41ad10f8))
+- *(deps)* Update rust crate serde_json to v1.0.150 (#73) ([16b20ca](https://github.com/factorial-io/imap-mcp/commit/16b20ca3759b50c9f2ada9f1e65e725b9f782cee))
+- *(deps)* Update rust crate tower-http to v0.6.11 (#72) ([69a51cd](https://github.com/factorial-io/imap-mcp/commit/69a51cdf20543ded802fa52a5125f4b34fd5c24e))
+- *(deps)* Update rust crate quick-xml to v0.40.1 (#71) ([130b062](https://github.com/factorial-io/imap-mcp/commit/130b0628bc01727556c593d5159275c445d93106))
+- *(deps)* Update rust crate rmcp to v1.7.0 ([f50bb2e](https://github.com/factorial-io/imap-mcp/commit/f50bb2e2ea67c478a2e1daa7e52d8e481fa79329))
+- *(deps)* Update rust crate lol_html to v2.9.0 ([4413df2](https://github.com/factorial-io/imap-mcp/commit/4413df22e1ba0ec314deffd8b1a8d3534653a65d))
+- *(deps)* Update rust crate quick-xml to v0.39.4 (#66) ([03ed514](https://github.com/factorial-io/imap-mcp/commit/03ed51495e13a2d5021c9f014f00da57d8a1650e))
+- *(deps)* Update rust crate tokio to v1.52.3 (#65) ([4f85db2](https://github.com/factorial-io/imap-mcp/commit/4f85db2667bb9fd989f771c79e76ebaf18ee05e6))
+- *(deps)* Update rust crate tower-http to v0.6.10 (#64) ([16b7640](https://github.com/factorial-io/imap-mcp/commit/16b7640e45ea2320bb231bfa41719b523959ed4a))
+- *(deps)* Update rust crate tower-http to v0.6.9 (#62) ([6979a74](https://github.com/factorial-io/imap-mcp/commit/6979a74a4a36110aa715921e0f28249ca10e4b78))
+- *(deps)* Update rust dependencies auto-merge (patch) (#61) ([348d34c](https://github.com/factorial-io/imap-mcp/commit/348d34ccb9803dc5f45b048798fe5c8c315f4f94))
+
+### Miscellaneous
+
+- *(main)* Release imap-mcp 0.1.4 (#58) ([aeb3687](https://github.com/factorial-io/imap-mcp/commit/aeb368780765f6d4d408696a122209dd2f51486d))
+
+### Merge
+
+- Main into multi-account-support-plan ([cd706ba](https://github.com/factorial-io/imap-mcp/commit/cd706baeb066e7d65f6fe873d275cf9ef2f05d68))
 ## [imap-mcp-v0.1.3] - 2026-05-03
 
 ### Features
@@ -96,6 +144,9 @@ All notable changes to this project will be documented in this file.
 - Remove html_body from get_email response, sanitize before html2text ([af7ecd6](https://github.com/factorial-io/imap-mcp/commit/af7ecd69e112c2fdd586ae7a73794caaab9c8557))
 - Sanitize HTML with ammonia to prevent prompt injection and XSS ([528154a](https://github.com/factorial-io/imap-mcp/commit/528154af228ff3505d2facbece172980a301437b))
 - *(deps)* Update rust crate sha2 to 0.11.0 ([4e18725](https://github.com/factorial-io/imap-mcp/commit/4e187259f6fb4e39c31ec1057078c78fca23fffb))
+- Use decoded HTML body as fallback on html2text conversion failure ([0c5e601](https://github.com/factorial-io/imap-mcp/commit/0c5e601879a276e7818cfa3e6bddd576b5349db1))
+- Log html2text conversion errors instead of silently suppressing them ([fedc18e](https://github.com/factorial-io/imap-mcp/commit/fedc18e6c154af93ddb379f0441415130efd4a4d))
+- *(deps)* Update rust crate html2text to 0.16.0 ([caaf65e](https://github.com/factorial-io/imap-mcp/commit/caaf65e8315811470af7b96e21d34963c97135e4))
 
 ### Refactor
 
@@ -152,9 +203,6 @@ All notable changes to this project will be documented in this file.
 - *(deps)* Update rust crate mail-builder to 0.4 ([2319b3a](https://github.com/factorial-io/imap-mcp/commit/2319b3a2fe798167199c02ab4a04fc5f3d1b894a))
 - *(deps)* Update rust crate redis to 0.32.0 ([f8bc669](https://github.com/factorial-io/imap-mcp/commit/f8bc6699796a5efd6e19b39e2efb28c675937291))
 - *(deps)* Update rust crate async-native-tls to 0.6.0 ([6889378](https://github.com/factorial-io/imap-mcp/commit/68893789a5b91eac4d87061dd722aa52f6013ff9))
-- Use decoded HTML body as fallback on html2text conversion failure ([0c5e601](https://github.com/factorial-io/imap-mcp/commit/0c5e601879a276e7818cfa3e6bddd576b5349db1))
-- Log html2text conversion errors instead of silently suppressing them ([fedc18e](https://github.com/factorial-io/imap-mcp/commit/fedc18e6c154af93ddb379f0441415130efd4a4d))
-- *(deps)* Update rust crate html2text to 0.16.0 ([caaf65e](https://github.com/factorial-io/imap-mcp/commit/caaf65e8315811470af7b96e21d34963c97135e4))
 - Propagate CAPABILITY error and add PPTX aggregate decompression limit ([51c33bc](https://github.com/factorial-io/imap-mcp/commit/51c33bc3c676bdc7830786982429d29476a79b89))
 - Address remaining review issues on PR 18 ([1e873a9](https://github.com/factorial-io/imap-mcp/commit/1e873a9ea5ef0ff00000348019c23f354a7403f3))
 - *(deps)* Update rust crate mailparse to 0.16.0 ([6f602fc](https://github.com/factorial-io/imap-mcp/commit/6f602fccba00df56573a6fd60f34b39f0ee266af))
