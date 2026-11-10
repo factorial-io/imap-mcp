@@ -4,8 +4,15 @@ on:
   push:
     branches:
       - main
-    tags:
-      - '*'
+  # Called by the Release workflow when release-please cuts a release.
+  # Tags created by release-please use GITHUB_TOKEN and therefore never
+  # trigger a `push: tags` event, so the release build is invoked explicitly.
+  workflow_call:
+    inputs:
+      version:
+        description: Semantic version of the release (e.g. 0.1.5), without prefix
+        required: true
+        type: string
 
 jobs:
   build-and-push:
@@ -35,10 +42,11 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=branch,enable=${{ inputs.version == '' }}
+            type=raw,value=latest,enable=${{ inputs.version == '' && github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}},value=${{ inputs.version }},enable=${{ inputs.version != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }},enable=${{ inputs.version != '' }}
+            type=semver,pattern={{major}},value=${{ inputs.version }},enable=${{ inputs.version != '' && !startsWith(inputs.version, '0.') }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
@@ -52,7 +60,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Trigger GitLab pipeline
-        if: success() && github.ref == 'refs/heads/main'
+        if: success() && github.ref == 'refs/heads/main' && inputs.version == ''
         run: |
           curl --fail -X POST \
             "https://source.factorial.io/api/v4/projects/${{ secrets.GITLAB_PROJECT_ID }}/trigger/pipeline" \
