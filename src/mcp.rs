@@ -7,8 +7,8 @@ use serde::Deserialize;
 use crate::error::AppError;
 use crate::extract;
 use crate::imap::{
-    self, AttachmentData, DraftContent, ExtractionHint, ImapConnection, MAX_LLM_CONTENT_SIZE,
-    MAX_RAW_BYTES_SIZE,
+    self, AttachmentData, DeleteOutcome, DraftContent, ExtractionHint, ImapConnection, MoveOutcome,
+    MAX_LLM_CONTENT_SIZE, MAX_RAW_BYTES_SIZE,
 };
 use crate::manage::{AccountSummary, ListAccountsResult};
 use crate::session::{Account, DownloadTicket, DOWNLOAD_TICKET_TTL};
@@ -255,6 +255,41 @@ pub struct MarkParams {
     /// IMAP folder name (default: INBOX)
     #[serde(default = "default_inbox")]
     pub folder: String,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MoveEmailParams {
+    /// Email UID to move
+    pub uid: u32,
+    /// Source IMAP folder name (default: INBOX)
+    #[serde(default = "default_inbox")]
+    pub source_folder: String,
+    /// Target IMAP folder name
+    pub target_folder: String,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteEmailParams {
+    /// Email UID to delete
+    pub uid: u32,
+    /// IMAP folder name containing the email (default: INBOX)
+    #[serde(default = "default_inbox")]
+    pub folder: String,
+    /// Optional account selector (account_id or label).
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateFolderParams {
+    /// Name of the new folder to create (e.g., "Projects", "Archive/2024")
+    pub folder_name: String,
     /// Optional account selector (account_id or label).
     #[serde(default)]
     pub account: Option<String>,
@@ -553,6 +588,77 @@ impl ImapMcpServer {
     }
 
     #[tool(
+        description = "Move an email to another folder by UID. The target folder must already exist (see list_folders / create_folder). Uses IMAP MOVE when the server supports it, otherwise COPY + flag \\Deleted + UID EXPUNGE of just that message. On old servers without MOVE and UIDPLUS the original is only flagged \\Deleted and stays visible in the source folder until a mail client expunges it; the result text says when that happened. Errors if the UID does not exist in the source folder."
+    )]
+    async fn move_email(
+        &self,
+        Parameters(params): Parameters<MoveEmailParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
+        let outcome = conn
+            .move_email(&params.source_folder, params.uid, &params.target_folder)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
+        conn.logout_or_warn().await;
+        let mut msg = format!(
+            "Email UID {} moved from '{}' to '{}'",
+            params.uid, params.source_folder, params.target_folder
+        );
+        msg.push_str(move_outcome_note(outcome));
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    #[tool(
+        description = "Delete an email by UID by moving it to the account's Trash folder (found via the \\Trash special-use flag or a well-known name). This never deletes permanently; the user can recover the message by moving it out of Trash with move_email. If the folder already is Trash, nothing is changed. Errors if the UID does not exist in the folder."
+    )]
+    async fn delete_email(
+        &self,
+        Parameters(params): Parameters<DeleteEmailParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
+        let outcome = conn
+            .delete_email(&params.folder, params.uid)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
+        conn.logout_or_warn().await;
+        let msg = match outcome {
+            DeleteOutcome::MovedToTrash {
+                trash_folder,
+                outcome,
+            } => format!(
+                "Email UID {} moved from '{}' to Trash ('{}'){}",
+                params.uid,
+                params.folder,
+                trash_folder,
+                move_outcome_note(outcome)
+            ),
+            DeleteOutcome::AlreadyInTrash { trash_folder } => format!(
+                "Email UID {} is already in Trash ('{}') — no action taken",
+                params.uid, trash_folder
+            ),
+        };
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
+    }
+
+    #[tool(
+        description = "Create a new IMAP folder. The folder name may include hierarchy separators (e.g., 'Projects' or 'Archive/2024') depending on the server's delimiter."
+    )]
+    async fn create_folder(
+        &self,
+        Parameters(params): Parameters<CreateFolderParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let (_account, mut conn) = self.connect_with(params.account.as_deref()).await?;
+        conn.create_folder(&params.folder_name)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
+        conn.logout_or_warn().await;
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Folder '{}' created",
+            params.folder_name
+        ))]))
+    }
+
+    #[tool(
         description = "Create a new draft email. The body MUST contain newline characters (\\n) to separate paragraphs and lines — never send the entire body as a single line. Optionally provide html_body for formatted emails (the plain text body is always required as fallback). The draft is saved to the specified folder (default: Drafts) and can be edited later with update_draft or sent from your email client. To create a reply, first use get_email to fetch the original email, then pass its message_id as in_reply_to, and set references to the original references value (if any) plus the original message_id appended. If the original email has no references (thread root), use only its message_id as the references value."
     )]
     async fn create_draft(
@@ -816,6 +922,19 @@ async fn render_text_attachment(
     ))]))
 }
 
+/// Extra note appended to move/delete results when the server could not
+/// remove the original from the source folder.
+fn move_outcome_note(outcome: MoveOutcome) -> &'static str {
+    match outcome {
+        MoveOutcome::Moved => "",
+        MoveOutcome::CopiedAndFlaggedDeleted => {
+            ". The server supports neither MOVE nor UIDPLUS, so the original was only \
+             flagged \\Deleted and stays in the source folder until a mail client \
+             expunges it"
+        }
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for ImapMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -823,7 +942,7 @@ impl ServerHandler for ImapMcpServer {
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions(
-            "IMAP email server with multi-account support. One MCP install can hold multiple mailboxes per user (personal, shared team boxes, etc.). Use list_accounts to see what's connected and to get a manage_url the user can open to add or remove mailboxes; use add_account_url for an 'add a new mailbox' link without first listing. If only one account is connected, IMAP tools default to it; if more than one, pass `account` (account_id from list_accounts, or label) on every IMAP call. Tools: list_folders, list_emails, get_email, search_emails, mark_read, mark_unread, get_attachment, download_attachment, create_draft, update_draft. When get_email returns attachment metadata, each attachment has an `extraction` field telling you what get_attachment will return: `text` (PDFs, Office docs, plain text — server extracts text, truncated to 200 KB); `embedded_message` (the attachment is itself an email — server parses it natively and returns headers, body, and its own attachments); `image` (returned visually if small enough); `raw_bytes` (returned as base64 for binary formats under 5 MB); `too_large` (call download_attachment instead). The `index` field is a path array: top-level attachments are like [0], an attachment inside a forwarded .eml is [0, 1], and so on up to 5 levels deep. Use the same array as `attachment_index` for get_attachment and download_attachment. download_attachment returns a one-shot signed URL valid for 15 minutes — surface it to the user as a clickable link; Claude cannot fetch it directly. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
+            "IMAP email server with multi-account support. One MCP install can hold multiple mailboxes per user (personal, shared team boxes, etc.). Use list_accounts to see what's connected and to get a manage_url the user can open to add or remove mailboxes; use add_account_url for an 'add a new mailbox' link without first listing. If only one account is connected, IMAP tools default to it; if more than one, pass `account` (account_id from list_accounts, or label) on every IMAP call. Tools: list_folders, create_folder, list_emails, get_email, search_emails, mark_read, mark_unread, move_email, delete_email, get_attachment, download_attachment, create_draft, update_draft. When get_email returns attachment metadata, each attachment has an `extraction` field telling you what get_attachment will return: `text` (PDFs, Office docs, plain text — server extracts text, truncated to 200 KB); `embedded_message` (the attachment is itself an email — server parses it natively and returns headers, body, and its own attachments); `image` (returned visually if small enough); `raw_bytes` (returned as base64 for binary formats under 5 MB); `too_large` (call download_attachment instead). The `index` field is a path array: top-level attachments are like [0], an attachment inside a forwarded .eml is [0, 1], and so on up to 5 levels deep. Use the same array as `attachment_index` for get_attachment and download_attachment. download_attachment returns a one-shot signed URL valid for 15 minutes — surface it to the user as a clickable link; Claude cannot fetch it directly. To reply to an email, first fetch it with get_email, then use create_draft with in_reply_to set to the original message_id, and references set to the original references value (if any) plus the original message_id appended. If the original has no references (thread root), use only its message_id as references. IMPORTANT: When composing email bodies for create_draft or update_draft, always include newline characters (\\n) to separate paragraphs, after greetings, and before sign-offs. Never send the entire body as one long line.".to_string(),
         )
     }
 }
