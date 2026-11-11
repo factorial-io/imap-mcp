@@ -27,7 +27,7 @@ grantry-redis = { version = "0.1.0" }
 async-trait = { version = "0.1" }
 
 # IMAP
-async-imap = { version = "0.11.0", default-features = false, features = ["runtime-tokio"] }
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
 async-native-tls = { version = "0.6.0", default-features = false, features = ["runtime-tokio"] }
 
 # Session storage
