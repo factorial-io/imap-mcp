@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.6](https://github.com/factorial-io/imap-mcp/compare/imap-mcp-v0.1.5...imap-mcp-v0.1.6) (2026-11-14)
+
+
+### Bug Fixes
+
+* **deps:** update rust crate base64 to 0.23.0 ([#107](https://github.com/factorial-io/imap-mcp/issues/107)) ([586c0bb](https://github.com/factorial-io/imap-mcp/commit/586c0bbe7db4a37fb46a78d53801ea7be7d18631))
+* **deps:** update rust crate calamine to 0.38 ([#108](https://github.com/factorial-io/imap-mcp/issues/108)) ([66268dd](https://github.com/factorial-io/imap-mcp/commit/66268ddaa1a2bf96162c70198d1000e501e1cf9b))
+* **deps:** update rust crate mail-builder to 0.5 ([#110](https://github.com/factorial-io/imap-mcp/issues/110)) ([34805f8](https://github.com/factorial-io/imap-mcp/commit/34805f84db3623cfa42ea38e39381d7bc4342b40))
+* **deps:** update rust crate mailparse to 0.18.0 ([#113](https://github.com/factorial-io/imap-mcp/issues/113)) ([f9f1fa1](https://github.com/factorial-io/imap-mcp/commit/f9f1fa17d78e4d4558707b8634919525e0855e9f))
+
 ## [imap-mcp-v0.1.5] - 2026-11-10
 
 ### Features
