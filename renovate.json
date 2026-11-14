@@ -93,6 +93,22 @@
       "groupName": "rustls packages"
     },
     {
+      "description": "async-imap depends on a specific imap-proto minor version and shares its types with us; update both together",
+      "groupName": "imap packages",
+      "matchPackageNames": [
+        "async-imap",
+        "imap-proto"
+      ]
+    },
+    {
+      "description": "grantry-redis depends on a specific grantry minor version; update both together",
+      "groupName": "grantry packages",
+      "matchPackageNames": [
+        "grantry",
+        "/^grantry-/"
+      ]
+    },
+    {
       "matchManagers": [
         "bun"
       ],
