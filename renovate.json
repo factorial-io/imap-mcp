@@ -142,6 +142,7 @@
     }
   ],
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    "security:minimumReleaseAgeCrate"
   ]
 }
