@@ -27,7 +27,7 @@ grantry-redis = { version = "0.1.0" }
 async-trait = { version = "0.1" }
 
 # IMAP
-async-imap = { version = "0.11.0", default-features = false, features = ["runtime-tokio"] }
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
 async-native-tls = { version = "0.6.0", default-features = false, features = ["runtime-tokio"] }
 
 # Session storage
@@ -72,7 +72,7 @@ html2text = { version = "0.17.0" }
 ammonia = { version = "4" }
 mailparse = { version = "0.18.0" }
 mail-builder = { version = "0.5" }
-imap-proto = { version = "0.16.4" }
+imap-proto = { version = "0.17.0" }
 lol_html = "2.7.2"
 tempfile = { version = "3" }
 clap = { version = "4.5", features = ["derive", "env"] }
