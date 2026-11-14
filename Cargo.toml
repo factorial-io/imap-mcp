@@ -71,7 +71,7 @@ url = { version = "2.5.4" }
 html2text = { version = "0.17.0" }
 ammonia = { version = "4" }
 mailparse = { version = "0.18.0" }
-mail-builder = { version = "0.5" }
+mail-builder = { version = "2.0" }
 imap-proto = { version = "0.16.4" }
 lol_html = "2.7.2"
 tempfile = { version = "3" }
