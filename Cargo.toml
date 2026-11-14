@@ -60,7 +60,7 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 pdf-extract = { version = "0.12" }
 calamine = { version = "0.38" }
 zip = { version = "2" }
-quick-xml = { version = "0.40" }
+quick-xml = { version = "0.42" }
 
 # Misc
 uuid = { version = "1.16.0", features = ["v4"] }
