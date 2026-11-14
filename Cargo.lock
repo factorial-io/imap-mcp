@@ -215,7 +215,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
- "imap-proto",
+ "imap-proto 0.16.7",
  "log",
  "nom 7.1.3",
  "pin-project",
@@ -1851,7 +1851,7 @@ dependencies = [
  "html2text",
  "http 1.5.0",
  "http-body-util",
- "imap-proto",
+ "imap-proto 0.17.0",
  "lol_html",
  "mail-builder",
  "mailparse",
@@ -1886,6 +1886,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25f6af35c6a517aea5c72314abe90134980d2ae6a763809b50c208b3e429d71f"
 dependencies = [
  "nom 7.1.3",
+]
+
+[[package]]
+name = "imap-proto"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ccf963d57074747b455398a1763d174da80bcaba6f51e3671a82252b531a68b"
+dependencies = [
+ "nom 8.0.0",
 ]
 
 [[package]]
