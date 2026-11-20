@@ -472,7 +472,7 @@ dependencies = [
  "encoding_rs",
  "fast-float2",
  "log",
- "quick-xml 0.42.0",
+ "quick-xml",
  "serde",
  "zip 9.0.0",
 ]
@@ -1846,7 +1846,7 @@ dependencies = [
  "native-tls",
  "openidconnect",
  "pdf-extract",
- "quick-xml 0.40.1",
+ "quick-xml",
  "redis",
  "reqwest",
  "rmcp",
@@ -2845,15 +2845,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "quick-xml"
-version = "0.40.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2474bd2e5029e7ccb6abb2ba48cf2383a333851dedf495901544281590c7da7f"
-dependencies = [
- "memchr",
 ]
 
 [[package]]
