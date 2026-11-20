@@ -145,7 +145,9 @@ fn extract_pdf(data: &[u8]) -> Result<String, ExtractError> {
 /// The `file.size()` check is advisory only (the ZIP header value is attacker-controlled).
 /// The actual DoS protection is `.take(MAX_ZIP_ENTRY_SIZE)` which hard-caps bytes read
 /// regardless of what the header claims.
-fn read_zip_entry_to_string(file: &mut zip::read::ZipFile<'_>) -> Result<String, ExtractError> {
+fn read_zip_entry_to_string<R: Read + ?Sized>(
+    file: &mut zip::read::ZipFile<'_, R>,
+) -> Result<String, ExtractError> {
     let uncompressed = file.size();
     // Fast-path rejection for honestly-sized files; not a security boundary.
     if uncompressed > MAX_ZIP_ENTRY_SIZE {
@@ -275,7 +277,10 @@ fn extract_xlsx(data: &[u8]) -> Result<String, ExtractError> {
                 let mut entry = src
                     .by_index(i)
                     .map_err(|e| ExtractError::Other(format!("invalid XLSX entry: {e}")))?;
-                let name = entry.name().to_string();
+                let name = entry
+                    .name()
+                    .map_err(|e| ExtractError::Other(format!("invalid XLSX entry name: {e}")))?
+                    .into_owned();
                 let options = zip::write::SimpleFileOptions::default()
                     .compression_method(zip::CompressionMethod::Stored);
                 // Read and validate content before starting the ZIP entry,
@@ -349,7 +354,7 @@ fn extract_pptx(data: &[u8]) -> Result<String, ExtractError> {
     // Collect slide file names and sort them.
     let mut slide_names: Vec<String> = (0..archive.len())
         .filter_map(|i| {
-            let name = archive.by_index(i).ok()?.name().to_string();
+            let name = archive.by_index(i).ok()?.name().ok()?.into_owned();
             if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
                 Some(name)
             } else {
