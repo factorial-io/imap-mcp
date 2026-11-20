@@ -650,11 +650,7 @@ impl ImapConnection {
     /// Build an RFC 5322 message from draft content using `mail-builder`.
     /// Handles RFC 2047 encoding, CRLF normalization, and MIME structure automatically.
     fn build_rfc2822_message(draft: &DraftContent<'_>) -> Result<String, AppError> {
-        let message_id = format!(
-            "<{}.{}@imap-mcp>",
-            uuid::Uuid::new_v4(),
-            chrono::Utc::now().timestamp()
-        );
+        let message_id = format!("<{}.{}@imap-mcp>", uuid::Uuid::new_v4(), crate::unix_now());
         let mut builder = mail_builder::MessageBuilder::new();
         builder = builder
             .message_id(message_id)

@@ -374,7 +374,7 @@ pub async fn setup(
         imap_port: provider.port,
         password_enc: enc,
         password_iv: iv,
-        created_at: chrono::Utc::now().timestamp(),
+        created_at: crate::unix_now(),
         last_used_at: None,
         auth_failure_count: 0,
         disabled_at: None,
