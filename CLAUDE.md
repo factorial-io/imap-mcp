@@ -7,6 +7,7 @@ Rust MCP server bridging claude.ai to IMAP email via OIDC auth.
 ```bash
 cargo build
 cargo test
+cargo test --test e2e -- --ignored   # end-to-end, needs Redis
 cargo fmt -- --check
 cargo clippy -- -D warnings
 ```
@@ -31,6 +32,7 @@ Never suppress errors with `.unwrap()`, `.expect()`, or silent `let _ =`. Propag
 - `src/error.rs` — error types
 - `src/extract.rs` — text extraction for attachments (PDF, DOCX, XLSX, PPTX)
 - `tests/integration.rs` — integration tests
+- `tests/e2e.rs` — end-to-end tests: the real binary against Redis, a mock OIDC provider and a scripted IMAPS server (fixtures in `tests/fixtures/e2e/`). Ignored by default; run with `cargo test --test e2e -- --ignored` (needs `redis-server` on `PATH` or `E2E_REDIS_URL`)
 
 ## Recent Changes
 

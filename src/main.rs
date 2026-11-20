@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         "Discovering OIDC configuration from {}",
         cli.oidc_issuer_url
     );
-    let oidc_client = auth::build_oidc_client(
+    let oidc = auth::build_oidc_client(
         &cli.oidc_issuer_url,
         &cli.oidc_client_id,
         &cli.oidc_client_secret,
@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState::new(
         sessions,
-        oidc_client,
+        oidc,
         oauth_server,
         providers,
         cli.base_url,

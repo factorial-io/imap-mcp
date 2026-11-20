@@ -421,7 +421,7 @@ impl SessionStore {
             return Ok(());
         };
         let mut acc: Account = serde_json::from_str(&v)?;
-        acc.last_used_at = Some(chrono::Utc::now().timestamp());
+        acc.last_used_at = Some(crate::unix_now());
         acc.auth_failure_count = 0;
         if acc.disabled_at.is_some() {
             acc.disabled_at = None;
@@ -471,7 +471,7 @@ impl SessionStore {
         if acc.disabled_at.is_some() {
             return Ok(false);
         }
-        acc.disabled_at = Some(chrono::Utc::now().timestamp());
+        acc.disabled_at = Some(crate::unix_now());
         let new_value = serde_json::to_string(&acc)?;
         conn.hset::<_, _, _, ()>(&key, account_id, &new_value)
             .await?;
@@ -537,7 +537,7 @@ impl SessionStore {
         let value = serde_json::to_string(&ManageTicket {
             oidc_sub: oidc_sub.to_string(),
             oidc_email: oidc_email.to_string(),
-            created_at: chrono::Utc::now().timestamp(),
+            created_at: crate::unix_now(),
         })?;
         let mut conn = self.conn().await?;
         conn.set_ex::<_, _, ()>(&key, &value, MANAGE_TICKET_TTL)
@@ -648,7 +648,7 @@ impl SessionStore {
             oidc_sub: oidc_sub.to_string(),
             oidc_email: oidc_email.to_string(),
             csrf_token: csrf_token.clone(),
-            created_at: chrono::Utc::now().timestamp(),
+            created_at: crate::unix_now(),
         })?;
         let mut conn = self.conn().await?;
         conn.set_ex::<_, _, ()>(&key, &value, MANAGE_SESSION_TTL)
