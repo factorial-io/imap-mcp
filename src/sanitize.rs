@@ -63,61 +63,57 @@ fn strip_hidden_elements(html: &str, strip_all_styles: bool) -> Result<String, A
 
     let result = rewrite_str(
         html,
-        RewriteStrSettings {
-            element_content_handlers: vec![
-                element!("style", |el| {
-                    el.remove();
-                    Ok(())
-                }),
-                element!("script", |el| {
-                    el.remove();
-                    Ok(())
-                }),
-                // If the element has any class associated with a hiding rule
-                // in a <style> block, remove the entire element (content included).
-                // Otherwise just strip the class attribute.
-                element!("*[class]", |el| {
-                    if !hc.is_empty() {
-                        if let Some(class_attr) = el.get_attribute("class") {
-                            if class_attr
-                                .split_whitespace()
-                                .any(|c| hc.contains(&c.to_lowercase()))
-                            {
-                                el.remove();
-                                return Ok(());
-                            }
-                        }
-                    }
-                    el.remove_attribute("class");
-                    Ok(())
-                }),
-                // If the element has an ID associated with a hiding rule, remove it.
-                element!("*[id]", |el| {
-                    if let Some(id_attr) = el.get_attribute("id") {
-                        if hi.contains(&format!("#{}", id_attr.to_lowercase())) {
+        RewriteStrSettings::new()
+            .append_element_content_handler(element!("style", |el| {
+                el.remove();
+                Ok(())
+            }))
+            .append_element_content_handler(element!("script", |el| {
+                el.remove();
+                Ok(())
+            }))
+            // If the element has any class associated with a hiding rule
+            // in a <style> block, remove the entire element (content included).
+            // Otherwise just strip the class attribute.
+            .append_element_content_handler(element!("*[class]", |el| {
+                if !hc.is_empty() {
+                    if let Some(class_attr) = el.get_attribute("class") {
+                        if class_attr
+                            .split_whitespace()
+                            .any(|c| hc.contains(&c.to_lowercase()))
+                        {
                             el.remove();
                             return Ok(());
                         }
                     }
-                    Ok(())
-                }),
-                element!("*[style]", |el| {
-                    if let Some(style) = el.get_attribute("style") {
-                        if is_style_hidden(&style) {
-                            el.remove();
-                            return Ok(());
-                        }
+                }
+                el.remove_attribute("class");
+                Ok(())
+            }))
+            // If the element has an ID associated with a hiding rule, remove it.
+            .append_element_content_handler(element!("*[id]", |el| {
+                if let Some(id_attr) = el.get_attribute("id") {
+                    if hi.contains(&format!("#{}", id_attr.to_lowercase())) {
+                        el.remove();
+                        return Ok(());
                     }
-                    // In reading mode, strip all styles (ammonia would anyway).
-                    // In draft mode, preserve non-hidden styles for filter_css_properties.
-                    if strip_all_styles {
-                        el.remove_attribute("style");
+                }
+                Ok(())
+            }))
+            .append_element_content_handler(element!("*[style]", |el| {
+                if let Some(style) = el.get_attribute("style") {
+                    if is_style_hidden(&style) {
+                        el.remove();
+                        return Ok(());
                     }
-                    Ok(())
-                }),
-            ],
-            ..Default::default()
-        },
+                }
+                // In reading mode, strip all styles (ammonia would anyway).
+                // In draft mode, preserve non-hidden styles for filter_css_properties.
+                if strip_all_styles {
+                    el.remove_attribute("style");
+                }
+                Ok(())
+            })),
     );
     // Drop Arc before returning so the temporary outlives the closures
     drop(hidden);
@@ -137,15 +133,12 @@ fn extract_hidden_classes(html: &str) -> Result<std::collections::HashSet<String
     // avoiding false matches on `<style` appearing in attribute values.
     rewrite_str(
         html,
-        RewriteStrSettings {
-            element_content_handlers: vec![text!("style", move |chunk| {
-                if let Ok(mut chunks) = css_ref.lock() {
-                    chunks.push(chunk.as_str().to_string());
-                }
-                Ok(())
-            })],
-            ..Default::default()
-        },
+        RewriteStrSettings::new().append_element_content_handler(text!("style", move |chunk| {
+            if let Ok(mut chunks) = css_ref.lock() {
+                chunks.push(chunk.as_str().to_string());
+            }
+            Ok(())
+        })),
     )
     .map_err(|e| AppError::Imap(format!("failed to extract style blocks: {e}")))?;
 
