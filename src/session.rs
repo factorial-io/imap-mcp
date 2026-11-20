@@ -1,6 +1,7 @@
-use aes_gcm::aead::rand_core::RngCore;
-use aes_gcm::aead::{Aead, OsRng};
-use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
+use aes_gcm::aead::array::Array;
+use aes_gcm::aead::consts::U32;
+use aes_gcm::aead::{Aead, Generate};
+use aes_gcm::{Aes256Gcm, Key, KeyInit};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as URLB64;
 use base64::Engine;
@@ -581,8 +582,8 @@ impl SessionStore {
                 DOWNLOAD_TICKET_MAX_SIZE
             )));
         }
-        let mut token_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut token_bytes);
+        let token_bytes = Array::<u8, U32>::try_generate()
+            .map_err(|e| AppError::Encryption(format!("failed to generate token: {e}")))?;
         let token = URLB64.encode(token_bytes);
         let meta_key = format!("download:meta:{token}");
         let data_key = format!("download:data:{token}");
@@ -727,10 +728,16 @@ impl SessionStore {
 
     // --- Encryption helpers ---
 
+    fn cipher(&self) -> Result<Aes256Gcm, AppError> {
+        let key = Key::<Aes256Gcm>::try_from(self.encryption_key.as_slice())
+            .map_err(|_| AppError::Encryption("invalid encryption key length".into()))?;
+        Ok(Aes256Gcm::new(&key))
+    }
+
     pub(crate) fn encrypt(&self, plaintext: &str) -> Result<(String, String), AppError> {
-        let key = Key::<Aes256Gcm>::from_slice(&self.encryption_key);
-        let cipher = Aes256Gcm::new(key);
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let cipher = self.cipher()?;
+        let nonce = aes_gcm::aead::Nonce::<Aes256Gcm>::try_generate()
+            .map_err(|e| AppError::Encryption(format!("failed to generate nonce: {e}")))?;
         let ciphertext = cipher
             .encrypt(&nonce, plaintext.as_bytes())
             .map_err(|e| AppError::Encryption(format!("encrypt failed: {e}")))?;
@@ -738,17 +745,17 @@ impl SessionStore {
     }
 
     pub(crate) fn decrypt(&self, ciphertext_b64: &str, iv_b64: &str) -> Result<String, AppError> {
-        let key = Key::<Aes256Gcm>::from_slice(&self.encryption_key);
-        let cipher = Aes256Gcm::new(key);
+        let cipher = self.cipher()?;
         let ciphertext = B64
             .decode(ciphertext_b64)
             .map_err(|e| AppError::Encryption(format!("invalid ciphertext base64: {e}")))?;
         let nonce_bytes = B64
             .decode(iv_b64)
             .map_err(|e| AppError::Encryption(format!("invalid iv base64: {e}")))?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = aes_gcm::aead::Nonce::<Aes256Gcm>::try_from(nonce_bytes.as_slice())
+            .map_err(|_| AppError::Encryption("invalid iv length".into()))?;
         let plaintext = cipher
-            .decrypt(nonce, ciphertext.as_ref())
+            .decrypt(&nonce, ciphertext.as_ref())
             .map_err(|e| AppError::Encryption(format!("decrypt failed: {e}")))?;
         String::from_utf8(plaintext)
             .map_err(|e| AppError::Encryption(format!("invalid utf8 after decrypt: {e}")))

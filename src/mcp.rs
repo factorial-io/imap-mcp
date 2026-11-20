@@ -1,5 +1,5 @@
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig};
 use rmcp::schemars;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serde::Deserialize;
@@ -401,7 +401,7 @@ impl ImapMcpServer {
             accounts: summaries,
             manage_url,
         };
-        let json = Content::json(&result)
+        let json = ContentBlock::json(&result)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
     }
@@ -418,7 +418,7 @@ impl ImapMcpServer {
         )
         .await
         .map_err(|e| rmcp::ErrorData::internal_error(format!("manage_url: {e}"), None))?;
-        let json = Content::json(&manage_url)
+        let json = ContentBlock::json(&manage_url)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
     }
@@ -434,7 +434,7 @@ impl ImapMcpServer {
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
-        let json = Content::json(&folders)
+        let json = ContentBlock::json(&folders)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
     }
@@ -452,7 +452,7 @@ impl ImapMcpServer {
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
-        let json = Content::json(&emails)
+        let json = ContentBlock::json(&emails)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
     }
@@ -470,7 +470,7 @@ impl ImapMcpServer {
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
-        let json = Content::json(&email)
+        let json = ContentBlock::json(&email)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
     }
@@ -532,7 +532,7 @@ impl ImapMcpServer {
             size: attachment.info.size,
             expires_in_seconds: DOWNLOAD_TICKET_TTL,
         };
-        let json = Content::json(&payload)
+        let json = ContentBlock::json(&payload)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
     }
@@ -550,7 +550,7 @@ impl ImapMcpServer {
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
-        let json = Content::json(&emails)
+        let json = ContentBlock::json(&emails)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
         Ok(CallToolResult::success(vec![json]))
     }
@@ -565,7 +565,7 @@ impl ImapMcpServer {
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Email UID {} marked as read",
             params.uid
         ))]))
@@ -581,7 +581,7 @@ impl ImapMcpServer {
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Email UID {} marked as unread",
             params.uid
         ))]))
@@ -605,7 +605,7 @@ impl ImapMcpServer {
             params.uid, params.source_folder, params.target_folder
         );
         msg.push_str(move_outcome_note(outcome));
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
 
     #[tool(
@@ -637,7 +637,7 @@ impl ImapMcpServer {
                 params.uid, trash_folder
             ),
         };
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(msg)]))
     }
 
     #[tool(
@@ -652,7 +652,7 @@ impl ImapMcpServer {
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
         conn.logout_or_warn().await;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Folder '{}' created",
             params.folder_name
         ))]))
@@ -689,7 +689,7 @@ impl ImapMcpServer {
             Some(uid) => format!(" (UID: {uid})"),
             None => String::new(),
         };
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Draft created in folder '{}'{uid_info}",
             params.folder
         ))]))
@@ -726,7 +726,7 @@ impl ImapMcpServer {
             Some(uid) => format!(" New UID: {uid}"),
             None => String::new(),
         };
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Draft UID {} updated in folder '{}'.{new_uid_info}",
             params.uid, params.folder
         ))]))
@@ -829,17 +829,17 @@ async fn render_attachment(
         ExtractionHint::EmbeddedMessage => {
             let embedded = imap::parse_embedded_message(&attachment.data, requested_path)
                 .map_err(|e| rmcp::ErrorData::internal_error(format!("{e}"), None))?;
-            let json = Content::json(&embedded)
+            let json = ContentBlock::json(&embedded)
                 .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
             Ok(CallToolResult::success(vec![json]))
         }
         ExtractionHint::Image => {
             let b64 = imap::base64_encode(&attachment.data);
             Ok(CallToolResult::success(vec![
-                Content::text(format!(
+                ContentBlock::text(format!(
                     "Image attachment: {filename} ({mime}, {size} bytes)"
                 )),
-                Content::image(b64, mime.clone()),
+                ContentBlock::image(b64, mime.clone()),
             ]))
         }
         ExtractionHint::RawBytes => {
@@ -850,11 +850,11 @@ async fn render_attachment(
                 extraction: "raw_bytes",
                 raw_base64: imap::base64_encode(&attachment.data),
             };
-            let json = Content::json(&payload)
+            let json = ContentBlock::json(&payload)
                 .map_err(|e| rmcp::ErrorData::internal_error(format!("JSON error: {e}"), None))?;
             Ok(CallToolResult::success(vec![json]))
         }
-        ExtractionHint::TooLarge => Ok(CallToolResult::success(vec![Content::text(format!(
+        ExtractionHint::TooLarge => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Attachment {filename} ({mime}, {size} bytes / {human}) exceeds the {cap} inline cap. \
              Call download_attachment with the same uid and attachment_index to get a one-shot signed URL.",
             human = format_size(size),
@@ -891,15 +891,15 @@ async fn render_text_attachment(
                         extracted.total_bytes / 1024,
                     ));
                 }
-                Ok(CallToolResult::success(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "{header}\n\n{}",
                     extracted.text
                 ))]))
             }
-            Err(err_msg) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Err(err_msg) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Attachment: {filename} ({mime}, {size} bytes)\nText extraction failed: {err_msg}. Content cannot be displayed."
             ))])),
-            Ok(None) => Ok(CallToolResult::success(vec![Content::text(format!(
+            Ok(None) => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Attachment: {filename} ({mime}, {size} bytes)\nText extraction is not supported for this format."
             ))])),
         };
@@ -917,7 +917,7 @@ async fn render_text_attachment(
             text.len() / 1024,
         ));
     }
-    Ok(CallToolResult::success(vec![Content::text(format!(
+    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
         "{header}\n\n{content}"
     ))]))
 }
@@ -937,8 +937,8 @@ fn move_outcome_note(outcome: MoveOutcome) -> &'static str {
 
 #[tool_handler]
 impl ServerHandler for ImapMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder().enable_tools().build(),
         )
         .with_instructions(
