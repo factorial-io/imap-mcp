@@ -17,7 +17,6 @@ use grantry::metadata::ProtectedResourceMetadata;
 use grantry::ActiveError;
 use http::Request;
 use oauth::{Identity, OAuthServer};
-use openidconnect::core::CoreClient;
 use providers::ProviderList;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::{
@@ -31,7 +30,7 @@ use tower_http::trace::TraceLayer;
 /// Shared application state.
 pub struct AppState {
     pub sessions: SessionStore,
-    pub oidc_client: CoreClient,
+    pub oidc: auth::Oidc,
     /// The OAuth 2.1 authorization server MCP clients connect through.
     pub oauth: OAuthServer,
     /// Allowlist of IMAP providers users may connect to. Always non-empty.
@@ -46,7 +45,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         sessions: SessionStore,
-        oidc_client: CoreClient,
+        oidc: auth::Oidc,
         oauth: OAuthServer,
         providers: ProviderList,
         base_url: String,
@@ -54,7 +53,7 @@ impl AppState {
         let mcp_allowed_hosts = derive_mcp_allowed_hosts(&base_url)?;
         Ok(Self {
             sessions,
-            oidc_client,
+            oidc,
             oauth,
             providers,
             base_url,
@@ -334,7 +333,7 @@ impl AccountResolver {
         };
 
         let provider = self.providers.first();
-        let now = chrono::Utc::now().timestamp();
+        let now = unix_now();
         // Deterministic account_id derived from oidc_sub + imap_email so that
         // concurrent migrations for the same legacy session converge on the
         // same record (HSET overwrites in-place) rather than producing
@@ -498,6 +497,12 @@ async fn authenticate(
     }
 }
 
+/// Current time as whole seconds since the Unix epoch, the form every
+/// stored timestamp (`created_at`, `last_used_at`, ...) uses.
+pub fn unix_now() -> i64 {
+    jiff::Timestamp::now().as_second()
+}
+
 pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     let auth = headers.get("authorization")?.to_str().ok()?;
     let token = auth.strip_prefix("Bearer ")?;
@@ -638,6 +643,18 @@ fn legacy_migrated_account_id(oidc_sub: &str, imap_email: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unix_now_is_current_epoch_seconds() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let now = super::unix_now();
+        assert!(now >= i64::try_from(before).unwrap_or(i64::MAX));
+        // Seconds, not milliseconds: well before the year 3000.
+        assert!(now < 32_503_680_000);
+    }
+
     use super::*;
 
     #[test]

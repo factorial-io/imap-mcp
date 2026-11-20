@@ -111,7 +111,7 @@ pub fn build_server(
     store: Arc<dyn OAuthStore<Subject = Identity>>,
 ) -> OAuthServer {
     let config = Config {
-        pending_ttl: chrono::Duration::minutes(PENDING_TTL_MINUTES),
+        pending_ttl: jiff::SignedDuration::from_mins(PENDING_TTL_MINUTES),
         ..Config::new(resource_url(base_url), TOKEN_KIND, scopes(), signer)
     };
     Server::new(
@@ -123,7 +123,7 @@ pub fn build_server(
         // Documents (that would need an egress policy against SSRF).
         Arc::new(NoFetch),
     )
-    .with_refresh_idle(chrono::Duration::days(REFRESH_IDLE_DAYS))
+    .with_refresh_idle(jiff::SignedDuration::from_hours(REFRESH_IDLE_DAYS * 24))
 }
 
 /// grantry's protocol routes: authorization server metadata, authorize, token
@@ -230,7 +230,7 @@ mod tests {
         };
         let token = grantry::token::mint(
             &a.config.signer,
-            chrono::Utc::now(),
+            jiff::Timestamp::now(),
             60,
             &claims,
             serde_json::Map::new(),

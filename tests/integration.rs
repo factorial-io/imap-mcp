@@ -3,6 +3,7 @@ use axum::http::{Request, StatusCode};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use http_body_util::BodyExt;
+use imap_mcp::auth::{oidc_http_client, Oidc};
 use imap_mcp::oauth::{self, Identity};
 use imap_mcp::providers::ProviderList;
 use imap_mcp::{build_router, session::SessionStore, AppState};
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 /// Build a fake OIDC client for testing (no real provider needed).
-fn fake_oidc_client() -> CoreClient {
+fn fake_oidc_client() -> Oidc {
     let provider_metadata = CoreProviderMetadata::new(
         IssuerUrl::new("https://gitlab.example.com".to_string()).unwrap(),
         AuthUrl::new("https://gitlab.example.com/oauth/authorize".to_string()).unwrap(),
@@ -33,14 +34,18 @@ fn fake_oidc_client() -> CoreClient {
         TokenUrl::new("https://gitlab.example.com/oauth/token".to_string()).unwrap(),
     ));
 
-    CoreClient::from_provider_metadata(
+    let client = CoreClient::from_provider_metadata(
         provider_metadata,
         ClientId::new("test_client_id".to_string()),
         Some(ClientSecret::new("test_client_secret".to_string())),
     )
     .set_redirect_uri(
         RedirectUrl::new("https://imap-mcp.example.com/auth/callback".to_string()).unwrap(),
-    )
+    );
+    Oidc {
+        client,
+        http: oidc_http_client().unwrap(),
+    }
 }
 
 const BASE_URL: &str = "https://imap-mcp.example.com";
@@ -605,4 +610,134 @@ async fn manage_set_default_without_cookie_returns_401() {
         .unwrap();
     let resp = send_request(req).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// --- OIDC provider access (openidconnect 4 HTTP client) ---
+
+/// Serve `router` on an ephemeral local port and return its base URL.
+async fn serve_local(router: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    format!("http://{addr}")
+}
+
+/// A minimal OIDC provider: discovery document and an empty key set.
+/// `with_token_endpoint` controls whether the token endpoint is advertised.
+async fn mock_oidc_provider(with_token_endpoint: bool) -> String {
+    let issuer = Arc::new(std::sync::OnceLock::<String>::new());
+    let doc_issuer = issuer.clone();
+    let router = axum::Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            axum::routing::get(move || {
+                let issuer = doc_issuer.get().cloned().unwrap_or_default();
+                async move {
+                    let mut doc = serde_json::json!({
+                        "issuer": issuer,
+                        "authorization_endpoint": format!("{issuer}/authorize"),
+                        "jwks_uri": format!("{issuer}/jwks"),
+                        "response_types_supported": ["code"],
+                        "subject_types_supported": ["public"],
+                        "id_token_signing_alg_values_supported": ["RS256"],
+                    });
+                    if with_token_endpoint {
+                        doc["token_endpoint"] = format!("{issuer}/token").into();
+                    }
+                    axum::Json(doc)
+                }
+            }),
+        )
+        .route(
+            "/jwks",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({ "keys": [] })) }),
+        );
+    let url = serve_local(router).await;
+    issuer.set(url.clone()).unwrap();
+    url
+}
+
+#[tokio::test]
+async fn oidc_discovery_builds_client_from_provider_metadata() {
+    let issuer = mock_oidc_provider(true).await;
+    let oidc = imap_mcp::auth::build_oidc_client(&issuer, "cid", "secret", BASE_URL)
+        .await
+        .unwrap();
+
+    let (url, _, _) = oidc
+        .client
+        .authorize_url(
+            openidconnect::AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
+            openidconnect::CsrfToken::new_random,
+            openidconnect::Nonce::new_random,
+        )
+        .url();
+    assert!(url.as_str().starts_with(&format!("{issuer}/authorize?")));
+    assert!(url
+        .as_str()
+        .contains("redirect_uri=https%3A%2F%2Fimap-mcp.example.com%2Fauth%2Fcallback"));
+    assert_eq!(
+        oidc.client.token_uri().map(|u| u.as_str().to_string()),
+        Some(format!("{issuer}/token"))
+    );
+}
+
+#[tokio::test]
+async fn oidc_client_without_token_endpoint_refuses_code_exchange() {
+    let issuer = mock_oidc_provider(false).await;
+    let oidc = imap_mcp::auth::build_oidc_client(&issuer, "cid", "secret", BASE_URL)
+        .await
+        .unwrap();
+    assert!(oidc
+        .client
+        .exchange_code(openidconnect::AuthorizationCode::new("code".into()))
+        .is_err());
+}
+
+#[tokio::test]
+async fn oidc_discovery_fails_for_unreachable_issuer() {
+    // Bind and drop a listener to get a port nothing is serving on.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let result =
+        imap_mcp::auth::build_oidc_client(&format!("http://{addr}"), "cid", "s", BASE_URL).await;
+    assert!(matches!(result, Err(imap_mcp::error::AppError::Oidc(_))));
+}
+
+#[tokio::test]
+async fn oidc_http_client_does_not_follow_redirects() {
+    let router = axum::Router::new()
+        .route(
+            "/start",
+            axum::routing::get(|| async { axum::response::Redirect::temporary("/target") }),
+        )
+        .route("/target", axum::routing::get(|| async { "followed" }));
+    let base = serve_local(router).await;
+
+    let resp = oidc_http_client()
+        .unwrap()
+        .get(format!("{base}/start"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+}
+
+#[tokio::test]
+async fn oidc_discovery_does_not_follow_redirects() {
+    // A provider whose discovery document redirects elsewhere must be
+    // rejected rather than followed (SSRF guard).
+    let target = mock_oidc_provider(true).await;
+    let redirect_to = format!("{target}/.well-known/openid-configuration");
+    let router = axum::Router::new().route(
+        "/.well-known/openid-configuration",
+        axum::routing::get(move || {
+            let to = redirect_to.clone();
+            async move { axum::response::Redirect::temporary(&to) }
+        }),
+    );
+    let issuer = serve_local(router).await;
+    let result = imap_mcp::auth::build_oidc_client(&issuer, "cid", "s", BASE_URL).await;
+    assert!(matches!(result, Err(imap_mcp::error::AppError::Oidc(_))));
 }

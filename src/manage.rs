@@ -11,7 +11,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Form;
-use chrono::Utc;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -224,7 +223,7 @@ pub async fn add_account(
         imap_port: provider.port,
         password_enc: enc,
         password_iv: iv,
-        created_at: Utc::now().timestamp(),
+        created_at: crate::unix_now(),
         last_used_at: None,
         auth_failure_count: 0,
         disabled_at: None,
@@ -497,12 +496,7 @@ fn render_manage_page(
             } else {
                 r#"<span class="ok">ok</span>"#.to_string()
             };
-            let last_used = match a.last_used_at {
-                Some(ts) => chrono::DateTime::from_timestamp(ts, 0)
-                    .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
-                    .unwrap_or_else(|| "—".to_string()),
-                None => "—".to_string(),
-            };
+            let last_used = format_last_used(a.last_used_at);
             // Re-validate form rendered only for disabled accounts: a small
             // password input + button that POSTs to .../revalidate. Hidden
             // for healthy accounts to keep the table tidy.
@@ -686,8 +680,31 @@ pub struct ListAccountsResult {
     pub manage_url: ManageUrl,
 }
 
+/// Render a stored Unix timestamp for the accounts table, or "—" when it is
+/// missing or out of range.
+fn format_last_used(ts: Option<i64>) -> String {
+    ts.and_then(|ts| jiff::Timestamp::from_second(ts).ok())
+        .map(|t| t.strftime("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "—".to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn format_last_used_renders_utc_minutes() {
+        assert_eq!(
+            super::format_last_used(Some(1_700_000_000)),
+            "2023-11-14 22:13 UTC"
+        );
+        assert_eq!(super::format_last_used(Some(0)), "1970-01-01 00:00 UTC");
+    }
+
+    #[test]
+    fn format_last_used_falls_back_to_dash() {
+        assert_eq!(super::format_last_used(None), "—");
+        assert_eq!(super::format_last_used(Some(i64::MAX)), "—");
+    }
+
     use super::*;
 
     #[test]
