@@ -4,10 +4,10 @@ use axum::Form;
 use grantry::server::ApproveError;
 use http::StatusCode;
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
-use openidconnect::reqwest::async_http_client;
 use openidconnect::{
-    AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
+    AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
+    EndpointNotSet, EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, Scope, TokenResponse,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -19,16 +19,45 @@ use crate::oauth::Identity;
 use crate::session::{Account, AuthFlowIntent, AuthFlowState, PendingSetup};
 use crate::AppState;
 
+/// The OIDC client as built from discovered provider metadata: the
+/// authorization endpoint is always known, the token and userinfo endpoints
+/// only if the provider advertises them.
+pub type OidcClient = CoreClient<
+    EndpointSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointMaybeSet,
+    EndpointMaybeSet,
+>;
+
+/// The OIDC client together with the HTTP client it talks to the provider
+/// through. The HTTP client is kept so connections are reused across logins.
+pub struct Oidc {
+    pub client: OidcClient,
+    pub http: openidconnect::reqwest::Client,
+}
+
+/// HTTP client for talking to the OIDC provider. It never follows redirects:
+/// openidconnect requires this to rule out SSRF via a redirecting provider.
+pub fn oidc_http_client() -> Result<openidconnect::reqwest::Client, AppError> {
+    openidconnect::reqwest::ClientBuilder::new()
+        .redirect(openidconnect::reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| AppError::Oidc(format!("failed to build HTTP client: {e}")))
+}
+
 /// Build the OIDC client using auto-discovery.
 pub async fn build_oidc_client(
     oidc_issuer_url: &str,
     client_id: &str,
     client_secret: &str,
     base_url: &str,
-) -> Result<CoreClient, AppError> {
+) -> Result<Oidc, AppError> {
+    let http = oidc_http_client()?;
     let issuer_url = IssuerUrl::new(oidc_issuer_url.to_string())
         .map_err(|e| AppError::Oidc(format!("invalid issuer URL: {e}")))?;
-    let metadata = CoreProviderMetadata::discover_async(issuer_url, async_http_client)
+    let metadata = CoreProviderMetadata::discover_async(issuer_url, &http)
         .await
         .map_err(|e| AppError::Oidc(format!("OIDC discovery failed: {e}")))?;
 
@@ -42,7 +71,7 @@ pub async fn build_oidc_client(
     )
     .set_redirect_uri(redirect_url);
 
-    Ok(client)
+    Ok(Oidc { client, http })
 }
 
 // --- Consent entry point ---
@@ -79,7 +108,8 @@ pub async fn connect(
 async fn start_oidc_flow(state: &AppState, mut flow: AuthFlowState) -> Result<Response, AppError> {
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let (auth_url, csrf_token, nonce) = state
-        .oidc_client
+        .oidc
+        .client
         .authorize_url(
             AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
             CsrfToken::new_random,
@@ -140,10 +170,12 @@ pub async fn callback(
 
     // Exchange OIDC authorization code for tokens
     let token_response = state
-        .oidc_client
+        .oidc
+        .client
         .exchange_code(AuthorizationCode::new(params.code))
+        .map_err(|e| AppError::Oidc(format!("token exchange unavailable: {e}")))?
         .set_pkce_verifier(pkce_verifier)
-        .request_async(async_http_client)
+        .request_async(&state.oidc.http)
         .await
         .map_err(|e| AppError::Oidc(format!("token exchange failed: {e}")))?;
 
@@ -151,7 +183,7 @@ pub async fn callback(
         .id_token()
         .ok_or_else(|| AppError::Oidc("missing ID token".to_string()))?;
 
-    let verifier = state.oidc_client.id_token_verifier();
+    let verifier = state.oidc.client.id_token_verifier();
     let claims = id_token
         .claims(&verifier, &nonce)
         .map_err(|e| AppError::Oidc(format!("ID token verification failed: {e}")))?;

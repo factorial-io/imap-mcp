@@ -1140,7 +1140,7 @@ fn parse_summary(fetch: &async_imap::types::Fetch) -> EmailSummary {
     }
 }
 
-pub(crate) fn format_addresses(addrs: Option<&[imap_proto::types::Address]>) -> Option<String> {
+pub(crate) fn format_addresses(addrs: Option<&[imap_proto::Address]>) -> Option<String> {
     let addrs = addrs?;
     let formatted: Vec<String> = addrs
         .iter()
@@ -1573,7 +1573,7 @@ mod tests {
 
     #[test]
     fn format_addresses_single_no_name() {
-        let addr = imap_proto::types::Address {
+        let addr = imap_proto::Address {
             name: None,
             adl: None,
             mailbox: Some(Cow::Borrowed(b"alice")),
@@ -1585,7 +1585,7 @@ mod tests {
 
     #[test]
     fn format_addresses_single_with_name() {
-        let addr = imap_proto::types::Address {
+        let addr = imap_proto::Address {
             name: Some(Cow::Borrowed(b"Alice Smith")),
             adl: None,
             mailbox: Some(Cow::Borrowed(b"alice")),
@@ -1598,13 +1598,13 @@ mod tests {
     #[test]
     fn format_addresses_multiple() {
         let addrs = vec![
-            imap_proto::types::Address {
+            imap_proto::Address {
                 name: None,
                 adl: None,
                 mailbox: Some(Cow::Borrowed(b"alice")),
                 host: Some(Cow::Borrowed(b"a.com")),
             },
-            imap_proto::types::Address {
+            imap_proto::Address {
                 name: Some(Cow::Borrowed(b"Bob")),
                 adl: None,
                 mailbox: Some(Cow::Borrowed(b"bob")),
@@ -2607,11 +2607,12 @@ Content-Type: text/html\r\n\r\n\
         // Goes through the actual imap-proto parser instead of hand-built
         // strings, so a parser change cannot silently break detection.
         let raw = b"* LIST (\\HasNoChildren \\Trash) \"/\" \"Papierkorb\"\r\n";
-        let (_, resp) = imap_proto::parser::parse_response(raw).expect("valid LIST response");
-        let imap_proto::types::Response::MailboxData(imap_proto::types::MailboxDatum::List {
-            name_attributes,
-            ..
-        }) = resp
+        let (_, resp) = imap_proto::Response::parse(raw).expect("valid LIST response");
+        let imap_proto::Response::MailboxData(imap_proto::MailboxDatum::List(
+            imap_proto::MailboxListData {
+                name_attributes, ..
+            },
+        )) = resp
         else {
             panic!("expected LIST mailbox data");
         };
