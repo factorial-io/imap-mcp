@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.6](https://github.com/factorial-io/imap-mcp/compare/imap-mcp-v0.1.5...imap-mcp-v0.1.6) (2026-11-20)
+
+
+### Bug Fixes
+
+* **deps:** update rust crate aes-gcm to 0.11.0 ([#89](https://github.com/factorial-io/imap-mcp/issues/89)) ([7b87c87](https://github.com/factorial-io/imap-mcp/commit/7b87c87fcb10649cecbcafa5a178abb66bc5c2a6))
+* **deps:** update rust crate base64 to 0.23.0 ([#107](https://github.com/factorial-io/imap-mcp/issues/107)) ([586c0bb](https://github.com/factorial-io/imap-mcp/commit/586c0bbe7db4a37fb46a78d53801ea7be7d18631))
+* **deps:** update rust crate calamine to 0.38 ([#108](https://github.com/factorial-io/imap-mcp/issues/108)) ([66268dd](https://github.com/factorial-io/imap-mcp/commit/66268ddaa1a2bf96162c70198d1000e501e1cf9b))
+* **deps:** update rust crate lol_html to v3 ([#76](https://github.com/factorial-io/imap-mcp/issues/76)) ([2ceaf2b](https://github.com/factorial-io/imap-mcp/commit/2ceaf2b0b3e7d31c93cbeab5392f3ecc811432d1))
+* **deps:** update rust crate mail-builder to 0.5 ([#110](https://github.com/factorial-io/imap-mcp/issues/110)) ([34805f8](https://github.com/factorial-io/imap-mcp/commit/34805f84db3623cfa42ea38e39381d7bc4342b40))
+* **deps:** update rust crate mail-builder to v2 ([#117](https://github.com/factorial-io/imap-mcp/issues/117)) ([bf5e5e7](https://github.com/factorial-io/imap-mcp/commit/bf5e5e786b3eed5f1fecee470db31b4188bab06e))
+* **deps:** update rust crate mailparse to 0.18.0 ([#113](https://github.com/factorial-io/imap-mcp/issues/113)) ([f9f1fa1](https://github.com/factorial-io/imap-mcp/commit/f9f1fa17d78e4d4558707b8634919525e0855e9f))
+* **deps:** update rust crate quick-xml to 0.42 ([#116](https://github.com/factorial-io/imap-mcp/issues/116)) ([10009a0](https://github.com/factorial-io/imap-mcp/commit/10009a041c79b2de1e0db3ec35c73662d1fac538))
+* **deps:** update rust crate rmcp to v3 ([#118](https://github.com/factorial-io/imap-mcp/issues/118)) ([3b4af4f](https://github.com/factorial-io/imap-mcp/commit/3b4af4f6bd7f1d94650d7536cd12387eefa81391))
+* **deps:** update rust crate zip to v9 ([#119](https://github.com/factorial-io/imap-mcp/issues/119)) ([dfa13c2](https://github.com/factorial-io/imap-mcp/commit/dfa13c247ee60a75ff4acbef32d75c1d2cdf0407))
+* **deps:** upgrade grantry, openidconnect and async-imap, replace chrono with jiff ([#122](https://github.com/factorial-io/imap-mcp/issues/122)) ([d607f2f](https://github.com/factorial-io/imap-mcp/commit/d607f2f0be3cdf67fae6e195979f98ec10e1d300))
+
 ## [imap-mcp-v0.1.5] - 2026-11-10
 
 ### Features
