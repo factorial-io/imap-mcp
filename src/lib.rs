@@ -425,7 +425,7 @@ async fn mcp_handler(
     };
 
     let config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
         .with_allowed_hosts(state.mcp_allowed_hosts.iter().cloned());
 
