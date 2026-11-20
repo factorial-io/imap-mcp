@@ -194,10 +194,10 @@ fn extract_docx(data: &[u8]) -> Result<String, ExtractError> {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
                 let local = e.local_name();
-                if local.as_ref() == b"p" && e.name().prefix().is_some_and(|p| p.as_ref() == b"w") {
+                if local.as_ref() == "p" && e.name().prefix().is_some_and(|p| p.as_ref() == "w") {
                     in_w_p = true;
                 }
-                if local.as_ref() == b"t" && e.name().prefix().is_some_and(|p| p.as_ref() == b"w") {
+                if local.as_ref() == "t" && e.name().prefix().is_some_and(|p| p.as_ref() == "w") {
                     in_w_t = true;
                 }
             }
@@ -205,8 +205,8 @@ fn extract_docx(data: &[u8]) -> Result<String, ExtractError> {
                 // Self-closing elements like <w:p/> — handle without setting
                 // in_w_t since Event::End won't fire to reset it.
                 let local = e.local_name();
-                if local.as_ref() == b"p"
-                    && e.name().prefix().is_some_and(|p| p.as_ref() == b"w")
+                if local.as_ref() == "p"
+                    && e.name().prefix().is_some_and(|p| p.as_ref() == "w")
                     && !text.is_empty()
                     && !text.ends_with('\n')
                 {
@@ -215,10 +215,10 @@ fn extract_docx(data: &[u8]) -> Result<String, ExtractError> {
             }
             Ok(Event::End(ref e)) => {
                 let local = e.local_name();
-                if local.as_ref() == b"t" && e.name().prefix().is_some_and(|p| p.as_ref() == b"w") {
+                if local.as_ref() == "t" && e.name().prefix().is_some_and(|p| p.as_ref() == "w") {
                     in_w_t = false;
                 }
-                if local.as_ref() == b"p" && e.name().prefix().is_some_and(|p| p.as_ref() == b"w") {
+                if local.as_ref() == "p" && e.name().prefix().is_some_and(|p| p.as_ref() == "w") {
                     if in_w_p && !text.is_empty() && !text.ends_with('\n') {
                         text.push('\n');
                     }
@@ -227,9 +227,7 @@ fn extract_docx(data: &[u8]) -> Result<String, ExtractError> {
             }
             Ok(Event::Text(ref e)) => {
                 if in_w_t {
-                    if let Ok(t) = e.decode() {
-                        text.push_str(&t);
-                    }
+                    text.push_str(&e.xml10_content());
                 }
                 // Stop accumulating once we exceed the LLM content limit;
                 // build_extracted will truncate anyway.
@@ -401,25 +399,21 @@ fn extract_pptx(data: &[u8]) -> Result<String, ExtractError> {
             match reader.read_event() {
                 Ok(Event::Start(ref e)) => {
                     let local = e.local_name();
-                    if local.as_ref() == b"t"
-                        && e.name().prefix().is_some_and(|p| p.as_ref() == b"a")
+                    if local.as_ref() == "t" && e.name().prefix().is_some_and(|p| p.as_ref() == "a")
                     {
                         in_a_t = true;
                     }
                 }
                 Ok(Event::End(ref e)) => {
                     let local = e.local_name();
-                    if local.as_ref() == b"t"
-                        && e.name().prefix().is_some_and(|p| p.as_ref() == b"a")
+                    if local.as_ref() == "t" && e.name().prefix().is_some_and(|p| p.as_ref() == "a")
                     {
                         in_a_t = false;
                     }
                 }
                 Ok(Event::Text(ref e)) if in_a_t => {
-                    if let Ok(t) = e.decode() {
-                        text.push_str(&t);
-                        text.push('\n');
-                    }
+                    text.push_str(&e.xml10_content());
+                    text.push('\n');
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => {
@@ -557,6 +551,49 @@ async fn extract_doc(data: &[u8]) -> Result<String, ExtractError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_zip(entries: &[(&str, &str)]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            for (name, content) in entries {
+                writer
+                    .start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(content.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    fn extract_docx_paragraph_text() {
+        let doc = r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:t xml:space="preserve"> world</w:t></w:r></w:p><w:p><w:r><w:t>Second</w:t></w:r></w:p></w:body></w:document>"#;
+        let data = build_zip(&[("word/document.xml", doc)]);
+        let text = extract_text(
+            &data,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(text.contains("Hello world"), "{text:?}");
+        assert!(text.contains("Second"), "{text:?}");
+    }
+
+    #[test]
+    fn extract_pptx_slide_text() {
+        let slide = r#"<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Slide title</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#;
+        let data = build_zip(&[("ppt/slides/slide1.xml", slide)]);
+        let text = extract_text(
+            &data,
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(text.contains("Slide title"), "{text:?}");
+    }
 
     #[test]
     fn truncate_within_limit() {
